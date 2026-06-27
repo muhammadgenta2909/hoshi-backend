@@ -1,0 +1,32 @@
+# dependencies
+/node_modules
+
+# build output
+/dist
+/build
+
+# secrets / env — JANGAN commit
+.env
+.env.*
+!.env.example
+platform.json
+*.pem
+
+# logs
+*.log
+npm-debug.log*
+logs
+
+# OS / editor
+.DS_Store
+.idea
+*.iml
+
+# tests / coverage
+/coverage
+.nyc_output
+
+# misc
+.cache
+dist
+*.tsbuildinfo

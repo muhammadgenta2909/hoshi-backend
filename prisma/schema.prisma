@@ -1,0 +1,112 @@
+// Hoshi Backend — Prisma schema
+// Domain Hoshi: platform menyimpan kartu fisik (vault) lalu mint NFT yang
+// merepresentasikan kartu tsb ke wallet user.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// Status sebuah item kartu fisik di dalam vault.
+enum VaultStatus {
+  STORED // kartu fisik tersimpan di vault, belum diklaim user
+  MINTING // sedang diklaim & proses mint berjalan (in-flight, tidak bisa diklaim lagi)
+  MINTED // sudah diklaim user & NFT-nya sudah di-mint
+  REDEEMED // user menukar NFT kembali jadi kartu fisik (out of POC scope)
+}
+
+// Status on-chain dari sebuah NFT yang sudah di-mint.
+enum NftStatus {
+  MINTED
+  TRANSFERRED
+  BURNED
+}
+
+// User dikenali dari wallet address (login-with-wallet).
+model User {
+  id            String   @id @default(cuid())
+  walletAddress String   @unique
+  // Nonce challenge untuk login berikutnya (di-set saat minta /auth/nonce,
+  // dikosongkan setelah dipakai). Mencegah replay signature.
+  nonce         String?
+  displayName   String?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  nfts       Nft[]
+  vaultItems VaultItem[]
+
+  @@map("users")
+}
+
+// Katalog/template kartu (metadata kartu fisik yang di-vault Hoshi).
+model Card {
+  id          String   @id @default(cuid())
+  name        String
+  description String?
+  imageUrl    String?
+  set         String?
+  rarity      String?
+  // Atribut bebas: [{ "trait_type": "Set", "value": "Base" }, ...]
+  attributes  Json?
+  // URL metadata JSON yang dipakai saat mint (fallback ke DEFAULT_METADATA_URI).
+  metadataUri String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  nfts       Nft[]
+  vaultItems VaultItem[]
+
+  @@map("cards")
+}
+
+// Catatan NFT yang sudah di-mint on-chain (devnet).
+model Nft {
+  id           String    @id @default(cuid())
+  assetAddress String    @unique // alamat asset Metaplex Core
+  ownerAddress String // wallet pemilik (snapshot saat mint)
+  mintTx       String? // signature transaksi mint
+  metadataUri  String?
+  name         String?
+  status       NftStatus @default(MINTED)
+
+  cardId  String?
+  // Restrict: hapus Card dilarang bila masih dirujuk NFT (cegah putus link diam-diam).
+  card    Card?   @relation(fields: [cardId], references: [id], onDelete: Restrict)
+  ownerId String?
+  owner   User?   @relation(fields: [ownerId], references: [id])
+
+  vaultItem VaultItem? // back-relation 1-1 (di-set saat klaim dari vault)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([ownerAddress])
+  @@map("nfts")
+}
+
+// Instance kartu fisik di dalam vault.
+model VaultItem {
+  id           String      @id @default(cuid())
+  serialNumber String?     @unique
+  status       VaultStatus @default(STORED)
+
+  cardId String
+  // Restrict: hapus Card dilarang bila masih ada vault item yang merujuknya.
+  card   Card   @relation(fields: [cardId], references: [id], onDelete: Restrict)
+
+  ownerId String? // user yang mengklaim (null selama masih STORED)
+  owner   User?   @relation(fields: [ownerId], references: [id])
+
+  nftId String? @unique // NFT hasil mint (null sebelum diklaim)
+  nft   Nft?    @relation(fields: [nftId], references: [id])
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("vault_items")
+}
