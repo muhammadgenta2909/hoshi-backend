@@ -30,3 +30,6 @@ logs
 .cache
 dist
 *.tsbuildinfo
+
+# catatan / dokumen kerja lokal (bukan untuk repo)
+docs/
