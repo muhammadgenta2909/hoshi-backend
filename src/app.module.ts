@@ -12,6 +12,8 @@ import { UsersModule } from './users/users.module';
 import { CardsModule } from './cards/cards.module';
 import { NftModule } from './nft/nft.module';
 import { VaultModule } from './vault/vault.module';
+import { InventoryModule } from './inventory/inventory.module';
+import { PacksModule } from './packs/packs.module';
 
 @Module({
   imports: [
@@ -25,6 +27,8 @@ import { VaultModule } from './vault/vault.module';
     CardsModule,
     NftModule,
     VaultModule,
+    InventoryModule,
+    PacksModule,
   ],
   controllers: [AppController],
   providers: [

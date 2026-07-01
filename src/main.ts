@@ -50,7 +50,8 @@ async function bootstrap() {
   SwaggerModule.setup('docs', app, document);
 
   const port = config.get<number>('PORT') ?? 3001;
-  await app.listen(port);
+  // Bind 0.0.0.0 so cloud hosts (Railway/Render) can route to the container.
+  await app.listen(port, '0.0.0.0');
   console.log(
     `🚀 Hoshi backend running on http://localhost:${port} (docs: /docs)`,
   );

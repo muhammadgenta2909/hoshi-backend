@@ -1,35 +1,56 @@
-# dependencies
-/node_modules
-
-# build output
+# compiled output
 /dist
+/node_modules
 /build
 
-# secrets / env — JANGAN commit
-.env
-.env.*
-!.env.example
-platform.json
-*.pem
-
-# logs
+# Logs
+logs
 *.log
 npm-debug.log*
-logs
+pnpm-debug.log*
+yarn-debug.log*
+yarn-error.log*
 
-# OS / editor
+# OS
 .DS_Store
-.idea
-*.iml
 
-# tests / coverage
+# Tests
 /coverage
-.nyc_output
+/.nyc_output
 
-# misc
-.cache
-dist
-*.tsbuildinfo
+# IDEs and editors
+/.idea
+.project
+.classpath
+.c9/
+*.launch
+.settings/
+*.sublime-workspace
 
-# catatan / dokumen kerja lokal (bukan untuk repo)
-docs/
+# IDE - VSCode
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+
+# dotenv environment variable files
+.env
+.env.local
+.env.*.local
+
+# temp directory
+.temp
+.tmp
+
+# Runtime data
+pids
+*.pid
+*.seed
+*.pid.lock
+
+# Diagnostic reports
+report.*.json
+
+# Solana platform keypair (JANGAN commit — berisi secret key)
+platform.json

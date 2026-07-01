@@ -1,5 +1,6 @@
 import { plainToInstance } from 'class-transformer';
 import {
+  IsIn,
   IsInt,
   IsOptional,
   IsString,
@@ -55,6 +56,20 @@ class EnvironmentVariables {
   @IsOptional()
   @IsString()
   DEFAULT_METADATA_URI?: string;
+
+  // Sumber inventory default untuk Open Packs (default 'hoshi-vault').
+  @IsOptional()
+  @IsIn(['hoshi-vault', 'collectorcrypt', 'mock'])
+  INVENTORY_PROVIDER?: string;
+
+  // Opsional (WAJIB kalau INVENTORY_PROVIDER=collectorcrypt) — kredensial API CollectorCrypt.
+  @IsOptional()
+  @IsString()
+  COLLECTORCRYPT_API_BASE_URL?: string;
+
+  @IsOptional()
+  @IsString()
+  COLLECTORCRYPT_API_KEY?: string;
 }
 
 export function validateEnv(config: Record<string, unknown>) {
