@@ -1,0 +1,45 @@
+# Render Blueprint — Hoshi Backend (NestJS + Prisma + Neon Postgres).
+#
+# Cara pakai (sekali):
+#   1. Push repo ini ke GitHub (sudah).
+#   2. Render Dashboard → New + → Blueprint → pilih repo `hoshi-backend`.
+#   3. Render membaca file ini, lalu MINTA kamu isi env var bertanda `sync: false`
+#      (DATABASE_URL, FRONTEND_ORIGIN, PLATFORM_SECRET_KEY). Isi di dashboard.
+#   4. Apply → Render build & deploy otomatis.
+#
+# Catatan free tier: service "tidur" setelah ~15 menit idle; request pertama
+# setelah tidur butuh ~30–50 detik untuk bangun (cold start). Wajar untuk demo.
+services:
+  - type: web
+    name: hoshi-backend
+    runtime: node
+    plan: free
+    region: singapore # dekat dengan Neon (ap-southeast-1)
+    branch: main
+    # postinstall menjalankan `prisma generate`; lalu `nest build`.
+    buildCommand: npm install && npm run build
+    # Terapkan migrasi ke Neon, lalu jalankan server.
+    startCommand: npm run prisma:deploy && npm run start:prod
+    healthCheckPath: /api/health
+    envVars:
+      # ── WAJIB (isi manual di dashboard) ──
+      - key: DATABASE_URL # connection string Neon (rahasia)
+        sync: false
+      - key: JWT_SECRET # Render generate otomatis (>=32 char)
+        generateValue: true
+      # ── Frontend origin untuk CORS (isi URL Vercel-mu nanti, mis. https://hoshi.vercel.app) ──
+      - key: FRONTEND_ORIGIN
+        sync: false
+      # ── Solana devnet (default aman, boleh dibiarkan) ──
+      - key: SOLANA_RPC_URL
+        value: https://api.devnet.solana.com
+      - key: SOLANA_CLUSTER
+        value: devnet
+      # ── Sumber inventory: mock = tanpa DB/chain, aman untuk demo tanpa dompet ──
+      - key: INVENTORY_PROVIDER
+        value: mock
+      - key: DEFAULT_METADATA_URI
+        value: https://gateway.irys.xyz/6UNWfKd2igXWUGF7XY39Mwa7baeVwFHVdorDCaH1bjN2
+      # ── Opsional: hanya jika mau mint NFT beneran (dompet platform). Biarkan kosong untuk demo ──
+      - key: PLATFORM_SECRET_KEY
+        sync: false
