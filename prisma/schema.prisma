@@ -8,7 +8,15 @@ generator client {
 
 datasource db {
   provider = "postgresql"
-  url      = env("DATABASE_URL")
+
+  // Koneksi POOLED (PgBouncer) — dipakai aplikasi saat runtime.
+  url = env("DATABASE_URL")
+
+  // Koneksi DIRECT (unpooled) — WAJIB untuk `prisma migrate deploy`.
+  // Migration menjalankan DDL dan mengambil advisory lock; lewat PgBouncer itu
+  // bisa menggantung atau gagal. Di Neon: pakai host TANPA sufiks `-pooler`.
+  // Untuk lokal cukup: DIRECT_URL="${DATABASE_URL}" (dotenv-expand).
+  directUrl = env("DIRECT_URL")
 }
 
 // Status sebuah item kartu fisik di dalam vault.

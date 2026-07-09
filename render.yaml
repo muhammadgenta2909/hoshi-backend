@@ -23,7 +23,9 @@ services:
     healthCheckPath: /api/health
     envVars:
       # ── WAJIB (isi manual di dashboard) ──
-      - key: DATABASE_URL # connection string Neon (rahasia)
+      - key: DATABASE_URL # Neon POOLED (host ber-sufiks `-pooler`), rahasia
+        sync: false
+      - key: DIRECT_URL # Neon DIRECT (tanpa `-pooler`) — dipakai `prisma migrate deploy`
         sync: false
       - key: JWT_SECRET # Render generate otomatis (>=32 char)
         generateValue: true
