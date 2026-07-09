@@ -101,7 +101,7 @@ export class CollectorCryptProvider implements InventoryProvider {
     const apiKey = this.config.get<string>('COLLECTORCRYPT_API_KEY');
     if (!baseUrl || !apiKey) {
       throw new ServiceUnavailableException(
-        'Provider CollectorCrypt belum dikonfigurasi. Isi COLLECTORCRYPT_API_BASE_URL & ' +
+        'Provider CollectorCrypt not configured. Set COLLECTORCRYPT_API_BASE_URL and ' +
           'COLLECTORCRYPT_API_KEY lalu verifikasi path endpoint ke docs.collectorcrypt.com.',
       );
     }
@@ -125,7 +125,7 @@ export class CollectorCryptProvider implements InventoryProvider {
     if (!res.ok) {
       this.logger.error(`CollectorCrypt ${method} ${path} → HTTP ${res.status}`);
       throw new ServiceUnavailableException(
-        `CollectorCrypt ${method} ${path} gagal (HTTP ${res.status}).`,
+        `CollectorCrypt ${method} ${path} failed (HTTP ${res.status}).`,
       );
     }
     return (await res.json()) as T;

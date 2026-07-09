@@ -27,7 +27,7 @@ export class PrismaExceptionFilter implements ExceptionFilter {
         status = HttpStatus.CONFLICT;
         const target = exception.meta?.target;
         const fields = Array.isArray(target) ? target.join(', ') : '';
-        message = `Data sudah ada${fields ? ` (unik: ${fields})` : ''}.`;
+        message = `Data already exists${fields ? ` (unique: ${fields})` : ''}.`;
         break;
       }
       case 'P2003':
@@ -36,7 +36,7 @@ export class PrismaExceptionFilter implements ExceptionFilter {
         break;
       case 'P2025':
         status = HttpStatus.NOT_FOUND;
-        message = 'Data tidak ditemukan.';
+        message = 'Data not found.';
         break;
       default:
         this.logger.error(`Prisma ${exception.code}: ${exception.message}`);

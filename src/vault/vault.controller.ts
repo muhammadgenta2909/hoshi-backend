@@ -20,7 +20,7 @@ export class VaultController {
   }
 
   @Get('available')
-  @ApiOperation({ summary: 'List item vault yang bisa diklaim' })
+  @ApiOperation({ summary: 'List claimable vault items' })
   available() {
     return this.vault.findAvailable();
   }

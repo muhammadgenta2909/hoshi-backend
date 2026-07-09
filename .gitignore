@@ -54,3 +54,14 @@ report.*.json
 
 # Solana platform keypair (JANGAN commit — berisi secret key)
 platform.json
+
+# Admin image uploads (multer, dibuat otomatis via fs.mkdirSync).
+# JANGAN commit: berisi file user, dan di host free tier (Render) filesystem-nya
+# ephemeral sehingga isinya hilang tiap redeploy. Ganti ke object storage
+# (Cloudinary/Supabase Storage) kalau perlu persisten.
+uploads/
+
+# Agent tooling; not part of the service.
+.agents/
+agent/
+skills-lock.json

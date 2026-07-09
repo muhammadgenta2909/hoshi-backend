@@ -46,7 +46,7 @@ export class AuthService {
 
     const message = this.buildLoginMessage(walletAddress, user.nonce);
     if (!this.verifySignature(walletAddress, message, signature)) {
-      throw new UnauthorizedException('Signature tidak valid.');
+      throw new UnauthorizedException('Invalid signature.');
     }
 
     // Konsumsi nonce ATOMIK: updateMany dengan predikat nonce → hanya SATU request
@@ -56,7 +56,7 @@ export class AuthService {
       data: { nonce: null },
     });
     if (consumed.count !== 1) {
-      throw new UnauthorizedException('Nonce sudah dipakai. Minta nonce baru.');
+      throw new UnauthorizedException('Nonce already used. Request a new nonce.');
     }
 
     const accessToken = await this.jwt.signAsync({

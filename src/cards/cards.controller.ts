@@ -34,7 +34,7 @@ export class CardsController {
   @Post()
   @ApiBearerAuth()
   @UseGuards(JwtAuthGuard)
-  @ApiOperation({ summary: 'Buat card baru (perlu login)' })
+  @ApiOperation({ summary: 'Create a new card (login required)' })
   create(@Body() dto: CreateCardDto) {
     return this.cards.create(dto);
   }
@@ -42,7 +42,7 @@ export class CardsController {
   @Patch(':id')
   @ApiBearerAuth()
   @UseGuards(JwtAuthGuard)
-  @ApiOperation({ summary: 'Update card (perlu login)' })
+  @ApiOperation({ summary: 'Update card (login required)' })
   update(@Param('id') id: string, @Body() dto: UpdateCardDto) {
     return this.cards.update(id, dto);
   }
@@ -50,7 +50,7 @@ export class CardsController {
   @Delete(':id')
   @ApiBearerAuth()
   @UseGuards(JwtAuthGuard)
-  @ApiOperation({ summary: 'Hapus card (perlu login)' })
+  @ApiOperation({ summary: 'Delete card (login required)' })
   remove(@Param('id') id: string) {
     return this.cards.remove(id);
   }

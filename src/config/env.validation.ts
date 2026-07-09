@@ -70,6 +70,11 @@ class EnvironmentVariables {
   @IsOptional()
   @IsString()
   COLLECTORCRYPT_API_KEY?: string;
+
+  // Opsional — fallback secret untuk admin login POC (kalau backend belum punya admin user).
+  @IsOptional()
+  @IsString()
+  ADMIN_SECRET?: string;
 }
 
 export function validateEnv(config: Record<string, unknown>) {

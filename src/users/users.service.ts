@@ -11,7 +11,7 @@ export class UsersService {
       where: { id: userId },
       include: { _count: { select: { nfts: true, vaultItems: true } } },
     });
-    if (!user) throw new NotFoundException('User tidak ditemukan.');
+    if (!user) throw new NotFoundException('User not found.');
     return {
       id: user.id,
       walletAddress: user.walletAddress,

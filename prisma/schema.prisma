@@ -26,6 +26,20 @@ enum NftStatus {
   BURNED
 }
 
+// Status sebuah listing di marketplace sekunder.
+enum ListingStatus {
+  ACTIVE // dipajang & bisa dibeli
+  SOLD // sudah terjual (buyer ter-set)
+  CANCELLED // ditarik penjual
+}
+
+// Lembaga grading pada slab kartu (badge di UI + filter Grade & Grader).
+enum Grader {
+  PSA
+  CGC
+  BGS
+}
+
 // User dikenali dari wallet address (login-with-wallet).
 model User {
   id            String   @id @default(cuid())
@@ -34,11 +48,18 @@ model User {
   // dikosongkan setelah dipakai). Mencegah replay signature.
   nonce         String?
   displayName   String?
+  role          String   @default("USER")
+  email         String?
+  passwordHash  String?
   createdAt     DateTime @default(now())
   updatedAt     DateTime @updatedAt
 
   nfts       Nft[]
   vaultItems VaultItem[]
+
+  // Listing yang dijual / dibeli user ini (marketplace sekunder).
+  listingsSelling Listing[] @relation("ListingSeller")
+  listingsBought  Listing[] @relation("ListingBuyer")
 
   @@map("users")
 }
@@ -60,6 +81,7 @@ model Card {
 
   nfts       Nft[]
   vaultItems VaultItem[]
+  listings   Listing[]
 
   @@map("cards")
 }
@@ -80,7 +102,8 @@ model Nft {
   ownerId String?
   owner   User?   @relation(fields: [ownerId], references: [id])
 
-  vaultItem VaultItem? // back-relation 1-1 (di-set saat klaim dari vault)
+  vaultItem          VaultItem? // back-relation 1-1 (di-set saat klaim dari vault)
+  marketplaceListing Listing?   @relation("ListingNft") // back-relation 1-1 (di-set saat buy marketplace)
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -109,4 +132,112 @@ model VaultItem {
   updatedAt DateTime @updatedAt
 
   @@map("vault_items")
+}
+
+// Satu listing kartu bergrade di marketplace sekunder.
+// POC/MVP: field tampilan (grade, era, element, dll) di-denormalisasi ke baris ini
+// supaya GET /marketplace langsung cocok dengan tipe `Listing` di frontend
+// (lib/market.ts) — swap mock→API tanpa mapping. cardId opsional buat menautkan
+// ke katalog nanti.
+model Listing {
+  id     String @id @default(cuid())
+  name   String
+  set    String // MarketSet: Classic/Jungle/Promo/Rare/Evolving
+  rarity String // Tier: Common/Rare/Epic/Legendary/Legendary Rare
+  image  String
+  // Optional back art. Kept on the listing row so detail pages do not invent it.
+  imageBack String?
+
+  // Ekonomi (IDRX). Int cukup utk POC (< 2.1M IDRX); TODO: BigInt kalau harga kartu
+  // riil > 2.1 miliar. Balik ke frontend sebagai number JSON apa adanya.
+  priceIdrx         Int
+  expectedValueIdrx Int
+  buybackIdrx       Int @default(0) // > 0 ⇒ Hoshi-backed (badge HOSHI)
+
+  // Field tampilan kartu bergrade (Figma).
+  grade      String // "PSA 10"
+  grader     Grader
+  gradeScore Float // 8 / 9 / 9.5 / 10
+  language   String // "English" | "Japan"
+  era        String // "Scarlet & Violet", dst
+  element    String // "Fire", "Water", dst
+  category   String // "Special Illustration", dst
+  views      Int    @default(0)
+
+  // Detail-page data. Nullable while a listing is still a lightweight market row;
+  // populated by seed/admin/create flows when real card metadata is available.
+  certificate     String?
+  vaultLocation   String?
+  cardNumber      String?
+  variant         String?
+  contractAddress String?
+  priceHistory    Json?
+  offers          Json?
+
+  status ListingStatus @default(ACTIVE)
+
+  // Penjual: sellerId null utk listing seed/POC; sellerAddress selalu ada (display).
+  sellerId      String?
+  seller        User?   @relation("ListingSeller", fields: [sellerId], references: [id])
+  sellerAddress String
+
+  // Pembeli (ter-set saat SOLD).
+  buyerId String?
+  buyer   User?   @relation("ListingBuyer", fields: [buyerId], references: [id])
+
+  // Offer records (separate table, bukan JSON lagi)
+  offerRecords Offer[]
+
+  // Tautan opsional ke katalog kartu (buat masa depan; POC boleh null).
+  cardId String?
+  card   Card?   @relation(fields: [cardId], references: [id], onDelete: Restrict)
+
+  // NFT hasil mint on-chain ke wallet buyer setelah listing dibeli.
+  nftId String? @unique
+  nft   Nft?    @relation("ListingNft", fields: [nftId], references: [id], onDelete: SetNull)
+
+  listedAt  DateTime  @default(now())
+  soldAt    DateTime?
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  @@index([status])
+  @@index([sellerId])
+  @@index([buyerId])
+  @@map("listings")
+}
+
+enum OfferStatus {
+  PENDING
+  ACCEPTED
+  REJECTED
+}
+
+model Offer {
+  id        String      @id @default(cuid())
+  listingId String
+  listing   Listing     @relation(fields: [listingId], references: [id], onDelete: Cascade)
+  user      String
+  amount    Int
+  status    OfferStatus @default(PENDING)
+  createdAt DateTime    @default(now())
+  updatedAt DateTime    @updatedAt
+
+  @@index([listingId])
+  @@index([status])
+  @@map("offers")
+}
+
+model ContactMessage {
+  id          String   @id @default(cuid())
+  listingId   String?
+  listingName String
+  senderName  String
+  senderEmail String
+  phone       String?
+  text        String
+  isRead      Boolean  @default(false)
+  createdAt   DateTime @default(now())
+
+  @@map("contact_messages")
 }

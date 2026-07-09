@@ -14,6 +14,8 @@ import { NftModule } from './nft/nft.module';
 import { VaultModule } from './vault/vault.module';
 import { InventoryModule } from './inventory/inventory.module';
 import { PacksModule } from './packs/packs.module';
+import { MarketplaceModule } from './marketplace/marketplace.module';
+import { AdminModule } from './admin/admin.module';
 
 @Module({
   imports: [
@@ -29,6 +31,8 @@ import { PacksModule } from './packs/packs.module';
     VaultModule,
     InventoryModule,
     PacksModule,
+    MarketplaceModule,
+    AdminModule,
   ],
   controllers: [AppController],
   providers: [

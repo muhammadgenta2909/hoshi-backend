@@ -17,14 +17,14 @@ export class AuthController {
 
   @Post('nonce')
   @ApiOperation({
-    summary: 'Langkah 1: minta nonce + message untuk ditandatangani wallet',
+    summary: 'Step 1: request nonce + message for wallet signing',
   })
   requestNonce(@Body() dto: NonceRequestDto) {
     return this.auth.requestNonce(dto.walletAddress);
   }
 
   @Post('login')
-  @ApiOperation({ summary: 'Langkah 2: kirim signature → dapat JWT' })
+  @ApiOperation({ summary: 'Step 2: submit signature → get JWT' })
   login(@Body() dto: LoginDto) {
     return this.auth.login(dto.walletAddress, dto.signature);
   }

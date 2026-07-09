@@ -20,7 +20,7 @@ export class VaultService {
     const card = await this.prisma.card.findUnique({
       where: { id: dto.cardId },
     });
-    if (!card) throw new NotFoundException('Card tidak ditemukan.');
+    if (!card) throw new NotFoundException('Card not found.');
     return this.prisma.vaultItem.create({
       data: { cardId: dto.cardId, serialNumber: dto.serialNumber },
       include: { card: true },
@@ -50,7 +50,7 @@ export class VaultService {
       where: { id },
       include: { card: true, nft: true },
     });
-    if (!item) throw new NotFoundException('Vault item tidak ditemukan.');
+    if (!item) throw new NotFoundException('Vault item not found.');
     return item;
   }
 
@@ -73,8 +73,8 @@ export class VaultService {
       const exists = await this.prisma.vaultItem.findUnique({
         where: { id: params.vaultItemId },
       });
-      if (!exists) throw new NotFoundException('Vault item tidak ditemukan.');
-      throw new BadRequestException('Item ini sudah diklaim / tidak tersedia.');
+      if (!exists) throw new NotFoundException('Vault item not found.');
+      throw new BadRequestException('This item has already been claimed / unavailable.');
     }
 
     try {

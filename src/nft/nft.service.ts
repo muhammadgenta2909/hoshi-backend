@@ -21,13 +21,13 @@ export class NftService {
     const card = await this.prisma.card.findUnique({
       where: { id: params.cardId },
     });
-    if (!card) throw new NotFoundException('Card tidak ditemukan.');
+    if (!card) throw new NotFoundException('Card not found.');
 
     const uri =
       card.metadataUri ?? this.config.get<string>('DEFAULT_METADATA_URI');
     if (!uri) {
       throw new NotFoundException(
-        'Card belum punya metadataUri & DEFAULT_METADATA_URI kosong.',
+        'Card has no metadataUri and DEFAULT_METADATA_URI is empty.',
       );
     }
 
@@ -63,7 +63,7 @@ export class NftService {
   async findOne(userId: string, id: string) {
     const nft = await this.prisma.nft.findUnique({ where: { id } });
     if (!nft || nft.ownerId !== userId) {
-      throw new NotFoundException('NFT tidak ditemukan.');
+      throw new NotFoundException('NFT not found.');
     }
     return this.withExplorer(nft);
   }

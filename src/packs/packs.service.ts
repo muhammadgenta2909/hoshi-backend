@@ -54,7 +54,7 @@ export class PacksService {
 
   getOne(id: string) {
     const pack = findPack(id);
-    if (!pack) throw new NotFoundException('Pack tidak ditemukan.');
+    if (!pack) throw new NotFoundException('Pack not found.');
     return this.decorate(pack);
   }
 
@@ -78,7 +78,7 @@ export class PacksService {
     source?: InventorySource;
   }) {
     const pack = findPack(params.packId);
-    if (!pack) throw new NotFoundException('Pack tidak ditemukan.');
+    if (!pack) throw new NotFoundException('Pack not found.');
 
     // TODO(pembayaran): tagih pack.priceIdr dalam IDRX (escrow/settlement) SEBELUM
     // menarik kartu. POC mengasumsikan pembayaran sudah beres.

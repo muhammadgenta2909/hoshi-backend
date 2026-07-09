@@ -39,7 +39,7 @@ export class UmiService {
     const secretRaw = this.config.get<string>('PLATFORM_SECRET_KEY');
     if (!secretRaw) {
       throw new InternalServerErrorException(
-        'PLATFORM_SECRET_KEY belum di-set (lihat .env.example).',
+        'PLATFORM_SECRET_KEY not set (see .env.example).',
       );
     }
 

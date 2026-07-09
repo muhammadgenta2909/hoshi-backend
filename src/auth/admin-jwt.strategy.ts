@@ -4,20 +4,19 @@ import { PassportStrategy } from '@nestjs/passport';
 import { ExtractJwt, Strategy } from 'passport-jwt';
 import { PrismaService } from '../prisma/prisma.service';
 
-export interface JwtPayload {
+export interface AdminJwtPayload {
   sub: string;
-  wallet: string;
+  role: 'ADMIN';
 }
 
-export interface AuthUser {
+export interface AdminUser {
   id: string;
-  walletAddress: string;
-  displayName: string | null;
+  email: string;
   role: string;
 }
 
 @Injectable()
-export class JwtStrategy extends PassportStrategy(Strategy) {
+export class AdminJwtStrategy extends PassportStrategy(Strategy, 'admin-jwt') {
   constructor(
     config: ConfigService,
     private readonly prisma: PrismaService,
@@ -29,15 +28,14 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
     });
   }
 
-  async validate(payload: JwtPayload): Promise<AuthUser> {
+  async validate(payload: AdminJwtPayload): Promise<AdminUser> {
     const user = await this.prisma.user.findUnique({
       where: { id: payload.sub },
     });
-    if (!user) throw new UnauthorizedException();
+    if (!user || user.role !== 'ADMIN') throw new UnauthorizedException();
     return {
       id: user.id,
-      walletAddress: user.walletAddress,
-      displayName: user.displayName,
+      email: user.email ?? '',
       role: user.role,
     };
   }
