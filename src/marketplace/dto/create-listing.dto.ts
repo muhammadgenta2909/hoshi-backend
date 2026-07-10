@@ -7,8 +7,10 @@ import {
   IsNumber,
   IsOptional,
   IsString,
+  Max,
   Min,
 } from 'class-validator';
+import { IDRX_MAX } from '../marketplace.constants';
 
 /** Payload untuk memajang kartu ke marketplace (POST /marketplace, perlu login). */
 export class CreateListingDto {
@@ -36,6 +38,7 @@ export class CreateListingDto {
   @ApiProperty({ example: 24_250_000, description: 'Harga jual (IDRX)' })
   @IsInt()
   @Min(0)
+  @Max(IDRX_MAX)
   price!: number;
 
   @ApiProperty({
@@ -44,6 +47,7 @@ export class CreateListingDto {
   })
   @IsInt()
   @Min(0)
+  @Max(IDRX_MAX)
   expectedValue!: number;
 
   @ApiPropertyOptional({
@@ -53,6 +57,7 @@ export class CreateListingDto {
   @IsOptional()
   @IsInt()
   @Min(0)
+  @Max(IDRX_MAX)
   buyback?: number;
 
   @ApiProperty({ example: 'PSA 10' })

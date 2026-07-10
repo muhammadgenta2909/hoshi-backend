@@ -69,6 +69,14 @@ model User {
   listingsSelling Listing[] @relation("ListingSeller")
   listingsBought  Listing[] @relation("ListingBuyer")
 
+  // Offer yang DIBUAT user ini (tab "Offers Made"). Offer yang DITERIMA user ini
+  // dicari lewat listing.sellerId, bukan relasi langsung (tab "Offers Received").
+  offersMade Offer[] @relation("OfferBuyer")
+
+  // Feed aktivitas profil: baris di mana user jadi aktor (from) atau lawan (to).
+  activityFrom Activity[] @relation("ActivityFrom")
+  activityTo   Activity[] @relation("ActivityTo")
+
   @@map("users")
 }
 
@@ -196,6 +204,9 @@ model Listing {
   // Offer records (separate table, bukan JSON lagi)
   offerRecords Offer[]
 
+  // Baris feed aktivitas yang menyebut listing ini.
+  activities Activity[]
+
   // Tautan opsional ke katalog kartu (buat masa depan; POC boleh null).
   cardId String?
   card   Card?   @relation(fields: [cardId], references: [id], onDelete: Restrict)
@@ -218,14 +229,23 @@ model Listing {
 enum OfferStatus {
   PENDING
   ACCEPTED
-  REJECTED
+  REJECTED // ditolak penjual
+  CANCELED // ditarik kembali oleh pembuat offer
 }
 
 model Offer {
-  id        String      @id @default(cuid())
+  id        String  @id @default(cuid())
   listingId String
-  listing   Listing     @relation(fields: [listingId], references: [id], onDelete: Cascade)
-  user      String
+  listing   Listing @relation(fields: [listingId], references: [id], onDelete: Cascade)
+
+  // Pembuat offer. buyerId null hanya untuk baris warisan POC (offer lama
+  // disubmit tanpa login, `user` cuma string tampilan). Semua offer baru punya
+  // buyerId — itu yang bikin tab "Offers Made"/"Offers Received" bisa nyata.
+  buyerId String?
+  buyer   User?   @relation("OfferBuyer", fields: [buyerId], references: [id])
+  // Label tampilan (displayName / wallet pendek) — snapshot saat offer dibuat.
+  user    String
+
   amount    Int
   status    OfferStatus @default(PENDING)
   createdAt DateTime    @default(now())
@@ -233,7 +253,62 @@ model Offer {
 
   @@index([listingId])
   @@index([status])
+  @@index([buyerId])
   @@map("offers")
+}
+
+// Jenis event yang tampil di feed Activity profil. Nama = label UI,
+// ikon dipetakan di frontend (public/activity/*.png).
+enum ActivityType {
+  OFFER_MADE // shopping_bag_speed
+  OFFER_CANCELED // label_off  — ditarik pembuat offer
+  OFFER_REJECTED // label_off  — ditolak penjual
+  SALE_CARD // sell        — kartu pindah tangan (beli langsung ATAU offer diterima)
+  LISTED_CARD // new_label
+  LISTING_CANCELED // label_off
+  SEND_TO_VAULT // warehouse
+  SEND_TO_HOME // delivery_truck_speed
+}
+
+// Catatan: TIDAK ada OFFER_ACCEPTED. Offer.status sudah menyimpan penerimaan;
+// yang menarik buat feed adalah perpindahan kartunya → SALE_CARD.
+
+/// Satu baris feed aktivitas. Ditulis oleh service saat event terjadi — feed
+/// TIDAK direkonstruksi dari status listing (status cuma menyimpan keadaan
+/// terakhir, jadi riwayat "pernah listed lalu cancel lalu listed lagi" hilang).
+///
+/// Field tampilan (itemName/itemImage/category/fromLabel/toLabel) di-snapshot
+/// supaya baris riwayat tetap terbaca walau listing/user berubah atau terhapus.
+model Activity {
+  id   String       @id @default(cuid())
+  type ActivityType
+
+  listingId String?
+  listing   Listing? @relation(fields: [listingId], references: [id], onDelete: SetNull)
+
+  itemName  String
+  itemImage String?
+  category  String?
+  /// Series/set kartu — snapshot, dipakai filter "All Series" di tab Activity.
+  set       String?
+
+  /// IDRX. null = event tanpa nominal (mis. offer dibatalkan → UI render "----").
+  amount Int?
+
+  fromId    String?
+  from      User?   @relation("ActivityFrom", fields: [fromId], references: [id])
+  fromLabel String?
+
+  toId    String?
+  to      User?   @relation("ActivityTo", fields: [toId], references: [id])
+  toLabel String?
+
+  createdAt DateTime @default(now())
+
+  @@index([fromId, createdAt])
+  @@index([toId, createdAt])
+  @@index([listingId])
+  @@map("activities")
 }
 
 model ContactMessage {

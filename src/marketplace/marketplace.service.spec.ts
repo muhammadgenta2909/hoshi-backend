@@ -20,6 +20,9 @@ describe('MarketplaceService', () => {
       updateMany: jest.Mock;
       update: jest.Mock;
     };
+    nft: { updateMany: jest.Mock };
+    offer: { updateMany: jest.Mock };
+    activity: { create: jest.Mock };
   };
   let nft: { mintForUser: jest.Mock };
 
@@ -28,6 +31,7 @@ describe('MarketplaceService', () => {
     id: 'buyer-1',
     walletAddress: 'BuyerWalletBase58',
     displayName: null,
+    role: 'USER',
   };
 
   const listing = {
@@ -71,6 +75,10 @@ describe('MarketplaceService', () => {
         updateMany: jest.fn(),
         update: jest.fn(),
       },
+      nft: { updateMany: jest.fn() },
+      // buy() closes any dangling offers and writes an audit row after settling.
+      offer: { updateMany: jest.fn().mockResolvedValue({ count: 0 }) },
+      activity: { create: jest.fn().mockResolvedValue({}) },
     };
     nft = { mintForUser: jest.fn() };
 
@@ -142,7 +150,9 @@ describe('MarketplaceService', () => {
       expect(res.nft?.assetAddress).toBe('AssetAddr');
     });
 
-    it('rolls SOLD back to ACTIVE when mint fails', async () => {
+    it('rolls a fresh listing back to its seed state when mint fails', async () => {
+      // Fresh listing: buyerId/nftId/soldAt are null, so the compensation
+      // restores exactly that (previous "owner" is nobody).
       const listedWithCard = { ...listing, cardId: 'card-1' };
       prisma.listing.findUnique.mockResolvedValue(listedWithCard);
       prisma.listing.updateMany
@@ -175,6 +185,49 @@ describe('MarketplaceService', () => {
       expect(prisma.listing.update).not.toHaveBeenCalled();
     });
 
+    it('restores the previous owner + nftId when a re-listed card fails to mint', async () => {
+      // A re-listed card carries the previous owner in buyerId and their NFT in
+      // nftId. Compensation must restore THAT state, not reset to seed/null.
+      const relisted = {
+        ...listing,
+        status: ListingStatus.ACTIVE,
+        sellerId: 'owner-9',
+        buyerId: 'owner-9',
+        soldAt: now,
+        nftId: 'nft-old',
+        cardId: 'card-1',
+      };
+      prisma.listing.findUnique.mockResolvedValue(relisted);
+      prisma.listing.updateMany
+        .mockResolvedValueOnce({ count: 1 })
+        .mockResolvedValueOnce({ count: 1 });
+      prisma.listing.findUniqueOrThrow.mockResolvedValue({
+        ...relisted,
+        status: ListingStatus.SOLD,
+        buyerId: user.id,
+      });
+      nft.mintForUser.mockRejectedValue(new Error('RPC timeout'));
+
+      await expect(service.buy('listing-1', user)).rejects.toThrow(
+        'RPC timeout',
+      );
+
+      expect(prisma.listing.updateMany).toHaveBeenLastCalledWith({
+        where: {
+          id: 'listing-1',
+          status: ListingStatus.SOLD,
+          buyerId: user.id,
+          nftId: 'nft-old',
+        },
+        data: {
+          status: ListingStatus.ACTIVE,
+          buyerId: 'owner-9',
+          soldAt: now,
+        },
+      });
+      expect(prisma.listing.update).not.toHaveBeenCalled();
+    });
+
     it('does not mint when another buyer already won the atomic update', async () => {
       prisma.listing.findUnique.mockResolvedValue(listing);
       prisma.listing.updateMany.mockResolvedValueOnce({ count: 0 });
@@ -198,6 +251,108 @@ describe('MarketplaceService', () => {
 
       expect(prisma.listing.updateMany).not.toHaveBeenCalled();
       expect(nft.mintForUser).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('relist', () => {
+    const owned = {
+      ...listing,
+      status: ListingStatus.SOLD,
+      sellerId: 'seller-1',
+      buyerId: user.id,
+      soldAt: now,
+      nftId: 'nft-1',
+      cardId: 'card-1',
+    };
+
+    it('flips SOLD/CANCELLED back to ACTIVE via the atomic updateMany', async () => {
+      prisma.listing.findUnique.mockResolvedValue(owned);
+      prisma.listing.updateMany.mockResolvedValueOnce({ count: 1 });
+      prisma.listing.findUniqueOrThrow.mockResolvedValue({
+        ...owned,
+        status: ListingStatus.ACTIVE,
+        sellerId: user.id,
+        priceIdrx: 30_000_000,
+        expectedValueIdrx: 33_000_000,
+        buybackIdrx: 20_000_000,
+        nft: null,
+      });
+
+      await service.relist(
+        'listing-1',
+        { price: 30_000_000, expectedValue: 33_000_000, buyback: 20_000_000 },
+        user,
+      );
+
+      expect(prisma.listing.updateMany).toHaveBeenCalledWith({
+        where: {
+          id: 'listing-1',
+          buyerId: user.id,
+          status: {
+            in: [ListingStatus.SOLD, ListingStatus.CANCELLED],
+          },
+        },
+        data: {
+          status: ListingStatus.ACTIVE,
+          sellerId: user.id,
+          sellerAddress: 'Buyer..se58',
+          priceIdrx: 30_000_000,
+          expectedValueIdrx: 33_000_000,
+          buybackIdrx: 20_000_000,
+          listedAt: expect.any(Date),
+        },
+      });
+    });
+
+    it('throws when the caller is not the owner (buyerId mismatch)', async () => {
+      prisma.listing.findUnique.mockResolvedValue({
+        ...owned,
+        buyerId: 'someone-else',
+      });
+
+      await expect(
+        service.relist('listing-1', { price: 30_000_000 }, user),
+      ).rejects.toThrow(BadRequestException);
+
+      expect(prisma.listing.updateMany).not.toHaveBeenCalled();
+    });
+
+    it('throws when the listing is already ACTIVE', async () => {
+      prisma.listing.findUnique.mockResolvedValue({
+        ...owned,
+        status: ListingStatus.ACTIVE,
+      });
+
+      await expect(
+        service.relist('listing-1', { price: 30_000_000 }, user),
+      ).rejects.toThrow(BadRequestException);
+
+      expect(prisma.listing.updateMany).not.toHaveBeenCalled();
+    });
+
+    it('throws when the atomic updateMany matches nothing (count 0)', async () => {
+      prisma.listing.findUnique.mockResolvedValue(owned);
+      prisma.listing.updateMany.mockResolvedValueOnce({ count: 0 });
+
+      await expect(
+        service.relist('listing-1', { price: 30_000_000 }, user),
+      ).rejects.toThrow(BadRequestException);
+
+      expect(prisma.listing.findUniqueOrThrow).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('listPurchases', () => {
+    it('queries by buyerId only, without a status filter', async () => {
+      prisma.listing.findMany.mockResolvedValue([]);
+
+      await service.listPurchases('buyer-1');
+
+      expect(prisma.listing.findMany).toHaveBeenCalledWith({
+        where: { buyerId: 'buyer-1' },
+        include: { nft: true },
+        orderBy: { soldAt: 'desc' },
+      });
     });
   });
 });

@@ -1,14 +1,24 @@
-import { BadRequestException, ConflictException, Injectable, NotFoundException } from '@nestjs/common';
+import {
+  BadRequestException,
+  ConflictException,
+  Injectable,
+  NotFoundException,
+} from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { JwtService } from '@nestjs/jwt';
 import { hash, verify } from '@node-rs/argon2';
 import { ListingStatus, Prisma } from '@prisma/client';
+import { MarketplaceService } from '../marketplace/marketplace.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { AdminCreateListingDto } from './dto/admin-create-listing.dto';
 import { AdminUpdateListingDto } from './dto/admin-update-listing.dto';
 import { CreateContactMessageDto } from './dto/contact-message.dto';
 import { ImportListingsDto } from './dto/import-listings.dto';
-import { QueryAdminActivityDto, QueryAdminCardsDto, QueryAdminListingsDto } from './dto/query-admin.dto';
+import {
+  QueryAdminActivityDto,
+  QueryAdminCardsDto,
+  QueryAdminListingsDto,
+} from './dto/query-admin.dto';
 import * as crypto from 'node:crypto';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
@@ -28,6 +38,7 @@ export class AdminService {
     private readonly prisma: PrismaService,
     private readonly jwt: JwtService,
     private readonly config: ConfigService,
+    private readonly marketplace: MarketplaceService,
   ) {}
 
   async login(email: string, password: string) {
@@ -50,14 +61,19 @@ export class AdminService {
   }
 
   async stats(): Promise<AdminStatsResponse> {
-    const [totalListings, activeListings, soldListings, totalUsers, totalCards] =
-      await Promise.all([
-        this.prisma.listing.count(),
-        this.prisma.listing.count({ where: { status: ListingStatus.ACTIVE } }),
-        this.prisma.listing.count({ where: { status: ListingStatus.SOLD } }),
-        this.prisma.user.count(),
-        this.prisma.card.count(),
-      ]);
+    const [
+      totalListings,
+      activeListings,
+      soldListings,
+      totalUsers,
+      totalCards,
+    ] = await Promise.all([
+      this.prisma.listing.count(),
+      this.prisma.listing.count({ where: { status: ListingStatus.ACTIVE } }),
+      this.prisma.listing.count({ where: { status: ListingStatus.SOLD } }),
+      this.prisma.user.count(),
+      this.prisma.card.count(),
+    ]);
     const revenueAgg = await this.prisma.listing.aggregate({
       where: { status: ListingStatus.SOLD },
       _sum: { priceIdrx: true },
@@ -154,7 +170,9 @@ export class AdminService {
         ...(dto.image !== undefined && { image: dto.image }),
         ...(dto.imageBack !== undefined && { imageBack: dto.imageBack }),
         ...(dto.price !== undefined && { priceIdrx: dto.price }),
-        ...(dto.expectedValue !== undefined && { expectedValueIdrx: dto.expectedValue }),
+        ...(dto.expectedValue !== undefined && {
+          expectedValueIdrx: dto.expectedValue,
+        }),
         ...(dto.buyback !== undefined && { buybackIdrx: dto.buyback }),
         ...(dto.grade !== undefined && { grade: dto.grade }),
         ...(dto.grader !== undefined && { grader: dto.grader }),
@@ -164,11 +182,17 @@ export class AdminService {
         ...(dto.element !== undefined && { element: dto.element }),
         ...(dto.category !== undefined && { category: dto.category }),
         ...(dto.certificate !== undefined && { certificate: dto.certificate }),
-        ...(dto.vaultLocation !== undefined && { vaultLocation: dto.vaultLocation }),
+        ...(dto.vaultLocation !== undefined && {
+          vaultLocation: dto.vaultLocation,
+        }),
         ...(dto.cardNumber !== undefined && { cardNumber: dto.cardNumber }),
         ...(dto.variant !== undefined && { variant: dto.variant }),
-        ...(dto.contractAddress !== undefined && { contractAddress: dto.contractAddress }),
-        ...(dto.priceHistory !== undefined && { priceHistory: dto.priceHistory }),
+        ...(dto.contractAddress !== undefined && {
+          contractAddress: dto.contractAddress,
+        }),
+        ...(dto.priceHistory !== undefined && {
+          priceHistory: dto.priceHistory,
+        }),
       },
       include: { nft: true },
     });
@@ -200,7 +224,9 @@ export class AdminService {
       offers: [],
     }));
     const created = await this.prisma.$transaction(
-      items.map((data) => this.prisma.listing.create({ data, include: { nft: true } })),
+      items.map((data) =>
+        this.prisma.listing.create({ data, include: { nft: true } }),
+      ),
     );
     return { imported: created.length, items: created };
   }
@@ -238,10 +264,14 @@ export class AdminService {
     const limit = query.limit ?? 20;
     const where: Prisma.ListingWhereInput = {};
     if (query.action === 'sold') where.status = ListingStatus.SOLD;
-    else if (query.action === 'cancelled') where.status = ListingStatus.CANCELLED;
-    if (query.search) where.name = { contains: query.search, mode: 'insensitive' };
+    else if (query.action === 'cancelled')
+      where.status = ListingStatus.CANCELLED;
+    if (query.search)
+      where.name = { contains: query.search, mode: 'insensitive' };
 
-    const orderBy: Prisma.ListingOrderByWithRelationInput = { updatedAt: 'desc' };
+    const orderBy: Prisma.ListingOrderByWithRelationInput = {
+      updatedAt: 'desc',
+    };
     const [data, total] = await Promise.all([
       this.prisma.listing.findMany({
         where,
@@ -268,7 +298,12 @@ export class AdminService {
 
   /* ---------- Contact Messages ---------- */
 
-  async listMessages(query: { page?: number; limit?: number; search?: string; status?: string }) {
+  async listMessages(query: {
+    page?: number;
+    limit?: number;
+    search?: string;
+    status?: string;
+  }) {
     const page = query.page ?? 1;
     const limit = query.limit ?? 20;
     const where: Prisma.ContactMessageWhereInput = {};
@@ -301,16 +336,25 @@ export class AdminService {
   async markMessageRead(id: string, isRead: boolean) {
     const row = await this.prisma.contactMessage.findUnique({ where: { id } });
     if (!row) throw new NotFoundException('Message not found');
-    return this.prisma.contactMessage.update({ where: { id }, data: { isRead } });
+    return this.prisma.contactMessage.update({
+      where: { id },
+      data: { isRead },
+    });
   }
 
   /* ---------- Offers (aggregate from Listing JSON) ---------- */
-  async listOffers(query: { page?: number; limit?: number; listingId?: string; search?: string }) {
+  async listOffers(query: {
+    page?: number;
+    limit?: number;
+    listingId?: string;
+    search?: string;
+  }) {
     const page = query.page ?? 1;
     const limit = query.limit ?? 20;
     const where: Prisma.OfferWhereInput = {};
     if (query.listingId) where.listingId = query.listingId;
-    if (query.search) where.listing = { name: { contains: query.search, mode: 'insensitive' } };
+    if (query.search)
+      where.listing = { name: { contains: query.search, mode: 'insensitive' } };
 
     const [data, total] = await Promise.all([
       this.prisma.offer.findMany({
@@ -333,14 +377,26 @@ export class AdminService {
       createdAt: o.createdAt.toISOString(),
     }));
 
-    return { data: mapped, total, page, limit, totalPages: Math.ceil(total / limit) };
+    return {
+      data: mapped,
+      total,
+      page,
+      limit,
+      totalPages: Math.ceil(total / limit),
+    };
   }
 
   /* ---------- Daily Stats (Charts) ---------- */
 
   async dailyStats(days = 30) {
     const now = new Date();
-    const since = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() - days));
+    const since = new Date(
+      Date.UTC(
+        now.getUTCFullYear(),
+        now.getUTCMonth(),
+        now.getUTCDate() - days,
+      ),
+    );
 
     const listings = await this.prisma.listing.findMany({
       where: { createdAt: { gte: since } },
@@ -374,9 +430,20 @@ export class AdminService {
     dailyRevenue.sort((a, b) => a.date.localeCompare(b.date));
 
     const statusDist = [
-      { status: 'ACTIVE', count: await this.prisma.listing.count({ where: { status: 'ACTIVE' } }) },
-      { status: 'SOLD', count: await this.prisma.listing.count({ where: { status: 'SOLD' } }) },
-      { status: 'CANCELLED', count: await this.prisma.listing.count({ where: { status: 'CANCELLED' } }) },
+      {
+        status: 'ACTIVE',
+        count: await this.prisma.listing.count({ where: { status: 'ACTIVE' } }),
+      },
+      {
+        status: 'SOLD',
+        count: await this.prisma.listing.count({ where: { status: 'SOLD' } }),
+      },
+      {
+        status: 'CANCELLED',
+        count: await this.prisma.listing.count({
+          where: { status: 'CANCELLED' },
+        }),
+      },
     ];
 
     const topListings = await this.prisma.listing.findMany({
@@ -391,7 +458,8 @@ export class AdminService {
       where: { status: 'SOLD' },
     });
     const totalListings = await this.prisma.listing.count();
-    const conversionRate = totalListings > 0 ? (conversionAgg._count / totalListings) * 100 : 0;
+    const conversionRate =
+      totalListings > 0 ? (conversionAgg._count / totalListings) * 100 : 0;
 
     return {
       dailyListings,
@@ -404,28 +472,19 @@ export class AdminService {
 
   /* ---------- Image Upload ---------- */
 
-  async acceptOffer(id: string) {
-    const offer = await this.prisma.offer.findUnique({ where: { id } });
-    if (!offer) throw new NotFoundException('Offer not found.');
-    if (offer.status !== 'PENDING') throw new BadRequestException('Offer already processed.');
-
-    return this.prisma.offer.update({
-      where: { id },
-      data: { status: 'ACCEPTED' },
-      include: { listing: { select: { id: true, name: true } } },
-    });
+  /**
+   * Accept/reject dari admin DIDELEGASIKAN ke MarketplaceService — jalur yang
+   * sama dengan tombol penjual di halaman profil. Dulu method ini cuma menulis
+   * `status: ACCEPTED` tanpa menjual listing atau mint NFT: offer tampak diterima
+   * padahal kartunya tidak pernah pindah tangan, dan penjual kehilangan tombol
+   * accept-nya (status bukan PENDING lagi). Admin = moderasi, bukan alur utama.
+   */
+  acceptOffer(id: string) {
+    return this.marketplace.acceptOfferAsAdmin(id);
   }
 
-  async rejectOffer(id: string) {
-    const offer = await this.prisma.offer.findUnique({ where: { id } });
-    if (!offer) throw new NotFoundException('Offer not found.');
-    if (offer.status !== 'PENDING') throw new BadRequestException('Offer already processed.');
-
-    return this.prisma.offer.update({
-      where: { id },
-      data: { status: 'REJECTED' },
-      include: { listing: { select: { id: true, name: true } } },
-    });
+  rejectOffer(id: string) {
+    return this.marketplace.rejectOfferAsAdmin(id);
   }
 
   async uploadImage(file: Express.Multer.File): Promise<{ url: string }> {
@@ -433,7 +492,8 @@ export class AdminService {
     const ext = path.extname(file.originalname).toLowerCase() || '.png';
     const filename = `${crypto.randomUUID()}${ext}`;
     const dest = path.join(this.uploadDir, filename);
-    if (!fs.existsSync(this.uploadDir)) fs.mkdirSync(this.uploadDir, { recursive: true });
+    if (!fs.existsSync(this.uploadDir))
+      fs.mkdirSync(this.uploadDir, { recursive: true });
     fs.writeFileSync(dest, file.buffer);
     return { url: `/uploads/${filename}` };
   }
@@ -455,16 +515,156 @@ export class AdminService {
 
   async seedChartData() {
     const SEED_CARDS = [
-      { name: 'Pikachu VMAX', set: 'Classic', rarity: 'Legendary', grade: 'PSA 10', grader: 'PSA' as const, gradeScore: 10, language: 'English', era: 'Classic', element: 'Lightning', category: 'Special Illustration', priceIdrx: 45000000, expectedValueIdrx: 48000000, image: 'https://placehold.co/400x560/3a2e0e/ffd700?text=Pikachu+VMAX' },
-      { name: 'Charizard VMAX', set: 'Classic', rarity: 'Legendary Rare', grade: 'PSA 10', grader: 'PSA' as const, gradeScore: 10, language: 'English', era: 'Classic', element: 'Fire', category: 'Character Illustration', priceIdrx: 52000000, expectedValueIdrx: 55000000, image: 'https://placehold.co/400x560/4a0e0e/ffd700?text=Charizard+VMAX' },
-      { name: 'Mewtwo VSTAR', set: 'Evolving', rarity: 'Legendary', grade: 'BGS 9.5', grader: 'BGS' as const, gradeScore: 9.5, language: 'English', era: 'Modern', element: 'Psychic', category: 'Special Illustration', priceIdrx: 28000000, expectedValueIdrx: 30000000, image: 'https://placehold.co/400x560/2e0e4a/ffd700?text=Mewtwo+VSTAR' },
-      { name: 'Gengar VMAX', set: 'Classic', rarity: 'Legendary Rare', grade: 'CGC 9', grader: 'CGC' as const, gradeScore: 9, language: 'English', era: 'Classic', element: 'Darkness', category: 'Special Illustration', priceIdrx: 35000000, expectedValueIdrx: 38000000, image: 'https://placehold.co/400x560/2e0e0e/ffd700?text=Gengar+VMAX' },
-      { name: 'Eevee V', set: 'Promo', rarity: 'Epic', grade: 'PSA 9', grader: 'PSA' as const, gradeScore: 9, language: 'English', era: 'Modern', element: 'Normal', category: 'Illustration', priceIdrx: 8500000, expectedValueIdrx: 9200000, image: 'https://placehold.co/400x560/3a2e0e/c8a84e?text=Eevee+V' },
-      { name: 'Umbreon VMAX', set: 'Evolving', rarity: 'Legendary', grade: 'BGS 10', grader: 'BGS' as const, gradeScore: 10, language: 'English', era: 'Modern', element: 'Darkness', category: 'Character Illustration', priceIdrx: 62000000, expectedValueIdrx: 65000000, image: 'https://placehold.co/400x560/1a1a2e/ffd700?text=Umbreon+VMAX' },
-      { name: 'Rayquaza V', set: 'Classic', rarity: 'Legendary', grade: 'CGC 9.5', grader: 'CGC' as const, gradeScore: 9.5, language: 'English', era: 'Classic', element: 'Dragon', category: 'Special Illustration', priceIdrx: 38000000, expectedValueIdrx: 40000000, image: 'https://placehold.co/400x560/0e3a2e/ffd700?text=Rayquaza+V' },
-      { name: 'Glaceon VSTAR', set: 'Jungle', rarity: 'Epic', grade: 'PSA 10', grader: 'PSA' as const, gradeScore: 10, language: 'English', era: 'Modern', element: 'Water', category: 'Illustration', priceIdrx: 18000000, expectedValueIdrx: 20000000, image: 'https://placehold.co/400x560/0e1a4a/aaccff?text=Glaceon+VSTAR' },
-      { name: 'Lucario V', set: 'Rare', rarity: 'Rare', grade: 'PSA 9', grader: 'PSA' as const, gradeScore: 9, language: 'Japan', era: 'Modern', element: 'Fighting', category: 'Character Illustration', priceIdrx: 6500000, expectedValueIdrx: 7200000, image: 'https://placehold.co/400x560/4a2e0e/d4a64e?text=Lucario+V' },
-      { name: 'Sylveon VMAX', set: 'Evolving', rarity: 'Legendary', grade: 'BGS 9.5', grader: 'BGS' as const, gradeScore: 9.5, language: 'English', era: 'Modern', element: 'Fairy', category: 'Character Illustration', priceIdrx: 42000000, expectedValueIdrx: 45000000, image: 'https://placehold.co/400x560/2e1a3a/ffb6c1?text=Sylveon+VMAX' },
+      {
+        name: 'Pikachu VMAX',
+        set: 'Classic',
+        rarity: 'Legendary',
+        grade: 'PSA 10',
+        grader: 'PSA' as const,
+        gradeScore: 10,
+        language: 'English',
+        era: 'Classic',
+        element: 'Lightning',
+        category: 'Special Illustration',
+        priceIdrx: 45000000,
+        expectedValueIdrx: 48000000,
+        image: 'https://placehold.co/400x560/3a2e0e/ffd700?text=Pikachu+VMAX',
+      },
+      {
+        name: 'Charizard VMAX',
+        set: 'Classic',
+        rarity: 'Legendary Rare',
+        grade: 'PSA 10',
+        grader: 'PSA' as const,
+        gradeScore: 10,
+        language: 'English',
+        era: 'Classic',
+        element: 'Fire',
+        category: 'Character Illustration',
+        priceIdrx: 52000000,
+        expectedValueIdrx: 55000000,
+        image: 'https://placehold.co/400x560/4a0e0e/ffd700?text=Charizard+VMAX',
+      },
+      {
+        name: 'Mewtwo VSTAR',
+        set: 'Evolving',
+        rarity: 'Legendary',
+        grade: 'BGS 9.5',
+        grader: 'BGS' as const,
+        gradeScore: 9.5,
+        language: 'English',
+        era: 'Modern',
+        element: 'Psychic',
+        category: 'Special Illustration',
+        priceIdrx: 28000000,
+        expectedValueIdrx: 30000000,
+        image: 'https://placehold.co/400x560/2e0e4a/ffd700?text=Mewtwo+VSTAR',
+      },
+      {
+        name: 'Gengar VMAX',
+        set: 'Classic',
+        rarity: 'Legendary Rare',
+        grade: 'CGC 9',
+        grader: 'CGC' as const,
+        gradeScore: 9,
+        language: 'English',
+        era: 'Classic',
+        element: 'Darkness',
+        category: 'Special Illustration',
+        priceIdrx: 35000000,
+        expectedValueIdrx: 38000000,
+        image: 'https://placehold.co/400x560/2e0e0e/ffd700?text=Gengar+VMAX',
+      },
+      {
+        name: 'Eevee V',
+        set: 'Promo',
+        rarity: 'Epic',
+        grade: 'PSA 9',
+        grader: 'PSA' as const,
+        gradeScore: 9,
+        language: 'English',
+        era: 'Modern',
+        element: 'Normal',
+        category: 'Illustration',
+        priceIdrx: 8500000,
+        expectedValueIdrx: 9200000,
+        image: 'https://placehold.co/400x560/3a2e0e/c8a84e?text=Eevee+V',
+      },
+      {
+        name: 'Umbreon VMAX',
+        set: 'Evolving',
+        rarity: 'Legendary',
+        grade: 'BGS 10',
+        grader: 'BGS' as const,
+        gradeScore: 10,
+        language: 'English',
+        era: 'Modern',
+        element: 'Darkness',
+        category: 'Character Illustration',
+        priceIdrx: 62000000,
+        expectedValueIdrx: 65000000,
+        image: 'https://placehold.co/400x560/1a1a2e/ffd700?text=Umbreon+VMAX',
+      },
+      {
+        name: 'Rayquaza V',
+        set: 'Classic',
+        rarity: 'Legendary',
+        grade: 'CGC 9.5',
+        grader: 'CGC' as const,
+        gradeScore: 9.5,
+        language: 'English',
+        era: 'Classic',
+        element: 'Dragon',
+        category: 'Special Illustration',
+        priceIdrx: 38000000,
+        expectedValueIdrx: 40000000,
+        image: 'https://placehold.co/400x560/0e3a2e/ffd700?text=Rayquaza+V',
+      },
+      {
+        name: 'Glaceon VSTAR',
+        set: 'Jungle',
+        rarity: 'Epic',
+        grade: 'PSA 10',
+        grader: 'PSA' as const,
+        gradeScore: 10,
+        language: 'English',
+        era: 'Modern',
+        element: 'Water',
+        category: 'Illustration',
+        priceIdrx: 18000000,
+        expectedValueIdrx: 20000000,
+        image: 'https://placehold.co/400x560/0e1a4a/aaccff?text=Glaceon+VSTAR',
+      },
+      {
+        name: 'Lucario V',
+        set: 'Rare',
+        rarity: 'Rare',
+        grade: 'PSA 9',
+        grader: 'PSA' as const,
+        gradeScore: 9,
+        language: 'Japan',
+        era: 'Modern',
+        element: 'Fighting',
+        category: 'Character Illustration',
+        priceIdrx: 6500000,
+        expectedValueIdrx: 7200000,
+        image: 'https://placehold.co/400x560/4a2e0e/d4a64e?text=Lucario+V',
+      },
+      {
+        name: 'Sylveon VMAX',
+        set: 'Evolving',
+        rarity: 'Legendary',
+        grade: 'BGS 9.5',
+        grader: 'BGS' as const,
+        gradeScore: 9.5,
+        language: 'English',
+        era: 'Modern',
+        element: 'Fairy',
+        category: 'Character Illustration',
+        priceIdrx: 42000000,
+        expectedValueIdrx: 45000000,
+        image: 'https://placehold.co/400x560/2e1a3a/ffb6c1?text=Sylveon+VMAX',
+      },
     ];
 
     const now = new Date();
@@ -472,7 +672,16 @@ export class AdminService {
 
     for (let dayOffset = 90; dayOffset >= 0; dayOffset--) {
       const card = SEED_CARDS[dayOffset % SEED_CARDS.length];
-      const createdAt = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() - dayOffset, 8, 0, 0));
+      const createdAt = new Date(
+        Date.UTC(
+          now.getUTCFullYear(),
+          now.getUTCMonth(),
+          now.getUTCDate() - dayOffset,
+          8,
+          0,
+          0,
+        ),
+      );
       await this.prisma.listing.create({
         data: {
           ...card,
@@ -491,7 +700,32 @@ export class AdminService {
 
     return {
       listingsCreated: created,
-      dateRange: { to: new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() - 0, 8, 0, 0)).toISOString().slice(0, 10), from: new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() - 90, 8, 0, 0)).toISOString().slice(0, 10) },
+      dateRange: {
+        to: new Date(
+          Date.UTC(
+            now.getUTCFullYear(),
+            now.getUTCMonth(),
+            now.getUTCDate() - 0,
+            8,
+            0,
+            0,
+          ),
+        )
+          .toISOString()
+          .slice(0, 10),
+        from: new Date(
+          Date.UTC(
+            now.getUTCFullYear(),
+            now.getUTCMonth(),
+            now.getUTCDate() - 90,
+            8,
+            0,
+            0,
+          ),
+        )
+          .toISOString()
+          .slice(0, 10),
+      },
     };
   }
 }

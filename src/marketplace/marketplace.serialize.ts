@@ -1,4 +1,4 @@
-import { Listing, Nft, Offer, Prisma } from '@prisma/client';
+import { Activity, Listing, Nft, Offer, Prisma, User } from '@prisma/client';
 
 /**
  * Bentuk yang dikirim ke frontend, cocok 1:1 dengan tipe `Listing` di
@@ -6,8 +6,14 @@ import { Listing, Nft, Offer, Prisma } from '@prisma/client';
  * runtime dari daftar mock.
  */
 type ListingNft = Pick<Nft, 'id' | 'assetAddress' | 'mintTx'>;
-type OfferRecord = Pick<Offer, 'id' | 'user' | 'amount' | 'status' | 'createdAt'>;
-type ListingRow = Listing & { nft?: ListingNft | null; offerRecords?: OfferRecord[] };
+type OfferRecord = Pick<
+  Offer,
+  'id' | 'user' | 'amount' | 'status' | 'createdAt'
+>;
+type ListingRow = Listing & {
+  nft?: ListingNft | null;
+  offerRecords?: OfferRecord[];
+};
 
 type DetailOffer = {
   id: string;
@@ -104,7 +110,8 @@ export type ListingDto = ReturnType<typeof toListingDto>;
 export function toCardDetailDto(row: ListingRow, related: ListingRow[]) {
   const listing = toListingDto(row);
   const languageLong = row.language === 'Japan' ? 'Japanese' : row.language;
-  const languageTag = row.language === 'Japan' ? 'JAPAN' : row.language.toUpperCase();
+  const languageTag =
+    row.language === 'Japan' ? 'JAPAN' : row.language.toUpperCase();
   const priceHistory = readPriceHistory(row.priceHistory, [
     row.expectedValueIdrx,
     row.priceIdrx,
@@ -137,3 +144,104 @@ export function toCardDetailDto(row: ListingRow, related: ListingRow[]) {
     related: related.map(toListingDto),
   };
 }
+
+/* ------------------------- offers (profile tabs) -------------------------- */
+
+/** Wallet panjang → bentuk pendek gaya TopNav (mis. "7xKXt..9c14"). */
+export function shortWallet(address: string): string {
+  if (address.length <= 11) return address;
+  return `${address.slice(0, 5)}..${address.slice(-4)}`;
+}
+
+/** Nama yang dipakai di kolom From/To: displayName kalau ada, kalau tidak wallet pendek. */
+export function displayLabel(
+  user: Pick<User, 'displayName' | 'walletAddress'> | null | undefined,
+  fallback: string,
+): string {
+  if (!user) return fallback;
+  const name = user.displayName?.trim();
+  return name && name.length > 0 ? name : shortWallet(user.walletAddress);
+}
+
+type OfferUser = Pick<User, 'id' | 'displayName' | 'walletAddress'>;
+type OfferListing = Pick<
+  Listing,
+  | 'id'
+  | 'name'
+  | 'image'
+  | 'category'
+  | 'set'
+  | 'priceIdrx'
+  | 'status'
+  | 'sellerAddress'
+> & { seller?: OfferUser | null };
+
+export type OfferRow = Offer & {
+  listing: OfferListing;
+  buyer?: OfferUser | null;
+};
+
+/**
+ * Satu baris tab "Offers Made" / "Offers Received". Membawa kedua sisi
+ * (buyer + seller) supaya satu tipe cukup untuk kedua tabel.
+ */
+export function toOfferDto(row: OfferRow) {
+  return {
+    id: row.id,
+    listingId: row.listingId,
+    amount: row.amount,
+    status: row.status,
+    createdAt: row.createdAt.toISOString(),
+    /** true selama offer masih bisa di-accept/reject/cancel. */
+    actionable: row.status === 'PENDING' && row.listing.status === 'ACTIVE',
+    item: {
+      id: row.listing.id,
+      name: row.listing.name,
+      image: row.listing.image,
+      category: row.listing.category,
+      set: row.listing.set,
+      price: row.listing.priceIdrx,
+      status: row.listing.status,
+    },
+    buyer: {
+      id: row.buyerId,
+      // `row.user` = label snapshot saat offer dibuat (offer POC lama tak punya buyer).
+      label: displayLabel(row.buyer, row.user),
+    },
+    seller: {
+      id: row.listing.seller?.id ?? null,
+      label: displayLabel(row.listing.seller, row.listing.sellerAddress),
+    },
+  };
+}
+
+export type OfferDto = ReturnType<typeof toOfferDto>;
+
+/* ------------------------ activity (profile feed) ------------------------- */
+
+export type ActivityRow = Activity;
+
+/**
+ * Satu baris feed Activity. Semua kolom tampilan berasal dari snapshot di baris
+ * activity, jadi riwayat tetap utuh walau listing/user berubah nama.
+ */
+export function toActivityDto(row: ActivityRow) {
+  return {
+    id: row.id,
+    type: row.type,
+    listingId: row.listingId,
+    item: {
+      name: row.itemName,
+      image: row.itemImage,
+      category: row.category,
+      set: row.set,
+    },
+    /** null ⇒ event tanpa nominal; UI merender "----". */
+    amount: row.amount,
+    from: row.fromId ? { id: row.fromId, label: row.fromLabel } : null,
+    to: row.toId ? { id: row.toId, label: row.toLabel } : null,
+    createdAt: row.createdAt.toISOString(),
+  };
+}
+
+export type ActivityDto = ReturnType<typeof toActivityDto>;
