@@ -350,8 +350,13 @@ export interface CcMachine {
   stock: CcRarityMap<number>;
 }
 
-/** Respons MENTAH GET /api/machines (array CcMachine dengan harga dolar-penuh). */
-export type CcMachinesResponse = CcMachine[];
+/**
+ * Respons MENTAH GET /api/machines. BENTUK ASLI (diverifikasi ke API devnet):
+ * `{ machines: CcMachine[] }` — array-nya DIBUNGKUS, bukan telanjang. Harga tiap
+ * mesin dalam dolar penuh. Klien tetap toleran bila suatu saat mereka mengirim
+ * array langsung (lihat CcGachaClient.machines()).
+ */
+export type CcMachinesResponse = { machines: CcMachine[] } | CcMachine[];
 
 /**
  * Mesin SETELAH dinormalisasi di boundary klien (CcGachaClient.machines()).

@@ -138,7 +138,11 @@ export class CcGachaClient {
    */
   async machines(): Promise<CcMachineNormalized[]> {
     const raw = await this.request<CcMachinesResponse>('GET', '/api/machines');
-    return raw.map((machine) => this.normalizeMachine(machine));
+    // BENTUK ASLI (diverifikasi ke API devnet): { machines: [...] } — BUKAN array telanjang.
+    // Tetap toleran kalau suatu saat mereka mengirim array langsung, supaya perubahan bentuk
+    // di sisi mereka tidak langsung membuat seluruh halaman Open Packs 500.
+    const list = Array.isArray(raw) ? raw : (raw?.machines ?? []);
+    return list.map((machine) => this.normalizeMachine(machine));
   }
 
   /** Ubah satu mesin dolar-penuh menjadi bentuk base-units yang aman untuk jalur uang. */
