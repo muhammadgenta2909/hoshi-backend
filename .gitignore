@@ -38,6 +38,16 @@ yarn-error.log*
 .env
 .env.local
 .env.*.local
+# Backup .env berisi secret yang SAMA persis dengan .env — tanpa baris ini,
+# satu `git add -A` yang tidak sengaja akan mem-publish JWT secret, kredensial DB,
+# API key CollectorCrypt, dan private key treasury sekaligus.
+.env.backup*
+.env.bak
+
+# Keypair treasury: private key dompet yang MEMEGANG USDC dan membayar setiap pack.
+# Ini file paling berbahaya di repo — siapa pun yang memilikinya bisa menguras treasury.
+# (platform.json sudah di-ignore di bawah; treasury.json levelnya lebih tinggi lagi.)
+treasury.json
 
 # temp directory
 .temp

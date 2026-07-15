@@ -16,6 +16,8 @@ import { InventoryModule } from './inventory/inventory.module';
 import { PacksModule } from './packs/packs.module';
 import { MarketplaceModule } from './marketplace/marketplace.module';
 import { AdminModule } from './admin/admin.module';
+import { CollectorCryptModule } from './collectorcrypt/collectorcrypt.module';
+import { PaymentsModule } from './payments/payments.module';
 
 @Module({
   imports: [
@@ -33,6 +35,8 @@ import { AdminModule } from './admin/admin.module';
     PacksModule,
     MarketplaceModule,
     AdminModule,
+    CollectorCryptModule,
+    PaymentsModule,
   ],
   controllers: [AppController],
   providers: [

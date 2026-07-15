@@ -13,8 +13,39 @@ import type {
   InventoryProvider,
 } from '../inventory.types';
 
-// Bentuk respons API CollectorCrypt (ASUMSI — konfirmasi ke docs.collectorcrypt.com
-// saat integrasi: modul Gacha API, Marketplace API, Vault/Shipping API).
+/**
+ * ⚠️ DEPRECATED — JANGAN DIPAKAI, JANGAN DIJADIKAN CONTOH. Endpoint yang dipanggil
+ * file ini TIDAK ADA di API CollectorCrypt yang sebenarnya.
+ *
+ * Integrasi yang benar & hidup: **src/collectorcrypt/** (CcGachaClient + GachaService).
+ *
+ * Yang salah di sini, setelah kontrak resmi mereka diverifikasi:
+ * - `/gacha/pool`, `/gacha/reserve`, `/gacha/settle`, `/gacha/release` semuanya KARANGAN → 404.
+ * - TIDAK ADA primitif reserve/hold/release. Pack dibeli putus; tidak ada cara membatalkan.
+ * - Undian BUKAN milik kita. CollectorCrypt yang mengundi lewat VRF on-chain
+ *   (program ccvrfu3fSpbnPLiUqdWAt85Zn9nq96ekwGTbHqGtdgQ) dan user bisa memverifikasinya
+ *   sendiri. Rarity mereka 4 tier (Common|Uncommon|Rare|Epic), bukan 5 tier Hoshi.
+ * - Auth-nya header `x-api-key`, BUKAN `Authorization: Bearer` seperti di bawah.
+ * - Bentuk interface `deliver()` mustahil dipenuhi: alur asli mereka wajib melewati
+ *   TANDA TANGAN WALLET USER di tengah jalan —
+ *     generatePack → USER MENANDATANGANI di browser → submitTransaction → openPack
+ *   sedangkan `deliver()` adalah satu panggilan sinkron dari server. Backend kita
+ *   non-kustodial: ia tidak pernah memegang private key user, jadi langkah itu tidak
+ *   akan pernah bisa dikerjakan dari sini.
+ *
+ * Dibiarkan hidup HANYA supaya InventoryModule/InventoryService tetap kompilasi
+ * (keduanya meng-import kelas ini). Inert selama INVENTORY_PROVIDER != 'collectorcrypt'
+ * dan selama COLLECTORCRYPT_API_* kosong — `credentials()` di bawah melempar 503.
+ *
+ * ⚠️ Mengisi COLLECTORCRYPT_API_BASE_URL + COLLECTORCRYPT_API_KEY akan MELUCUTI penjaga itu
+ * dan membuat stub ini benar-benar menembak endpoint karangan tadi. Var gacha yang asli
+ * sengaja dinamai lain (COLLECTORCRYPT_GACHA_BASE_URL / COLLECTORCRYPT_GACHA_API_KEY)
+ * supaya keduanya tidak pernah saling menyalakan. Biarkan var lama ini KOSONG.
+ */
+
+// Bentuk respons API CollectorCrypt (ASUMSI — dan asumsi ini sudah TERBUKTI SALAH;
+// lihat blok deprecation di atas. Bentuk wire yang benar ada di
+// src/collectorcrypt/cc-gacha.types.ts).
 interface CcPoolItem {
   assetId: string;
   name: string;

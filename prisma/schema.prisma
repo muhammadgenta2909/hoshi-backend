@@ -77,6 +77,12 @@ model User {
   activityFrom Activity[] @relation("ActivityFrom")
   activityTo   Activity[] @relation("ActivityTo")
 
+  // Pembelian pack gacha CollectorCrypt (ledger atribusi komisi).
+  ccPackPurchases CcPackPurchase[]
+
+  // Order pembayaran rupiah lewat IDRX (buku besar on-ramp).
+  paymentOrders PaymentOrder[]
+
   @@map("users")
 }
 
@@ -323,4 +329,184 @@ model ContactMessage {
   createdAt   DateTime @default(now())
 
   @@map("contact_messages")
+}
+
+/// Status siklus hidup satu pembelian pack di gacha CollectorCrypt.
+/// Status siklus hidup satu pembelian pack.
+///
+/// PENTING — "gagal" dan "tidak diketahui" WAJIB dibedakan. submitTransaction milik
+/// CollectorCrypt TIDAK idempoten: begitu kita meneruskannya, transaksi bisa saja sudah
+/// tayang on-chain walau panggilan kita timeout. Menandai baris seperti itu FAILED =
+/// bohong (uang user mungkin sudah keluar) DAN berbahaya (membuka jalan submit ulang →
+/// user ditagih 2×). Itulah sebabnya SUBMITTING ada.
+enum CcPackStatus {
+  GENERATED // transaksi dibuat, belum di-submit — tidak ada uang bergerak, aman ditinggal
+  SUBMITTING // sudah diteruskan ke CC, hasilnya BELUM DIKETAHUI → JANGAN submit ulang; rekonsiliasi lewat packStatus
+  SUBMITTED // pembelian terkonfirmasi on-chain — uang sudah keluar
+  OPENED // pack dibuka, kartu diberikan
+  BOUGHT_BACK // kartu dijual balik ke CollectorCrypt (window 72 jam)
+  FAILED // HANYA bila kita YAKIN tidak ada uang yang bergerak
+}
+
+/// Ledger pembelian pack CollectorCrypt — catatan INDEPENDEN kita atas tiap pack.
+/// Ditulis write-ahead (segera setelah generatePack, sebelum uang user bergerak):
+/// generatePack tidak memindahkan dana, tapi setelah user menandatangani transaksi
+/// TIDAK ADA primitif reverse/hold/release di CollectorCrypt — baris yang hilang =
+/// user bayar tanpa jejak, dan komisi 50% yang tak bisa kita tagih. Jadi: roll
+/// forward saja (rekonsiliasi via GET /api/pack/status?memo=), jangan pernah rollback.
+model CcPackPurchase {
+  id String @id @default(cuid())
+
+  /// "slug-uuid" dari CollectorCrypt. Prefix slug = identitas revenue-share kita,
+  /// dan @unique bikin retry generate/submit tidak bisa menggandakan baris.
+  memo String @unique
+
+  userId String
+  /// Restrict (eksplisit): baris ledger tidak boleh yatim gara-gara user dihapus.
+  user   User   @relation(fields: [userId], references: [id], onDelete: Restrict)
+
+  /// Wallet pembayar. SELALU diturunkan dari JWT, TIDAK PERNAH dari request body:
+  /// body yang bisa memilih address = penyerang menyuruh korban menandatangani
+  /// pembelian yang kartunya mendarat di wallet penyerang.
+  playerAddress String
+
+  packType String
+  turbo    Boolean      @default(false)
+  status   CcPackStatus @default(GENERATED)
+
+  /// Snapshot harga saat generate — USDC base unit (6 desimal), bukan IDR.
+  /// Dipakai untuk memverifikasi jumlah on-chain sebelum revenue dibukukan.
+  priceUsdc Int?
+
+  purchaseSignature String? // signature tx pembelian
+  openSignature     String? // signature tx pengiriman NFT
+
+  /// Tier milik CollectorCrypt (Common|Uncommon|Rare|Epic) — String mentah, JANGAN
+  /// dipetakan ke 5-tier Hoshi: "Uncommon" tidak punya padanan dan akan hilang.
+  rarity     String?
+  nftAddress String?
+  nftName    String?
+
+  /// Hasil roll VRF on-chain (sumber kebenaran satu-satunya; kita tidak pernah
+  /// mengocok ulang secara lokal). String supaya aman dari overflow number JS.
+  roll   String?
+  points Int?
+
+  buybackAmountUsdc Int? // USDC base unit, dari GET /api/buyback/available
+  buybackSignature  String?
+
+  error String? // pesan error terakhir bila FAILED
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  openedAt  DateTime?
+
+  @@index([userId])
+  @@index([status])
+  @@map("cc_pack_purchases")
+}
+
+/// Status siklus hidup satu order pembayaran rupiah (IDRX on-ramp).
+///
+/// PENTING — PAID berarti "SUDAH DIVERIFIKASI lewat GET /api/transaction/user-transaction-history",
+/// BUKAN "callback bilang begitu". Webhook IDRX TIDAK ditandatangani (dokumentasinya menyatakannya
+/// terus terang) dan merchantOrderId bukan rahasia — kita sendiri yang menyerahkannya ke frontend
+/// supaya user bisa melihat QR-nya. Artinya siapa pun yang tahu URL callback kita bisa mengarang
+/// POST "paymentStatus: PAID". Body callback itu PEMICU, bukan BUKTI: satu-satunya field yang boleh
+/// dibaca darinya adalah merchantOrderId, dan setiap keputusan uang diambil dari respons History API
+/// (syarat lolos: paymentStatus=PAID DAN userMintStatus=MINTED).
+///
+/// FAILED vs REFUND_DUE dibedakan dengan disiplin yang sama seperti CcPackStatus:
+/// FAILED hanya boleh dipakai bila kita YAKIN tidak ada uang user yang tertahan. Begitu rupiah
+/// masuk tapi pack tidak bisa diberikan, itu REFUND_DUE — utang, bukan kegagalan yang bisa dilupakan.
+enum PaymentStatus {
+  PENDING // mint-request dibuat, QR/VA sudah diberikan, user belum bayar
+  PAID // TERVERIFIKASI lewat Transaction History API — BUKAN dari callback mentah
+  FULFILLING // klaim atomik sudah dimenangkan; treasury sedang membeli pack. Mencegah dobel-pack.
+  FULFILLED // pack sudah dibeli & tertaut ke order ini (packMemo terisi)
+  EXPIRED // jendela pembayaran habis tanpa pembayaran masuk
+  FAILED // gagal, dan kita YAKIN tidak ada uang user yang tertahan
+  REFUND_DUE // user SUDAH BAYAR tapi pack tidak bisa diberikan → kita berutang refund
+}
+
+/// Buku besar pembayaran rupiah — satu baris per order pack yang dibayar lewat IDRX.
+/// Baris inilah GERBANG antara "user login" dan "treasury membelanjakan ~$50 USDC asli":
+/// jalur fulfilment WAJIB mengklaim baris ini secara atomik (updateMany berpredikat status,
+/// PAID → FULFILLING, lalu cek count === 1) SEBELUM memanggil GachaService.purchase().
+/// Tanpa klaim itu, callback yang di-replay / callback yang balapan dengan reconciler akan
+/// membeli N pack untuk SATU pembayaran.
+model PaymentOrder {
+  id String @id @default(cuid())
+
+  /// Dikembalikan oleh IDRX saat mint-request. Kunci join untuk callback DAN rekonsiliasi.
+  /// @unique bukan sekadar rapi: keunikan inilah yang memaksa setiap callback palsu, callback
+  /// yang diulang, dan dua request yang balapan bertabrakan di SATU baris — supaya satu flip
+  /// status atomik bisa menentukan tepat satu pemenang.
+  merchantOrderId String @unique
+
+  /// Field `id` milik IDRX (bukan punya kita) — disimpan untuk jejak audit / support.
+  idrxRequestId String?
+  reference     String?
+
+  userId String
+  /// Restrict (eksplisit): baris pembayaran tidak boleh yatim gara-gara user dihapus.
+  /// Riwayat uang tidak ikut terhapus bersama akun.
+  user   User   @relation(fields: [userId], references: [id], onDelete: Restrict)
+
+  /// Snapshot saat order dibuat. Saat fulfilment, packType diambil dari SINI dan tidak pernah
+  /// dari input client — kalau tidak, user bisa memesan pack murah lalu menebus pack mahal.
+  packType String
+
+  /// Yang dibayar user, rupiah penuh sebagai integer. JANGAN float (uang tidak boleh dibulatkan
+  /// oleh IEEE-754). Int aman di sini: mint-request IDRX dibatasi maks Rp 1.000.000.000 per
+  /// transaksi, di bawah plafon Int 2.147.483.647.
+  priceIdr Int
+
+  /// Snapshot harga mesin CollectorCrypt saat order dibuat — USDC base unit (6 desimal), BUKAN
+  /// rupiah. Dua kolom uang di baris ini memakai satuan yang berbeda; jangan pernah dibandingkan
+  /// satu sama lain. Snapshot ini yang jadi plafon harga saat pack ditebus, supaya pergerakan
+  /// harga CC antara "user bayar" dan "kita tebus" tidak diam-diam ditanggung treasury.
+  priceUsdc Int
+
+  /// QRIS | VA | HOSTED (alur hosted IDRX = paymentUrl, mencakup QRIS + e-wallet + VA + retail).
+  paymentMethod    String
+  qrContent        String?
+  virtualAccountNo String?
+  paymentUrl       String?
+
+  /// Diturunkan dari expiryPeriod IDRX. Pembayaran yang mendarat setelah ini berarti snapshot
+  /// harganya sudah basi — jangan di-fulfil otomatis.
+  expiresAt DateTime?
+
+  status PaymentStatus @default(PENDING)
+
+  /// Nilai MENTAH dari IDRX, disimpan apa adanya untuk audit — bukan untuk dipakai sebagai
+  /// gerbang. Gerbangnya adalah kolom `status` di atas, yang cuma boleh diubah setelah
+  /// verifikasi server-to-server.
+  idrxPaymentStatus  String? // PAID | WAITING_FOR_PAYMENT | EXPIRED
+  idrxUserMintStatus String? // NOT_AVAILABLE | PROCESSING | MINTED | FAILED | REJECTED | REFUND
+
+  /// Signature transaksi mint IDRX di Solana (IDRX masuk ke treasury).
+  txHash String?
+
+  /// Tautan ke CcPackPurchase.memo. @unique = SATU ORDER, SATU PACK, SELAMANYA — ini invariant
+  /// terakhir yang menahan uang kita: kalaupun semua pengaman di atas bocor dan fulfilment
+  /// dijalankan dua kali untuk satu pembayaran, INSERT/UPDATE kedua tabrakan di unique index ini
+  /// dan Postgres yang menolaknya. Klaim atomik mencegah pack kedua dibuat; @unique membuktikan
+  /// setelahnya bahwa memang tidak pernah ada pack kedua.
+  packMemo String? @unique
+
+  /// Pesan error terakhir. JANGAN pernah menuliskan kredensial IDRX ke sini.
+  error String?
+
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  paidAt      DateTime?
+  fulfilledAt DateTime?
+
+  /// Reconciler memindai order yang menggantung berdasarkan status — callback IDRX tidak pernah
+  /// diulang, jadi polling inilah sumber kebenaran yang sebenarnya.
+  @@index([status])
+  @@index([userId])
+  @@map("payment_orders")
 }
