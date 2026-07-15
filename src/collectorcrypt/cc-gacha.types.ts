@@ -99,10 +99,15 @@ export function usdDollarsToUsdcBaseUnits(dollars: number): number {
   return baseUnits;
 }
 
-/** Bentuk body error CC saat non-2xx (dipakai untuk meneruskan pesan aslinya). */
+/**
+ * Bentuk body error CC saat non-2xx. Pada 500, alasan SPESIFIK ada di `details`
+ * (mis. "Machine is empty" / "Machine is off"), sedang `error` cuma generik
+ * ("Internal server error"). Baca `details` dulu supaya pesan ke user berguna.
+ */
 export interface CcErrorBody {
   message?: string;
   error?: string;
+  details?: string;
 }
 
 /* --- POST /api/generatePack --- */

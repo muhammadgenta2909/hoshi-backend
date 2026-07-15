@@ -68,4 +68,29 @@ describe('CcGachaClient.machines', () => {
     expect(list).toHaveLength(1);
     expect(list[0].priceUsdcBaseUnits).toBe(250_000_000);
   });
+
+  // "Machine is empty" (di `details`, bukan `error`) harus jadi kalimat yang jelas untuk
+  // user — bukan "Internal server error" mentah yang sempat tampil di halaman.
+  it('turns a CC "Machine is empty" 500 into a friendly, actionable message', async () => {
+    global.fetch = jest.fn().mockResolvedValue({
+      ok: false,
+      status: 500,
+      text: () =>
+        Promise.resolve(
+          JSON.stringify({
+            error: 'Internal server error',
+            details: 'Machine is empty',
+          }),
+        ),
+    });
+
+    await expect(client.stock()).rejects.toMatchObject({
+      status: 503,
+      message: expect.stringContaining('sedang tidak tersedia') as string,
+    });
+    // Teks teknis CC tidak boleh bocor ke pesan yang dilihat user.
+    await expect(client.stock()).rejects.not.toMatchObject({
+      message: expect.stringContaining('Internal server error') as string,
+    });
+  });
 });

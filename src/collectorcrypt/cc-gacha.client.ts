@@ -300,10 +300,16 @@ export class CcGachaClient {
         return new ForbiddenException(message);
       case 404:
         return new NotFoundException(message);
-      default:
+      default: {
         // 500 (mesin off/stok habis/saldo kurang/processing), 503 (terlalu banyak pack
         // terbuka), dan status tak terduga lainnya → semua jadi 503 di sisi kita.
-        return new ServiceUnavailableException(message);
+        // Pesan mentah CC ("Internal server error"/"Machine is empty") tampil ke USER,
+        // jadi kalau ini soal ketersediaan mesin, ganti dengan kalimat yang jelas &
+        // bisa ditindaklanjuti. Detail teknis tetap masuk log di atas.
+        return new ServiceUnavailableException(
+          friendlyMachineMessage(remote) ?? message,
+        );
+      }
     }
   }
 
@@ -323,7 +329,9 @@ export class CcGachaClient {
       const parsed: unknown = JSON.parse(text);
       if (parsed && typeof parsed === 'object') {
         const bodyError = parsed as CcErrorBody;
-        const message = bodyError.message ?? bodyError.error;
+        // `details` lebih spesifik dari `error` yang generik ("Internal server error").
+        const message =
+          bodyError.details ?? bodyError.message ?? bodyError.error;
         if (typeof message === 'string' && message.length > 0) {
           return message.slice(0, CC_ERROR_MESSAGE_MAX);
         }
@@ -333,4 +341,23 @@ export class CcGachaClient {
     }
     return text.slice(0, CC_ERROR_MESSAGE_MAX);
   }
+}
+
+/**
+ * Ubah alasan mentah CC menjadi kalimat yang jelas & bisa ditindaklanjuti untuk USER.
+ * Di devnet, status mesin sering berubah: "Machine is empty" (kolam hadiah kosong),
+ * "Machine is off"/"low stock"/"balance"/"processing". Semua itu artinya sama bagi user —
+ * mesin ini sedang tidak bisa dibuka — jadi jangan tampilkan teks teknis mereka.
+ * Kembalikan null bila bukan soal ketersediaan mesin (biar pesan asli yang dipakai).
+ */
+function friendlyMachineMessage(remote: string | undefined): string | null {
+  if (!remote) return null;
+  if (
+    /empty|off|stock|balance|processing|not\s*available|unavailable/i.test(
+      remote,
+    )
+  ) {
+    return 'Mesin pack ini sedang tidak tersedia (kolam hadiahnya kosong atau ditutup sementara). Coba mesin lain, atau ulangi sebentar lagi.';
+  }
+  return null;
 }
