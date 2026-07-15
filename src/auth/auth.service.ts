@@ -70,6 +70,10 @@ export class AuthService {
         id: user.id,
         walletAddress: user.walletAddress,
         displayName: user.displayName,
+        // WAJIB: frontend memakai user.role untuk isAdmin (mis. membuka tombol
+        // tarik pack devnet). Tanpa baris ini role selalu undefined di klien →
+        // admin yang sah pun terkunci walau role-nya sudah ADMIN di DB.
+        role: user.role,
       },
     };
   }
