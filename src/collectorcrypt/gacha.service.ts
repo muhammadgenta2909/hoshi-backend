@@ -23,6 +23,7 @@ import type {
   CcOpenPackResponse,
   CcPackStatusResponse,
   CcRarity,
+  CcRecentWinnerRaw,
   CcRecentWinnersResponse,
   CcStockResponse,
   CcSubmitTransactionResponse,
@@ -36,6 +37,24 @@ import { TreasuryService } from './treasury.service';
 
 /** Mesin default CollectorCrypt bila klien tidak menyebut packType. */
 const DEFAULT_PACK_TYPE = 'pokemon_50';
+
+/**
+ * Mesin yang di-agregasi untuk ticker "Live Card Won" bila klien TIDAK menyebut packType.
+ * Tiap mesin cuma menyimpan 5 winner terakhir, jadi kita gabung beberapa mesin supaya
+ * feed-nya ramai. getRecentWinners tetap mengembalikan winner historis walau mesinnya
+ * sedang "empty/off", jadi daftar ini aman walau sebagian mesin sedang tidak aktif.
+ */
+const DEFAULT_WINNER_PACKS: readonly string[] = [
+  'pokemon_250',
+  'pokemon_50',
+  'pokemon_25',
+  'onepiece_250',
+  'pokemon_1000',
+  'pokemon_cnft',
+];
+
+/** Batas item ticker: cukup ramai untuk marquee, tidak membanjiri payload. */
+const MAX_WINNERS = 20;
 
 /** Batas panjang pesan error yang disimpan di ledger. */
 const ERROR_MAX = 500;
@@ -114,6 +133,26 @@ export interface CcPackDto {
   openedAt: Date | null;
 }
 
+/**
+ * Bentuk DOMAIN BERSIH satu pemenang untuk ticker "Live Card Won" di frontend.
+ *
+ * Sengaja RATA & minimal: gambar + nama kartu ASLI dari getRecentWinners, plus wallet
+ * pemenangnya untuk subtitle "won by <wallet>". TIDAK ADA nilai USD di sini — payload
+ * getRecentWinners tidak menjamin harga, jadi kita tidak pernah mengarang nominal.
+ */
+export interface GachaWinner {
+  /** Alamat NFT — juga kunci dedupe antar mesin. */
+  nftAddress: string;
+  /** Nama kartu asli (nft.content.metadata.name). */
+  name: string;
+  /** URL gambar: links.image ?? files[0].cdn_uri ?? files[0].uri. */
+  image: string;
+  /** Wallet pemenang (dipotong di frontend jadi mis. 4Th3…VtyT). */
+  winner: string;
+  /** prize_tier numerik apa adanya dari CC. */
+  tier: number;
+}
+
 export interface CcGeneratedPackDto {
   memo: string;
   /** Base64 UNSIGNED — hanya wallet user yang boleh menandatanganinya. */
@@ -183,6 +222,49 @@ export class GachaService {
 
   recentWinners(packType?: string): Promise<CcRecentWinnersResponse> {
     return this.client.recentWinners(packType ?? DEFAULT_PACK_TYPE);
+  }
+
+  /**
+   * Feed "Live Card Won" — bentuk domain BERSIH untuk ticker frontend.
+   *
+   * - packType diberikan → ambil winner mesin itu saja.
+   * - packType kosong → agregasi DEFAULT_WINNER_PACKS secara PARALEL. Dipakai
+   *   Promise.allSettled: satu mesin yang gagal (empty/off/timeout) TIDAK boleh
+   *   menjatuhkan seluruh feed — mesin lain tetap tampil.
+   *
+   * Pemetaan winner mentah → GachaWinner bersifat DEFENSIF: getRecentWinners tidak
+   * didokumentasikan dan bentuknya bersarang, jadi item yang tak punya nama/gambar/alamat
+   * dibuang diam-diam, bukan bikin throw. Hasilnya di-dedupe per nftAddress dan dibatasi
+   * MAX_WINNERS. Metode ini TIDAK PERNAH melempar ke caller hanya karena satu item jelek.
+   */
+  async winners(packType?: string): Promise<GachaWinner[]> {
+    const packs = packType ? [packType] : DEFAULT_WINNER_PACKS;
+
+    const settled = await Promise.allSettled(
+      packs.map((pack) => this.client.recentWinners(pack)),
+    );
+
+    const winners: GachaWinner[] = [];
+    const seen = new Set<string>();
+
+    for (const result of settled) {
+      if (result.status !== 'fulfilled') {
+        // Satu mesin gagal → catat, lanjut. Bukan alasan menjatuhkan seluruh feed.
+        this.logger.warn(
+          `getRecentWinners gagal untuk satu mesin: ${errorMessage(result.reason)}`,
+        );
+        continue;
+      }
+      for (const raw of extractWinnerArray(result.value)) {
+        const mapped = toGachaWinner(raw);
+        if (!mapped || seen.has(mapped.nftAddress)) continue;
+        seen.add(mapped.nftAddress);
+        winners.push(mapped);
+        if (winners.length >= MAX_WINNERS) return winners;
+      }
+    }
+
+    return winners;
   }
 
   /**
@@ -924,6 +1006,75 @@ function unrecognisedRarityNote(raw: string): string {
     0,
     ERROR_MAX,
   );
+}
+
+/**
+ * Ekstrak array winner mentah dari amplop getRecentWinners.
+ *
+ * Bentuk terverifikasi ke API devnet: `{ success: true, data: [ ... ] }`. Tetap toleran
+ * kalau suatu saat CC mengirim array telanjang — sama pola-nya dengan machines(). Apa pun
+ * yang bukan array (null, objek tanpa data, dsb) → array kosong, BUKAN throw.
+ */
+function extractWinnerArray(response: unknown): CcRecentWinnerRaw[] {
+  if (Array.isArray(response)) {
+    return response as CcRecentWinnerRaw[];
+  }
+  if (response && typeof response === 'object') {
+    const data = (response as { data?: unknown }).data;
+    if (Array.isArray(data)) {
+      return data as CcRecentWinnerRaw[];
+    }
+  }
+  return [];
+}
+
+/**
+ * Winner mentah CC → GachaWinner bersih, atau null bila item tak layak tampil.
+ *
+ * DEFENSIF sepenuhnya: bentuk item tidak dijamin kontrak, jadi tiap lapis dibaca lewat
+ * optional chaining dan divalidasi tipenya. nftAddress (kunci dedupe), name, dan image
+ * WAJIB ada & non-kosong — item tanpa salah satunya dibuang (return null), tidak dipaksakan.
+ * Gambar diambil berurutan: links.image → files[0].cdn_uri → files[0].uri. Tidak ada
+ * nilai USD yang disentuh: payload ini tidak menjamin harga, jadi kita tidak mengarangnya.
+ */
+function toGachaWinner(raw: CcRecentWinnerRaw): GachaWinner | null {
+  const content = raw?.nft?.content;
+  const nftAddress = raw?.nft?.id;
+  const name = content?.metadata?.name;
+  const winner = raw?.winner;
+
+  const files = content?.files;
+  const firstFile = Array.isArray(files) ? files[0] : undefined;
+  // `??` tidak cukup: feed CC kadang mengirim links.image = "" (string kosong), dan `??`
+  // hanya jatuh pada null/undefined — string kosong akan lolos lalu gagal cek panjang di
+  // bawah, membuang winner yang sebenarnya punya cdn_uri/uri valid. Pilih yang PERTAMA
+  // yang tidak kosong.
+  const image = [
+    content?.links?.image,
+    firstFile?.cdn_uri,
+    firstFile?.uri,
+  ].find((u): u is string => typeof u === 'string' && u.length > 0);
+
+  if (
+    typeof nftAddress !== 'string' ||
+    nftAddress.length === 0 ||
+    typeof name !== 'string' ||
+    name.length === 0 ||
+    typeof image !== 'string' ||
+    image.length === 0 ||
+    typeof winner !== 'string' ||
+    winner.length === 0
+  ) {
+    return null;
+  }
+
+  return {
+    nftAddress,
+    name,
+    image,
+    winner,
+    tier: typeof raw?.prize_tier === 'number' ? raw.prize_tier : 0,
+  };
 }
 
 /** Baris ledger → bentuk publik. `rarity` tetap 4-tier CollectorCrypt, bukan tier Hoshi. */

@@ -50,6 +50,7 @@ describe('GachaService', () => {
     openPack: jest.Mock;
     packStatus: jest.Mock;
     buyback: jest.Mock;
+    recentWinners: jest.Mock;
   };
   let treasury: {
     publicKey: string;
@@ -173,6 +174,7 @@ describe('GachaService', () => {
       openPack: jest.fn(),
       packStatus: jest.fn(),
       buyback: jest.fn(),
+      recentWinners: jest.fn(),
     };
     treasury = {
       publicKey: TREASURY_WALLET,
@@ -692,6 +694,220 @@ describe('GachaService', () => {
       ).rejects.toThrow(ForbiddenException);
 
       expect(client.buyback).not.toHaveBeenCalled();
+    });
+  });
+
+  /**
+   * winners(): feed "Live Card Won". Membaca bentuk getRecentWinners MENTAH CC — bersarang
+   * dalam (nft.content.metadata.name + links.image) dan tidak dijamin kontrak — lalu
+   * memetakannya ke GachaWinner[] yang rata. Dua sifat yang diuji ketat: pemetaan yang
+   * BENAR (nama/gambar/winner/tier), dan KETAHANAN — satu mesin yang gagal atau satu item
+   * jelek tidak boleh menjatuhkan seluruh feed.
+   */
+  describe('winners', () => {
+    // Bentuk SATU winner VERBATIM dari getRecentWinners (disederhanakan dari payload devnet).
+    const NFT_ID = '8AskiNe41W1wo15SzTDUkfErV1v89c2yJ3Utzkg8MREt';
+    const WINNER_WALLET = '4Th3Ej2oJrsj2g2Hi7JByC2R237YvHnNaZgMp4ztVtyT';
+    const CARD_NAME = '2003 #7 Minun-Holo PSA 6 EX Drag';
+    const CARD_IMAGE = 'https://arweave.net/q9PZ';
+
+    const rawWinner = {
+      winner: WINNER_WALLET,
+      prize_tier: 4,
+      nft: {
+        id: NFT_ID,
+        content: {
+          links: { image: CARD_IMAGE },
+          files: [
+            {
+              uri: 'https://arweave.net/file-uri',
+              cdn_uri: 'https://cdn.helius-rpc.com/file-cdn',
+              cc_cdn: 'https://dq63y5568o1bp.cloudfront.net/file-cc',
+            },
+          ],
+          metadata: { name: CARD_NAME, attributes: [] },
+        },
+      },
+    };
+
+    // Amplop APA ADANYA: { success: true, data: [ ... ] }.
+    const envelope = (data: unknown[]): unknown => ({ success: true, data });
+
+    it('maps the raw CollectorCrypt winner shape to a clean GachaWinner', async () => {
+      client.recentWinners.mockResolvedValue(envelope([rawWinner]));
+
+      const res = await service.winners('pokemon_50');
+
+      // packType diberikan → hanya mesin itu yang dipanggil, sekali.
+      expect(client.recentWinners).toHaveBeenCalledTimes(1);
+      expect(client.recentWinners).toHaveBeenCalledWith('pokemon_50');
+      expect(res).toEqual([
+        {
+          nftAddress: NFT_ID,
+          name: CARD_NAME,
+          image: CARD_IMAGE,
+          winner: WINNER_WALLET,
+          tier: 4,
+        },
+      ]);
+    });
+
+    // Gambar diambil berurutan: links.image → files[0].cdn_uri → files[0].uri.
+    it('falls back to files[0].cdn_uri, then files[0].uri, when links.image is absent', async () => {
+      const noLink = {
+        ...rawWinner,
+        nft: {
+          id: 'nft-no-link',
+          content: { ...rawWinner.nft.content, links: {} },
+        },
+      };
+      const noLinkNoCdn = {
+        ...rawWinner,
+        nft: {
+          id: 'nft-uri-only',
+          content: {
+            ...rawWinner.nft.content,
+            links: {},
+            files: [{ uri: 'https://arweave.net/only-uri' }],
+          },
+        },
+      };
+      client.recentWinners.mockResolvedValue(envelope([noLink, noLinkNoCdn]));
+
+      const res = await service.winners('pokemon_50');
+
+      expect(res).toEqual([
+        expect.objectContaining({
+          nftAddress: 'nft-no-link',
+          image: 'https://cdn.helius-rpc.com/file-cdn',
+        }),
+        expect.objectContaining({
+          nftAddress: 'nft-uri-only',
+          image: 'https://arweave.net/only-uri',
+        }),
+      ]);
+    });
+
+    // REGRESI: links.image = "" (string KOSONG) harus dianggap tidak ada, lalu jatuh ke
+    // files[0].cdn_uri. Dengan `??` dulu, "" lolos dan winner valid malah dibuang.
+    it('treats an empty-string links.image as absent and falls back to cdn_uri', async () => {
+      const emptyLink = {
+        ...rawWinner,
+        nft: {
+          id: 'nft-empty-link',
+          content: { ...rawWinner.nft.content, links: { image: '' } },
+        },
+      };
+      client.recentWinners.mockResolvedValue(envelope([emptyLink]));
+
+      const res = await service.winners('pokemon_50');
+
+      expect(res).toEqual([
+        expect.objectContaining({
+          nftAddress: 'nft-empty-link',
+          image: 'https://cdn.helius-rpc.com/file-cdn',
+        }),
+      ]);
+    });
+
+    // Item jelek dibuang DIAM-DIAM (return null), bukan bikin throw — satu winner tanpa
+    // nama atau tanpa gambar tidak boleh mematikan seluruh feed.
+    it('skips winners missing a name or an image without throwing', async () => {
+      const noName = {
+        winner: 'w-no-name',
+        prize_tier: 1,
+        nft: {
+          id: 'nft-no-name',
+          content: { links: { image: 'https://img' } },
+        },
+      };
+      const noImage = {
+        winner: 'w-no-image',
+        prize_tier: 2,
+        nft: { id: 'nft-no-image', content: { metadata: { name: 'Anon' } } },
+      };
+      client.recentWinners.mockResolvedValue(
+        envelope([noName, noImage, rawWinner]),
+      );
+
+      const res = await service.winners('pokemon_50');
+
+      expect(res).toHaveLength(1);
+      expect(res[0].nftAddress).toBe(NFT_ID);
+    });
+
+    // allSettled: satu packType yang REJECTED (mesin off/timeout) tidak menjatuhkan hasil —
+    // mesin lain tetap menyumbang winner. Tanpa packType, winners() meng-agregasi 6 mesin.
+    it('does not drop the feed when one packType rejects (aggregation path)', async () => {
+      const other = {
+        ...rawWinner,
+        winner: 'otherWallet',
+        nft: { ...rawWinner.nft, id: 'nft-other' },
+      };
+      client.recentWinners.mockImplementation((pack: string) =>
+        pack === 'pokemon_250'
+          ? Promise.reject(new Error('Machine is off'))
+          : Promise.resolve(envelope([other])),
+      );
+
+      const res = await service.winners();
+
+      // 6 mesin default dipanggil; 1 reject, 5 sukses (semua winner sama → dedupe jadi 1).
+      expect(client.recentWinners).toHaveBeenCalledTimes(6);
+      expect(res).toEqual([
+        {
+          nftAddress: 'nft-other',
+          name: CARD_NAME,
+          image: CARD_IMAGE,
+          winner: 'otherWallet',
+          tier: 4,
+        },
+      ]);
+    });
+
+    // Dedupe lintas mesin berdasar nftAddress: winner yang sama muncul di banyak mesin,
+    // tapi hanya tampil sekali di feed.
+    it('dedupes winners by nftAddress across machines', async () => {
+      const distinct = {
+        ...rawWinner,
+        winner: 'walletB',
+        nft: { ...rawWinner.nft, id: 'nft-distinct' },
+      };
+      // Tiap mesin mengembalikan DUA winner yang sama → 6 mesin, tetap 2 unik.
+      client.recentWinners.mockResolvedValue(envelope([rawWinner, distinct]));
+
+      const res = await service.winners();
+
+      expect(res).toHaveLength(2);
+      expect(res.map((w) => w.nftAddress).sort()).toEqual(
+        [NFT_ID, 'nft-distinct'].sort(),
+      );
+    });
+
+    // Payload yang bukan amplop winner (null / bentuk asing) → [] , TIDAK PERNAH throw.
+    it('returns an empty array when the response is not a winners envelope', async () => {
+      client.recentWinners.mockResolvedValue(null);
+
+      await expect(service.winners('pokemon_50')).resolves.toEqual([]);
+    });
+
+    // prize_tier hilang → tier default 0 (tetap ditampilkan; tier bukan syarat tampil).
+    it('defaults tier to 0 when prize_tier is absent', async () => {
+      const noTier = {
+        winner: WINNER_WALLET,
+        nft: {
+          id: 'nft-no-tier',
+          content: {
+            links: { image: CARD_IMAGE },
+            metadata: { name: CARD_NAME },
+          },
+        },
+      };
+      client.recentWinners.mockResolvedValue(envelope([noTier]));
+
+      const [winner] = await service.winners('pokemon_50');
+
+      expect(winner.tier).toBe(0);
     });
   });
 

@@ -74,11 +74,15 @@ export class GachaController {
     name: 'packType',
     required: false,
     example: 'pokemon_50',
-    description: 'Kode mesin dari GET /gacha/machines. Default: pokemon_50.',
+    description:
+      'Kode mesin dari GET /gacha/machines. Kosongkan untuk menggabungkan beberapa mesin.',
   })
-  @ApiOperation({ summary: '5 pemenang terakhir sebuah mesin (publik)' })
-  recentWinners(@Query('packType') packType?: string) {
-    return this.gacha.recentWinners(packType);
+  @ApiOperation({
+    summary:
+      'Kartu-kartu yang baru dimenangkan untuk ticker "Live Card Won" (publik)',
+  })
+  winners(@Query('packType') packType?: string) {
+    return this.gacha.winners(packType);
   }
 
   @Get('verify/:memo')

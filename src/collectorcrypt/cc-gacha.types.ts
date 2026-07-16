@@ -412,6 +412,41 @@ export interface CcPackStatusResponse {
 /** 5 pemenang terakhir. Bentuk item tidak dijanjikan kontrak → opaque. */
 export type CcRecentWinnersResponse = unknown;
 
+/**
+ * Bentuk LONGGAR satu winner mentah dari getRecentWinners — SEMUA field opsional.
+ *
+ * Ini BUKAN kontrak yang dijamin CC: getRecentWinners tidak didokumentasikan dan
+ * bentuknya bersarang dalam. Tipe ini hanya alat bantu penyempit (narrowing) supaya
+ * GachaService.winners() bisa membaca lewat optional chaining tanpa men-deref buta.
+ * Setiap field WAJIB diperlakukan mungkin-hilang; item yang tak lengkap dibuang, bukan
+ * dipaksakan. Gambar diambil berurutan: links.image → files[0].cdn_uri → files[0].uri.
+ */
+export interface CcRecentWinnerRaw {
+  /** Wallet pemenang (untuk subtitle "won by <wallet>"). */
+  winner?: string;
+  /** prize_tier NUMERIK (getRecentWinners TIDAK mengirim rarity string di sini). */
+  prize_tier?: number;
+  nft?: {
+    /** Alamat NFT — dipakai sebagai kunci dedupe. */
+    id?: string;
+    content?: {
+      links?: { image?: string };
+      files?: Array<{ uri?: string; cdn_uri?: string; cc_cdn?: string }>;
+      metadata?: { name?: string };
+    };
+  };
+}
+
+/**
+ * Amplop getRecentWinners APA ADANYA: `{ success: true, data: [ winner, ... ] }`.
+ * Dibiarkan longgar (data opsional & opaque) supaya perubahan kecil di sisi CC tidak
+ * langsung membuat ticker "Live Card Won" gagal total.
+ */
+export interface CcRecentWinnersEnvelope {
+  success?: boolean;
+  data?: unknown;
+}
+
 /* --- GET /api/vrf/verify?memo= --- */
 
 /** Bukti VRF untuk sebuah memo. Bentuknya tidak dienumerasi kontrak → opaque. */
