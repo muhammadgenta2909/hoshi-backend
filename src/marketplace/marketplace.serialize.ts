@@ -96,6 +96,13 @@ export function toListingDto(row: ListingRow) {
     category: row.category,
     views: row.views,
     status: row.status,
+    // Provenance vault: 'HOSHI' | 'COLLECTORCRYPT'. Badge di kartu dirender dari
+    // sini — bukan lagi disimpulkan dari buyback > 0 (itu semantik lama yang
+    // salah kaprah: buyback>0 artinya "ada jaminan buyback", bukan "vault Hoshi").
+    source: row.source,
+    // true ⇒ CC punya buyback offer aktif untuk kartu ini (harga & eksekusi
+    // milik CollectorCrypt; kita hanya meneruskan sinyalnya).
+    ccHasBuyback: row.ccHasBuyback,
     nft: row.nft ? toNftDto(row.nft) : null,
   };
 }

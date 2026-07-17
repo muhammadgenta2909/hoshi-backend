@@ -1,7 +1,16 @@
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import { Grader } from '@prisma/client';
 import { Type } from 'class-transformer';
-import { IsArray, IsEnum, IsInt, IsNumber, IsOptional, IsString, Min, ValidateNested } from 'class-validator';
+import {
+  IsArray,
+  IsEnum,
+  IsInt,
+  IsNumber,
+  IsOptional,
+  IsString,
+  Min,
+  ValidateNested,
+} from 'class-validator';
 
 class ImportListingItemDto {
   @ApiProperty() @IsString() name!: string;
@@ -32,7 +41,10 @@ export class ImportListingsDto {
   @Type(() => ImportListingItemDto)
   items!: ImportListingItemDto[];
 
-  @ApiPropertyOptional({ description: 'Override seller address for all imported items' })
-  @IsOptional() @IsString()
+  @ApiPropertyOptional({
+    description: 'Override seller address for all imported items',
+  })
+  @IsOptional()
+  @IsString()
   sellerOverride?: string;
 }

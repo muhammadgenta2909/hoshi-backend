@@ -1,13 +1,14 @@
 import {
   BadRequestException,
   ConflictException,
+  ForbiddenException,
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { JwtService } from '@nestjs/jwt';
 import { hash, verify } from '@node-rs/argon2';
-import { ListingStatus, Prisma } from '@prisma/client';
+import { ListingSource, ListingStatus, Prisma } from '@prisma/client';
 import { MarketplaceService } from '../marketplace/marketplace.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { AdminCreateListingDto } from './dto/admin-create-listing.dto';
@@ -158,9 +159,48 @@ export class AdminService {
     return row;
   }
 
+  /**
+   * Field yang MILIK CollectorCrypt pada listing hasil sync: nilainya di-refresh
+   * setiap re-sync, jadi edit admin di sini pasti tertimpa lagi — lebih jujur
+   * menolaknya dengan 400 daripada menerima edit yang umurnya sampai sync
+   * berikutnya. Model bisnisnya "kita hanya edit harga di atas katalog mereka":
+   * price / expectedValue / buyback / priceHistory tetap boleh.
+   */
+  private static readonly CC_LOCKED_FIELDS = [
+    'name',
+    'set',
+    'rarity',
+    'image',
+    'imageBack',
+    'grade',
+    'grader',
+    'gradeScore',
+    'language',
+    'era',
+    'element',
+    'category',
+    'certificate',
+    'vaultLocation',
+    'cardNumber',
+    'variant',
+    'contractAddress',
+  ] as const satisfies readonly (keyof AdminUpdateListingDto)[];
+
   async updateListing(id: string, dto: AdminUpdateListingDto) {
     const existing = await this.prisma.listing.findUnique({ where: { id } });
     if (!existing) throw new NotFoundException('Listing not found.');
+    if (existing.source === ListingSource.COLLECTORCRYPT) {
+      const locked = AdminService.CC_LOCKED_FIELDS.filter(
+        (field) => dto[field] !== undefined,
+      );
+      if (locked.length > 0) {
+        throw new BadRequestException(
+          `Listing ini hasil sync CollectorCrypt — metadata milik mereka dan akan ` +
+            `ditimpa re-sync. Field terkunci: ${locked.join(', ')}. ` +
+            `Yang bisa diedit: price, expectedValue, buyback, priceHistory.`,
+        );
+      }
+    }
     return this.prisma.listing.update({
       where: { id },
       data: {
@@ -498,7 +538,15 @@ export class AdminService {
     return { url: `/uploads/${filename}` };
   }
 
-  async seedAdmin(email: string, password: string) {
+  async seedAdmin(email: string, password: string, secret?: string) {
+    // Fail closed: tanpa ADMIN_SECRET di env, seed tidak bisa dipakai sama
+    // sekali — endpoint ini membuat akun ADMIN, bukan sekadar data demo.
+    const expected = this.config.get<string>('ADMIN_SECRET');
+    if (!expected || secret !== expected) {
+      throw new ForbiddenException(
+        'Seed admin butuh header x-admin-secret yang cocok dengan env ADMIN_SECRET.',
+      );
+    }
     const existing = await this.prisma.user.findFirst({ where: { email } });
     if (existing) throw new ConflictException('Admin already exists');
     const passwordHash = await hash(password);

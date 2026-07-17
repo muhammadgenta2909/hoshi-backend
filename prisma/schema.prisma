@@ -50,17 +50,25 @@ enum Grader {
 
 // User dikenali dari wallet address (login-with-wallet).
 model User {
-  id            String   @id @default(cuid())
-  walletAddress String   @unique
+  id            String  @id @default(cuid())
+  walletAddress String  @unique
   // Nonce challenge untuk login berikutnya (di-set saat minta /auth/nonce,
   // dikosongkan setelah dipakai). Mencegah replay signature.
   nonce         String?
   displayName   String?
-  role          String   @default("USER")
+  role          String  @default("USER")
   email         String?
   passwordHash  String?
-  createdAt     DateTime @default(now())
-  updatedAt     DateTime @updatedAt
+
+  // Profil publik opsional (halaman profil). Semua nullable: null = belum diisi.
+  bio              String?
+  twitter          String? // handle tanpa "@" — di-strip di DTO
+  website          String?
+  phoneCountryCode String? // format "+62" (divalidasi di DTO)
+  phoneNumber      String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 
   nfts       Nft[]
   vaultItems VaultItem[]
@@ -83,7 +91,33 @@ model User {
   // Order pembayaran rupiah lewat IDRX (buku besar on-ramp).
   paymentOrders PaymentOrder[]
 
+  // Alamat pengiriman kartu fisik (redeem). Maks 5 per user (ditegakkan di service).
+  shippingAddresses ShippingAddress[]
+
   @@map("users")
+}
+
+/// Alamat pengiriman kartu fisik milik user (untuk redeem). Cascade: alamat tidak
+/// punya nilai audit sendiri, jadi ikut terhapus bila user-nya dihapus.
+model ShippingAddress {
+  id               String   @id @default(cuid())
+  userId           String
+  user             User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  fullName         String
+  country          String
+  street           String
+  apt              String?
+  state            String?
+  city             String
+  phoneCountryCode String?
+  phoneNumber      String?
+  zip              String
+  isDefault        Boolean  @default(false)
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  @@index([userId])
+  @@map("shipping_addresses")
 }
 
 // Katalog/template kartu (metadata kartu fisik yang di-vault Hoshi).
@@ -156,17 +190,26 @@ model VaultItem {
   @@map("vault_items")
 }
 
+// Provenance vault sebuah listing: di vault siapa kartu fisiknya tersimpan.
+// HOSHI = kartu kelolaan sendiri (default — semua listing lama otomatis HOSHI).
+// COLLECTORCRYPT = hasil sync katalog publik CollectorCrypt; metadata milik
+// mereka (di-refresh tiap sync), admin kita hanya mengedit HARGA di atasnya.
+enum ListingSource {
+  HOSHI
+  COLLECTORCRYPT
+}
+
 // Satu listing kartu bergrade di marketplace sekunder.
 // POC/MVP: field tampilan (grade, era, element, dll) di-denormalisasi ke baris ini
 // supaya GET /marketplace langsung cocok dengan tipe `Listing` di frontend
 // (lib/market.ts) — swap mock→API tanpa mapping. cardId opsional buat menautkan
 // ke katalog nanti.
 model Listing {
-  id     String @id @default(cuid())
-  name   String
-  set    String // MarketSet: Classic/Jungle/Promo/Rare/Evolving
-  rarity String // Tier: Common/Rare/Epic/Legendary/Legendary Rare
-  image  String
+  id        String  @id @default(cuid())
+  name      String
+  set       String // MarketSet: Classic/Jungle/Promo/Rare/Evolving
+  rarity    String // Tier: Common/Rare/Epic/Legendary/Legendary Rare
+  image     String
   // Optional back art. Kept on the listing row so detail pages do not invent it.
   imageBack String?
 
@@ -197,6 +240,28 @@ model Listing {
   offers          Json?
 
   status ListingStatus @default(ACTIVE)
+
+  // ── Provenance vault + jejak sync CollectorCrypt ─────────────────────────
+  // Badge "Hoshi vault" vs "CollectorCrypt vault" di frontend dirender dari
+  // `source` — BUKAN lagi disimpulkan dari buybackIdrx > 0.
+  source ListingSource @default(HOSHI)
+
+  // Kunci upsert sync: alamat NFT (Solana asset) kartu di katalog CC.
+  // @unique ⇒ re-sync meng-update baris yang sama, tidak pernah menduplikasi.
+  ccNftAddress String? @unique
+
+  // Snapshot harga listing CC dalam DOLAR UTUH (Float, BUKAN base unit 6-desimal:
+  // kartu > $2.147 akan overflow Int32 kalau disimpan sebagai base unit).
+  // Dipakai admin sebagai pembanding saat mengedit harga jual IDRX kita.
+  ccPriceUsd Float?
+
+  // true ⇒ kartu punya buyback offer AKTIF di CollectorCrypt (param ccBuyback di
+  // API mereka). Harga & eksekusi buyback 100% milik CC — kita tidak pernah
+  // mengarang nominal buyback untuk kartu vault mereka.
+  ccHasBuyback Boolean @default(false)
+
+  // Kapan baris ini terakhir disentuh proses sync CC (created ATAU updated).
+  ccSyncedAt DateTime?
 
   // Penjual: sellerId null utk listing seed/POC; sellerAddress selalu ada (display).
   sellerId      String?
@@ -229,6 +294,7 @@ model Listing {
   @@index([status])
   @@index([sellerId])
   @@index([buyerId])
+  @@index([source])
   @@map("listings")
 }
 
@@ -386,6 +452,9 @@ model CcPackPurchase {
   rarity     String?
   nftAddress String?
   nftName    String?
+  /// URL gambar kartu, resolusi sama dengan ticker winner:
+  /// content.links.image → files[0].cdn_uri → files[0].uri.
+  nftImage   String?
 
   /// Hasil roll VRF on-chain (sumber kebenaran satu-satunya; kita tidak pernah
   /// mengocok ulang secara lokal). String supaya aman dari overflow number JS.

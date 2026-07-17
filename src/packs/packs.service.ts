@@ -31,7 +31,9 @@ function shuffled<T>(input: T[]): T[] {
   return a;
 }
 
-function groupByRarity(cards: InventoryCard[]): Map<CardRarity, InventoryCard[]> {
+function groupByRarity(
+  cards: InventoryCard[],
+): Map<CardRarity, InventoryCard[]> {
   const map = new Map<CardRarity, InventoryCard[]>();
   for (const c of cards) {
     const arr = map.get(c.rarity) ?? [];

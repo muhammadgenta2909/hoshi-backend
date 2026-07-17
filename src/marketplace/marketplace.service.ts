@@ -7,6 +7,7 @@ import {
 } from '@nestjs/common';
 import {
   ActivityType,
+  ListingSource,
   ListingStatus,
   NftStatus,
   OfferStatus,
@@ -185,6 +186,7 @@ export class MarketplaceService {
         category: true,
         set: true,
         status: true,
+        source: true,
         sellerId: true,
         sellerAddress: true,
         seller: { select: USER_LABEL_SELECT },
@@ -193,6 +195,14 @@ export class MarketplaceService {
     if (!listing) throw new NotFoundException('Listing tidak ditemukan.');
     if (listing.status !== ListingStatus.ACTIVE) {
       throw new BadRequestException('Listing is no longer active.');
+    }
+    // Kartu vault CC tidak bisa di-offer: tidak ada penjual Hoshi yang bisa
+    // menerima (sellerId null) dan tidak ada mekanisme settle dengan CC. Lihat
+    // alasan lengkap di buy().
+    if (listing.source === ListingSource.COLLECTORCRYPT) {
+      throw new BadRequestException(
+        'Kartu vault CollectorCrypt belum menerima penawaran lewat Hoshi.',
+      );
     }
     if (listing.sellerId && listing.sellerId === buyer.id) {
       throw new BadRequestException(
@@ -565,6 +575,18 @@ export class MarketplaceService {
       include: { seller: { select: USER_LABEL_SELECT } },
     });
     if (!existing) throw new NotFoundException('Listing tidak ditemukan.');
+    // Kartu vault CollectorCrypt hanya di-sync untuk display: fisiknya ada di
+    // custody CC, masih dijual di collectorcrypt.com, dan belum ada mekanisme
+    // transfer/settlement CC. Kalau dibeli di sini, buy() akan me-mint NFT Hoshi
+    // BARU yang tidak menautkan aset CC apa pun dan menandai listing SOLD —
+    // menjual barang yang bukan milik kita (double-sale). Blokir sampai alur
+    // beli lintas-vault disepakati dengan CollectorCrypt.
+    if (existing.source === ListingSource.COLLECTORCRYPT) {
+      throw new BadRequestException(
+        'Kartu vault CollectorCrypt belum bisa dibeli lewat Hoshi. ' +
+          'Pembelian kartu CC akan tersedia setelah integrasi settlement CC.',
+      );
+    }
     if (existing.sellerId && existing.sellerId === user.id) {
       throw new BadRequestException('Cannot buy your own listing.');
     }

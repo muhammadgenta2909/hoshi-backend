@@ -53,7 +53,9 @@ export class HoshiVaultProvider implements InventoryProvider {
       data: { status: VaultStatus.MINTING },
     });
     if (locked.count !== 1) {
-      throw new ConflictException('Card is no longer available (taken by another draw).');
+      throw new ConflictException(
+        'Card is no longer available (taken by another draw).',
+      );
     }
     return { source: this.source, holdId: card.ref, card };
   }

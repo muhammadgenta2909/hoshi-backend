@@ -142,6 +142,7 @@ describe('GachaService', () => {
     rarity: null,
     nftAddress: null,
     nftName: null,
+    nftImage: null,
     roll: null,
     points: null,
     buybackAmountUsdc: null,
@@ -406,6 +407,8 @@ describe('GachaService', () => {
           rarity: 'Epic',
           nftAddress: 'NftAddrBase58',
           nftName: 'Charizard',
+          // Mock nftWon di atas tidak membawa links/files → gambar tidak ada = null.
+          nftImage: null,
           openSignature: 'OpenSig',
           roll: '9987',
           points: 420,

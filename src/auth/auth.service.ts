@@ -56,7 +56,9 @@ export class AuthService {
       data: { nonce: null },
     });
     if (consumed.count !== 1) {
-      throw new UnauthorizedException('Nonce already used. Request a new nonce.');
+      throw new UnauthorizedException(
+        'Nonce already used. Request a new nonce.',
+      );
     }
 
     const accessToken = await this.jwt.signAsync({

@@ -74,7 +74,9 @@ export class VaultService {
         where: { id: params.vaultItemId },
       });
       if (!exists) throw new NotFoundException('Vault item not found.');
-      throw new BadRequestException('This item has already been claimed / unavailable.');
+      throw new BadRequestException(
+        'This item has already been claimed / unavailable.',
+      );
     }
 
     try {

@@ -52,10 +52,34 @@ const rates = (
 ];
 
 export const PACKS: PackDefinition[] = [
-  { id: 'n', name: 'Hoshi Pack N', group: 'Normal Hoshi Pack', priceIdr: 10_000, dropRates: rates(70, 22, 6, 1.8, 0.2) },
-  { id: 'uc', name: 'Hoshi Pack UC', group: 'Normal Hoshi Pack', priceIdr: 15_000, dropRates: rates(62, 26, 9, 2.7, 0.3) },
-  { id: 'r', name: 'Hoshi Pack R', group: 'Special Hoshi Pack', priceIdr: 50_000, dropRates: rates(55, 27, 13, 4.6, 0.4) },
-  { id: 'sr', name: 'Hoshi Pack SR', group: 'Special Hoshi Pack', priceIdr: 75_000, dropRates: rates(50, 25, 15, 4.5, 0.5) },
+  {
+    id: 'n',
+    name: 'Hoshi Pack N',
+    group: 'Normal Hoshi Pack',
+    priceIdr: 10_000,
+    dropRates: rates(70, 22, 6, 1.8, 0.2),
+  },
+  {
+    id: 'uc',
+    name: 'Hoshi Pack UC',
+    group: 'Normal Hoshi Pack',
+    priceIdr: 15_000,
+    dropRates: rates(62, 26, 9, 2.7, 0.3),
+  },
+  {
+    id: 'r',
+    name: 'Hoshi Pack R',
+    group: 'Special Hoshi Pack',
+    priceIdr: 50_000,
+    dropRates: rates(55, 27, 13, 4.6, 0.4),
+  },
+  {
+    id: 'sr',
+    name: 'Hoshi Pack SR',
+    group: 'Special Hoshi Pack',
+    priceIdr: 75_000,
+    dropRates: rates(50, 25, 15, 4.5, 0.5),
+  },
 ];
 
 export function findPack(id: string): PackDefinition | undefined {

@@ -98,9 +98,13 @@ export class CollectorCryptProvider implements InventoryProvider {
 
   async reserve(card: InventoryCard): Promise<InventoryHold> {
     // TODO(integrasi): POST /gacha/reserve { assetId } → hold ber-TTL.
-    const res = await this.request<CcReserveResponse>('POST', '/gacha/reserve', {
-      assetId: card.ref,
-    });
+    const res = await this.request<CcReserveResponse>(
+      'POST',
+      '/gacha/reserve',
+      {
+        assetId: card.ref,
+      },
+    );
     return { source: this.source, holdId: res.holdId, card };
   }
 
@@ -154,7 +158,9 @@ export class CollectorCryptProvider implements InventoryProvider {
       body: body === undefined ? undefined : JSON.stringify(body),
     });
     if (!res.ok) {
-      this.logger.error(`CollectorCrypt ${method} ${path} → HTTP ${res.status}`);
+      this.logger.error(
+        `CollectorCrypt ${method} ${path} → HTTP ${res.status}`,
+      );
       throw new ServiceUnavailableException(
         `CollectorCrypt ${method} ${path} failed (HTTP ${res.status}).`,
       );

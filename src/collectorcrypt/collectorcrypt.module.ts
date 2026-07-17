@@ -1,7 +1,9 @@
 import { Module } from '@nestjs/common';
 import { CcGachaClient } from './cc-gacha.client';
+import { CcMarketClient } from './cc-market.client';
 import { GachaController } from './gacha.controller';
 import { GachaService } from './gacha.service';
+import { MarketSyncService } from './market-sync.service';
 import { TreasuryService } from './treasury.service';
 
 /**
@@ -15,10 +17,14 @@ import { TreasuryService } from './treasury.service';
  * TreasuryService SENGAJA tidak di-`exports`: ia memegang private key yang membayar
  * tiap pack, jadi satu-satunya yang boleh menyuruhnya menandatangani adalah GachaService
  * di modul ini. Modul lain yang butuh gacha cukup lewat GachaService.
+ *
+ * MarketSyncService (+ CcMarketClient, katalog publik tanpa key) di-export untuk
+ * AdminModule: sync katalog adalah aksi admin, tapi pengetahuan tentang API CC
+ * tetap terkonsentrasi di modul ini.
  */
 @Module({
   controllers: [GachaController],
-  providers: [CcGachaClient, GachaService, TreasuryService],
-  exports: [GachaService],
+  providers: [CcGachaClient, CcMarketClient, GachaService, MarketSyncService, TreasuryService],
+  exports: [GachaService, MarketSyncService],
 })
 export class CollectorCryptModule {}

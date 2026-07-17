@@ -1,21 +1,53 @@
-import { Body, Controller, Delete, Get, Param, Post, Put, Query, UploadedFile, UseGuards, UseInterceptors } from '@nestjs/common';
+import {
+  Body,
+  Controller,
+  Delete,
+  Get,
+  Headers,
+  Param,
+  Post,
+  Put,
+  Query,
+  UploadedFile,
+  UseGuards,
+  UseInterceptors,
+} from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
-import { ApiBearerAuth, ApiBody, ApiConsumes, ApiOperation, ApiTags } from '@nestjs/swagger';
+import {
+  ApiBearerAuth,
+  ApiBody,
+  ApiConsumes,
+  ApiOperation,
+  ApiTags,
+} from '@nestjs/swagger';
 import { AdminGuard } from '../auth/admin.guard';
 import { CurrentUser } from '../auth/current-user.decorator';
 import type { AdminUser } from '../auth/admin-jwt.strategy';
+import { MarketSyncService } from '../collectorcrypt/market-sync.service';
 import { AdminService } from './admin.service';
 import { AdminCreateListingDto } from './dto/admin-create-listing.dto';
+import { CcSyncDto } from './dto/cc-sync.dto';
 import { AdminLoginDto } from './dto/admin-login.dto';
 import { AdminUpdateListingDto } from './dto/admin-update-listing.dto';
-import { CreateContactMessageDto, MarkMessageReadDto, QueryAdminMessagesDto } from './dto/contact-message.dto';
+import {
+  CreateContactMessageDto,
+  MarkMessageReadDto,
+  QueryAdminMessagesDto,
+} from './dto/contact-message.dto';
 import { ImportListingsDto } from './dto/import-listings.dto';
-import { QueryAdminActivityDto, QueryAdminCardsDto, QueryAdminListingsDto } from './dto/query-admin.dto';
+import {
+  QueryAdminActivityDto,
+  QueryAdminCardsDto,
+  QueryAdminListingsDto,
+} from './dto/query-admin.dto';
 
 @ApiTags('admin')
 @Controller('admin')
 export class AdminController {
-  constructor(private readonly admin: AdminService) {}
+  constructor(
+    private readonly admin: AdminService,
+    private readonly ccSync: MarketSyncService,
+  ) {}
 
   @Post('login')
   @ApiOperation({ summary: 'Admin login with email + password' })
@@ -79,6 +111,18 @@ export class AdminController {
     return this.admin.importListings(dto);
   }
 
+  @Post('cc-sync')
+  @ApiBearerAuth()
+  @UseGuards(AdminGuard)
+  @ApiOperation({
+    summary:
+      'Sync katalog CollectorCrypt → listings (source=COLLECTORCRYPT); ' +
+      're-sync me-refresh metadata tanpa menyentuh harga yang diedit admin',
+  })
+  ccSyncListings(@Body() dto: CcSyncDto) {
+    return this.ccSync.sync(dto);
+  }
+
   @Get('cards')
   @ApiBearerAuth()
   @UseGuards(AdminGuard)
@@ -98,7 +142,9 @@ export class AdminController {
   @Get('stats/daily')
   @ApiBearerAuth()
   @UseGuards(AdminGuard)
-  @ApiOperation({ summary: 'Daily stats for charts (listings, revenue, status dist)' })
+  @ApiOperation({
+    summary: 'Daily stats for charts (listings, revenue, status dist)',
+  })
   dailyStats(@Query('days') days?: string) {
     return this.admin.dailyStats(days ? parseInt(days, 10) : 365);
   }
@@ -133,7 +179,12 @@ export class AdminController {
   @ApiBearerAuth()
   @UseGuards(AdminGuard)
   @ApiOperation({ summary: 'All offers paginated' })
-  listOffers(@Query('page') page?: string, @Query('limit') limit?: string, @Query('listingId') listingId?: string, @Query('search') search?: string) {
+  listOffers(
+    @Query('page') page?: string,
+    @Query('limit') limit?: string,
+    @Query('listingId') listingId?: string,
+    @Query('search') search?: string,
+  ) {
     return this.admin.listOffers({
       page: page ? parseInt(page, 10) : undefined,
       limit: limit ? parseInt(limit, 10) : undefined,
@@ -166,17 +217,27 @@ export class AdminController {
   @UseInterceptors(FileInterceptor('file'))
   @ApiConsumes('multipart/form-data')
   @ApiBody({
-    schema: { type: 'object', properties: { file: { type: 'string', format: 'binary' } } },
+    schema: {
+      type: 'object',
+      properties: { file: { type: 'string', format: 'binary' } },
+    },
   })
   @ApiOperation({ summary: 'Upload image for listing' })
   uploadImage(@UploadedFile() file: Express.Multer.File) {
     return this.admin.uploadImage(file);
   }
 
+  // Dulu endpoint ini benar-benar publik: siapa pun bisa membuat akun ADMIN
+  // hanya dengan tahu URL-nya. Sekarang wajib menyertakan header x-admin-secret
+  // yang cocok dengan env ADMIN_SECRET (dan kalau env-nya tidak di-set, seed
+  // ditolak selalu — fail closed).
   @Post('seed')
-  @ApiOperation({ summary: 'Seed admin user (dev only)' })
-  seedAdmin(@Body() dto: AdminLoginDto) {
-    return this.admin.seedAdmin(dto.email, dto.password);
+  @ApiOperation({ summary: 'Seed admin user (butuh header x-admin-secret)' })
+  seedAdmin(
+    @Body() dto: AdminLoginDto,
+    @Headers('x-admin-secret') secret?: string,
+  ) {
+    return this.admin.seedAdmin(dto.email, dto.password, secret);
   }
 
   @Post('seed/charts')

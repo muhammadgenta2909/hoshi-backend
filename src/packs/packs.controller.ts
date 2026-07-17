@@ -1,12 +1,10 @@
+import { Controller, Get, Param, Post, Query, UseGuards } from '@nestjs/common';
 import {
-  Controller,
-  Get,
-  Param,
-  Post,
-  Query,
-  UseGuards,
-} from '@nestjs/common';
-import { ApiBearerAuth, ApiOperation, ApiQuery, ApiTags } from '@nestjs/swagger';
+  ApiBearerAuth,
+  ApiOperation,
+  ApiQuery,
+  ApiTags,
+} from '@nestjs/swagger';
 import { CurrentUser } from '../auth/current-user.decorator';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import type { AuthUser } from '../auth/jwt.strategy';
@@ -19,7 +17,9 @@ export class PacksController {
   constructor(private readonly packs: PacksService) {}
 
   @Get()
-  @ApiOperation({ summary: 'Katalog pack + expected value & drop rates (publik)' })
+  @ApiOperation({
+    summary: 'Katalog pack + expected value & drop rates (publik)',
+  })
   list() {
     return this.packs.list();
   }

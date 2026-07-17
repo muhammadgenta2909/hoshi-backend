@@ -204,6 +204,13 @@ export interface CcNftMetadata {
 export interface CcNftWon {
   content: {
     metadata: CcNftMetadata;
+    /**
+     * Payload mentah CC juga membawa links/files (bentuk yang sama dengan
+     * getRecentWinners) — sumber URL gambar kartu. Opsional: bukan kontrak
+     * yang mereka jamin, jadi WAJIB dibaca lewat optional chaining.
+     */
+    links?: { image?: string };
+    files?: { uri?: string; cdn_uri?: string }[];
   };
 }
 

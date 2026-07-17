@@ -1,6 +1,14 @@
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import { Grader } from '@prisma/client';
-import { IsArray, IsEnum, IsInt, IsNumber, IsOptional, IsString, Min } from 'class-validator';
+import {
+  IsArray,
+  IsEnum,
+  IsInt,
+  IsNumber,
+  IsOptional,
+  IsString,
+  Min,
+} from 'class-validator';
 
 export class AdminCreateListingDto {
   @ApiProperty() @IsString() name!: string;
@@ -23,5 +31,9 @@ export class AdminCreateListingDto {
   @ApiPropertyOptional() @IsOptional() @IsString() vaultLocation?: string;
   @ApiPropertyOptional() @IsOptional() @IsString() cardNumber?: string;
   @ApiPropertyOptional() @IsOptional() @IsString() variant?: string;
-  @ApiPropertyOptional() @IsOptional() @IsArray() @IsNumber({}, { each: true }) priceHistory?: number[];
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsArray()
+  @IsNumber({}, { each: true })
+  priceHistory?: number[];
 }

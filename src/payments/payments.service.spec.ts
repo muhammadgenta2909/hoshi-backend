@@ -175,6 +175,7 @@ describe('PaymentsService', () => {
     rarity: 'Epic',
     nftAddress: 'NftAddrBase58',
     nftName: 'Charizard',
+    nftImage: 'https://cdn.example.com/charizard.png',
     roll: '9987',
     points: 420,
     buybackAmountUsdc: null,

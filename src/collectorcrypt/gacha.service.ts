@@ -125,6 +125,8 @@ export interface CcPackDto {
   rarity: CcRarity | null;
   nftAddress: string | null;
   nftName: string | null;
+  /** URL gambar kartu: links.image ?? files[0].cdn_uri ?? files[0].uri. */
+  nftImage: string | null;
   roll: string | null;
   points: number | null;
   buybackAmountUsdc: number | null;
@@ -464,6 +466,7 @@ export class GachaService {
         // ada NFT untuk dinamai. Melakukan deref buta di sini berarti sebuah pack yang
         // SUDAH terbuka on-chain (ireversibel) gagal tercatat, lalu tersangkut selamanya.
         nftName: res.nftWon?.content?.metadata?.name ?? null,
+        nftImage: resolveNftImage(res.nftWon?.content),
         openSignature: res.transactionSignature,
         roll: res.roll == null ? null : String(res.roll),
         points: res.points ?? null,
@@ -704,6 +707,7 @@ export class GachaService {
         // bukan kontrak yang mereka jamin. Deref buta atas pack yang SUDAH terbuka
         // on-chain (ireversibel) = pack itu gagal tercatat dan tersangkut selamanya.
         nftName: opened.nftWon?.content?.metadata?.name ?? null,
+        nftImage: resolveNftImage(opened.nftWon?.content),
         openSignature: opened.transactionSignature,
         roll: opened.roll == null ? null : String(opened.roll),
         points: opened.points ?? null,
@@ -1029,39 +1033,61 @@ function extractWinnerArray(response: unknown): CcRecentWinnerRaw[] {
 }
 
 /**
+ * Bentuk MINIMAL content NFT yang memuat gambar — irisan bersama antara payload
+ * getRecentWinners (CcRecentWinnerRaw.nft.content) dan openPack (CcNftWon.content).
+ */
+interface NftImageContent {
+  links?: { image?: string };
+  files?: { uri?: string; cdn_uri?: string }[];
+}
+
+/**
+ * URL gambar sebuah NFT dari content mentah CC, atau null bila tidak ada.
+ *
+ * SATU-SATUNYA tempat urutan resolusi gambar didefinisikan — dipakai winners()
+ * (via toGachaWinner) DAN persist hasil open/purchase, supaya kartu yang tampil
+ * di ticker dan kartu milik user tidak pernah beda sumber gambar.
+ *
+ * `??` tidak cukup: feed CC kadang mengirim links.image = "" (string kosong), dan `??`
+ * hanya jatuh pada null/undefined — string kosong akan lolos padahal ada cdn_uri/uri
+ * valid. Pilih yang PERTAMA yang tidak kosong: links.image → files[0].cdn_uri →
+ * files[0].uri.
+ */
+function resolveNftImage(
+  content: NftImageContent | null | undefined,
+): string | null {
+  const files = content?.files;
+  const firstFile = Array.isArray(files) ? files[0] : undefined;
+  return (
+    [content?.links?.image, firstFile?.cdn_uri, firstFile?.uri].find(
+      (u): u is string => typeof u === 'string' && u.length > 0,
+    ) ?? null
+  );
+}
+
+/**
  * Winner mentah CC → GachaWinner bersih, atau null bila item tak layak tampil.
  *
  * DEFENSIF sepenuhnya: bentuk item tidak dijamin kontrak, jadi tiap lapis dibaca lewat
  * optional chaining dan divalidasi tipenya. nftAddress (kunci dedupe), name, dan image
  * WAJIB ada & non-kosong — item tanpa salah satunya dibuang (return null), tidak dipaksakan.
- * Gambar diambil berurutan: links.image → files[0].cdn_uri → files[0].uri. Tidak ada
- * nilai USD yang disentuh: payload ini tidak menjamin harga, jadi kita tidak mengarangnya.
+ * Gambar di-resolve lewat resolveNftImage (logika tunggal bersama persist open/purchase).
+ * Tidak ada nilai USD yang disentuh: payload ini tidak menjamin harga, jadi kita tidak
+ * mengarangnya.
  */
 function toGachaWinner(raw: CcRecentWinnerRaw): GachaWinner | null {
   const content = raw?.nft?.content;
   const nftAddress = raw?.nft?.id;
   const name = content?.metadata?.name;
   const winner = raw?.winner;
-
-  const files = content?.files;
-  const firstFile = Array.isArray(files) ? files[0] : undefined;
-  // `??` tidak cukup: feed CC kadang mengirim links.image = "" (string kosong), dan `??`
-  // hanya jatuh pada null/undefined — string kosong akan lolos lalu gagal cek panjang di
-  // bawah, membuang winner yang sebenarnya punya cdn_uri/uri valid. Pilih yang PERTAMA
-  // yang tidak kosong.
-  const image = [
-    content?.links?.image,
-    firstFile?.cdn_uri,
-    firstFile?.uri,
-  ].find((u): u is string => typeof u === 'string' && u.length > 0);
+  const image = resolveNftImage(content);
 
   if (
     typeof nftAddress !== 'string' ||
     nftAddress.length === 0 ||
     typeof name !== 'string' ||
     name.length === 0 ||
-    typeof image !== 'string' ||
-    image.length === 0 ||
+    image === null ||
     typeof winner !== 'string' ||
     winner.length === 0
   ) {
@@ -1091,6 +1117,7 @@ function toCcPackDto(row: CcPackPurchase): CcPackDto {
     rarity: row.rarity as CcRarity | null,
     nftAddress: row.nftAddress,
     nftName: row.nftName,
+    nftImage: row.nftImage,
     roll: row.roll,
     points: row.points,
     buybackAmountUsdc: row.buybackAmountUsdc,

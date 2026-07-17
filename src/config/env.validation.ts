@@ -76,6 +76,23 @@ class EnvironmentVariables {
   @IsString()
   ADMIN_SECRET?: string;
 
+  // Opsional — base URL API KATALOG PUBLIK CollectorCrypt Marketplace (tanpa key).
+  // Default: https://api.collectorcrypt.com — dipakai POST /admin/cc-sync untuk
+  // menarik produk mereka ke marketplace kita. Terpisah dari GACHA_* (host beda,
+  // auth beda) dan dari COLLECTORCRYPT_API_* lama yang deprecated.
+  @IsOptional()
+  @IsString()
+  COLLECTORCRYPT_MARKET_BASE_URL?: string;
+
+  // Opsional — kurs USD→IDR untuk mengubah harga katalog CC menjadi harga display
+  // IDRX saat listing PERTAMA dibuat (re-sync tidak menyentuh harga). String
+  // (bukan @IsInt) mengikuti pola HOSHI_PACK_MARGIN_BPS: salah ketik tidak boleh
+  // diam-diam berubah jadi angka. Default 16000; MarketSyncService memvalidasi
+  // rentang 1000–1000000.
+  @IsOptional()
+  @IsString()
+  HOSHI_USD_IDR_RATE?: string;
+
   // Opsional (WAJIB kalau fitur gacha CollectorCrypt dipakai) — kredensial API gacha.
   // SENGAJA terpisah dari COLLECTORCRYPT_API_* di atas: var lama itu milik inventory
   // provider lama; mengisinya akan "mempersenjatai" provider tsb ke endpoint yang belum

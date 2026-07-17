@@ -116,7 +116,8 @@ export class CreateListingDto {
 
   @ApiPropertyOptional({
     example: 'HHw4oQh9pNqL4sY7F7hX7sFAzW9yJ7jUu4w9rHf3Z6a1',
-    description: 'Alamat asset/kontrak jika listing sudah punya asset on-chain.',
+    description:
+      'Alamat asset/kontrak jika listing sudah punya asset on-chain.',
   })
   @IsOptional()
   @IsString()
