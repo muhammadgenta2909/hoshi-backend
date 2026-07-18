@@ -352,11 +352,14 @@ export class CcGachaClient {
  */
 function friendlyMachineMessage(remote: string | undefined): string | null {
   if (!remote) return null;
-  if (
-    /empty|off|stock|balance|processing|not\s*available|unavailable/i.test(
-      remote,
-    )
-  ) {
+  // A payer (treasury) with no USDC is NOT a machine-availability problem — it's
+  // a top-up problem. Surface it distinctly so "try another machine" (which won't
+  // help — every machine draws the same treasury) isn't shown, and the operator
+  // knows to fund the treasury.
+  if (/insufficient|\bbalance\b|\bfund(s|ing)?\b|saldo/i.test(remote)) {
+    return 'Saldo treasury demo habis (USDC devnet). Perlu top-up dulu sebelum bisa membuka pack.';
+  }
+  if (/empty|off|stock|processing|not\s*available|unavailable/i.test(remote)) {
     return 'Mesin pack ini sedang tidak tersedia (kolam hadiahnya kosong atau ditutup sementara). Coba mesin lain, atau ulangi sebentar lagi.';
   }
   return null;
