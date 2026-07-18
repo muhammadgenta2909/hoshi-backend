@@ -131,4 +131,15 @@ export class CreateListingDto {
   @IsArray()
   @IsNumber({}, { each: true })
   priceHistory?: number[];
+
+  @ApiPropertyOptional({
+    example: 'hoshi-slug-11111111-2222-3333-4444-555555555555',
+    description:
+      'Jika diisi: memo CcPackPurchase kartu hasil pack yang mau dijual. ' +
+      'Backend memverifikasi kartu ini benar milik user (status OPENED), lalu ' +
+      'menautkan listing ke NFT aslinya (provenance CollectorCrypt).',
+  })
+  @IsOptional()
+  @IsString()
+  fromPackMemo?: string;
 }

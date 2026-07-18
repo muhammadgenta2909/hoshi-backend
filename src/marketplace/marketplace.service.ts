@@ -1,5 +1,6 @@
 import {
   BadRequestException,
+  ConflictException,
   ForbiddenException,
   Injectable,
   Logger,
@@ -7,6 +8,7 @@ import {
 } from '@nestjs/common';
 import {
   ActivityType,
+  CcPackStatus,
   ListingSource,
   ListingStatus,
   NftStatus,
@@ -196,12 +198,11 @@ export class MarketplaceService {
     if (listing.status !== ListingStatus.ACTIVE) {
       throw new BadRequestException('Listing is no longer active.');
     }
-    // Kartu vault CC tidak bisa di-offer: tidak ada penjual Hoshi yang bisa
-    // menerima (sellerId null) dan tidak ada mekanisme settle dengan CC. Lihat
-    // alasan lengkap di buy().
-    if (listing.source === ListingSource.COLLECTORCRYPT) {
+    // Sama seperti buy(): hanya kartu KATALOG-SYNC (sellerId null) yang diblokir.
+    // Kartu CC hasil pull milik user (sellerId terisi) boleh menerima penawaran.
+    if (listing.source === ListingSource.COLLECTORCRYPT && !listing.sellerId) {
       throw new BadRequestException(
-        'Kartu vault CollectorCrypt belum menerima penawaran lewat Hoshi.',
+        'Kartu katalog CollectorCrypt belum menerima penawaran lewat Hoshi.',
       );
     }
     if (listing.sellerId && listing.sellerId === buyer.id) {
@@ -475,6 +476,68 @@ export class MarketplaceService {
       });
       if (!card) throw new NotFoundException('Card not found.');
     }
+
+    // Kartu hasil PACK yang mau dijual: verifikasi user benar-benar memiliki
+    // pull-nya (baris CcPackPurchase miliknya, status OPENED), lalu tautkan
+    // listing ke NFT aslinya. Ini yang membedakan "jual kartu hasil pull" dari
+    // sekadar mengetik kartu baru: listing mewakili aset on-chain yang nyata.
+    let source: ListingSource = ListingSource.HOSHI;
+    let ccNftAddress: string | undefined;
+    if (dto.fromPackMemo) {
+      const pack = await this.prisma.ccPackPurchase.findFirst({
+        where: {
+          memo: dto.fromPackMemo,
+          userId: user.id,
+          status: CcPackStatus.OPENED,
+        },
+      });
+      if (!pack?.nftAddress) {
+        throw new ForbiddenException(
+          'Pull tidak ditemukan, belum dibuka, atau bukan milik Anda.',
+        );
+      }
+      // Satu NFT hanya boleh punya satu listing (ccNftAddress @unique). Kalau
+      // sudah pernah dipajang: aktif ⇒ tolak; sudah tidak aktif & milik user ⇒
+      // pajang ulang (relist) alih-alih menabrak unique index dengan 500.
+      const existing = await this.prisma.listing.findUnique({
+        where: { ccNftAddress: pack.nftAddress },
+      });
+      if (existing) {
+        if (existing.status === ListingStatus.ACTIVE) {
+          throw new ConflictException(
+            'Kartu ini sudah dipajang di marketplace.',
+          );
+        }
+        if (existing.sellerId !== user.id) {
+          throw new ForbiddenException('Kartu ini bukan milik Anda.');
+        }
+        const relisted = await this.prisma.listing.update({
+          where: { id: existing.id },
+          data: {
+            status: ListingStatus.ACTIVE,
+            priceIdrx: dto.price,
+            expectedValueIdrx: dto.expectedValue,
+            buybackIdrx: dto.buyback ?? 0,
+            buyerId: null,
+            soldAt: null,
+          },
+          include: { nft: true },
+        });
+        await this.recordActivity({
+          type: ActivityType.LISTED_CARD,
+          listing: relisted,
+          amount: relisted.priceIdrx,
+          fromId: user.id,
+          fromLabel: displayLabel(user, shortWallet(user.walletAddress)),
+          toId: null,
+          toLabel: null,
+        });
+        return toListingDto(relisted);
+      }
+      source = ListingSource.COLLECTORCRYPT;
+      ccNftAddress = pack.nftAddress;
+    }
+
     const row = await this.prisma.listing.create({
       data: {
         name: dto.name,
@@ -495,8 +558,12 @@ export class MarketplaceService {
         certificate: dto.certificate,
         vaultLocation: dto.vaultLocation,
         cardNumber: dto.cardNumber,
+        // On-chain address of the real pulled NFT (falls back to any address the
+        // caller supplied for a plain Hoshi listing).
+        contractAddress: ccNftAddress ?? dto.contractAddress,
         variant: dto.variant,
-        contractAddress: dto.contractAddress,
+        source,
+        ccNftAddress,
         priceHistory:
           dto.priceHistory ??
           ([dto.expectedValue, dto.price] satisfies number[]),
@@ -575,16 +642,15 @@ export class MarketplaceService {
       include: { seller: { select: USER_LABEL_SELECT } },
     });
     if (!existing) throw new NotFoundException('Listing tidak ditemukan.');
-    // Kartu vault CollectorCrypt hanya di-sync untuk display: fisiknya ada di
-    // custody CC, masih dijual di collectorcrypt.com, dan belum ada mekanisme
-    // transfer/settlement CC. Kalau dibeli di sini, buy() akan me-mint NFT Hoshi
-    // BARU yang tidak menautkan aset CC apa pun dan menandai listing SOLD —
-    // menjual barang yang bukan milik kita (double-sale). Blokir sampai alur
-    // beli lintas-vault disepakati dengan CollectorCrypt.
-    if (existing.source === ListingSource.COLLECTORCRYPT) {
+    // Blokir HANYA kartu KATALOG-SYNC CollectorCrypt (sellerId null): fisiknya di
+    // custody CC, masih dijual di collectorcrypt.com, tanpa mekanisme settlement —
+    // membelinya akan me-mint NFT Hoshi palsu & menandai SOLD (jual barang bukan
+    // milik kita). Kartu CC yang di-PULL lalu dipajang seorang user (sellerId
+    // terisi) MEMANG miliknya untuk dijual, jadi tidak diblokir di sini.
+    if (existing.source === ListingSource.COLLECTORCRYPT && !existing.sellerId) {
       throw new BadRequestException(
-        'Kartu vault CollectorCrypt belum bisa dibeli lewat Hoshi. ' +
-          'Pembelian kartu CC akan tersedia setelah integrasi settlement CC.',
+        'Kartu katalog CollectorCrypt belum bisa dibeli lewat Hoshi. ' +
+          'Pembelian kartu katalog CC akan tersedia setelah integrasi settlement CC.',
       );
     }
     if (existing.sellerId && existing.sellerId === user.id) {

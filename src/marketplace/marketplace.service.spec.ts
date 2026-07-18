@@ -1,6 +1,15 @@
-import { BadRequestException } from '@nestjs/common';
+import {
+  BadRequestException,
+  ConflictException,
+  ForbiddenException,
+} from '@nestjs/common';
 import { Test } from '@nestjs/testing';
-import { Grader, ListingStatus } from '@prisma/client';
+import {
+  CcPackStatus,
+  Grader,
+  ListingSource,
+  ListingStatus,
+} from '@prisma/client';
 import { NftService } from '../nft/nft.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { MarketplaceService } from './marketplace.service';
@@ -23,6 +32,7 @@ describe('MarketplaceService', () => {
     nft: { updateMany: jest.Mock };
     offer: { updateMany: jest.Mock };
     activity: { create: jest.Mock };
+    ccPackPurchase: { findFirst: jest.Mock };
   };
   let nft: { mintForUser: jest.Mock };
 
@@ -79,6 +89,7 @@ describe('MarketplaceService', () => {
       // buy() closes any dangling offers and writes an audit row after settling.
       offer: { updateMany: jest.fn().mockResolvedValue({ count: 0 }) },
       activity: { create: jest.fn().mockResolvedValue({}) },
+      ccPackPurchase: { findFirst: jest.fn() },
     };
     nft = { mintForUser: jest.fn() };
 
@@ -339,6 +350,152 @@ describe('MarketplaceService', () => {
       ).rejects.toThrow(BadRequestException);
 
       expect(prisma.listing.findUniqueOrThrow).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('create (from pack)', () => {
+    const puller = {
+      id: 'puller-1',
+      walletAddress: 'PullerWalletBase58',
+      displayName: null,
+      role: 'USER',
+    };
+    const fromPackDto = {
+      name: 'Zubat',
+      set: 'Neo Destiny',
+      rarity: 'Rare',
+      image: 'https://cc/zubat.png',
+      price: 2_000_000,
+      expectedValue: 2_200_000,
+      grade: 'PSA 9',
+      grader: Grader.PSA,
+      gradeScore: 9,
+      language: 'English',
+      era: 'Classic',
+      element: 'Poison',
+      category: 'Full Art',
+      fromPackMemo: 'hoshi-slug-abc',
+    };
+
+    it('verifies pull ownership, then links the listing to the real NFT (source CC + ccNftAddress)', async () => {
+      prisma.ccPackPurchase.findFirst.mockResolvedValue({
+        nftAddress: 'CCAsset123',
+        status: CcPackStatus.OPENED,
+      });
+      prisma.listing.findUnique.mockResolvedValue(null); // not listed yet
+      prisma.listing.create.mockResolvedValue({
+        ...listing,
+        source: ListingSource.COLLECTORCRYPT,
+        ccNftAddress: 'CCAsset123',
+        sellerId: puller.id,
+      });
+
+      await service.create(fromPackDto, puller);
+
+      expect(prisma.ccPackPurchase.findFirst).toHaveBeenCalledWith({
+        where: {
+          memo: 'hoshi-slug-abc',
+          userId: puller.id,
+          status: CcPackStatus.OPENED,
+        },
+      });
+      expect(prisma.listing.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            source: ListingSource.COLLECTORCRYPT,
+            ccNftAddress: 'CCAsset123',
+            contractAddress: 'CCAsset123',
+            sellerId: puller.id,
+          }),
+        }),
+      );
+    });
+
+    it('rejects when the pull is not the caller’s / not OPENED', async () => {
+      prisma.ccPackPurchase.findFirst.mockResolvedValue(null);
+
+      await expect(service.create(fromPackDto, puller)).rejects.toThrow(
+        ForbiddenException,
+      );
+      expect(prisma.listing.create).not.toHaveBeenCalled();
+    });
+
+    it('rejects when the pulled card is already actively listed', async () => {
+      prisma.ccPackPurchase.findFirst.mockResolvedValue({
+        nftAddress: 'CCAsset123',
+        status: CcPackStatus.OPENED,
+      });
+      prisma.listing.findUnique.mockResolvedValue({
+        ...listing,
+        status: ListingStatus.ACTIVE,
+        ccNftAddress: 'CCAsset123',
+      });
+
+      await expect(service.create(fromPackDto, puller)).rejects.toThrow(
+        ConflictException,
+      );
+      expect(prisma.listing.create).not.toHaveBeenCalled();
+    });
+
+    it('re-lists a previously cancelled pull instead of hitting the unique index', async () => {
+      prisma.ccPackPurchase.findFirst.mockResolvedValue({
+        nftAddress: 'CCAsset123',
+        status: CcPackStatus.OPENED,
+      });
+      prisma.listing.findUnique.mockResolvedValue({
+        ...listing,
+        status: ListingStatus.CANCELLED,
+        sellerId: puller.id,
+        ccNftAddress: 'CCAsset123',
+      });
+      prisma.listing.update.mockResolvedValue({
+        ...listing,
+        status: ListingStatus.ACTIVE,
+        sellerId: puller.id,
+      });
+
+      await service.create(fromPackDto, puller);
+
+      expect(prisma.listing.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            status: ListingStatus.ACTIVE,
+            priceIdrx: 2_000_000,
+          }),
+        }),
+      );
+      expect(prisma.listing.create).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('buy — CollectorCrypt source guard', () => {
+    it('blocks buying a SYNCED catalog CC card (no seller)', async () => {
+      prisma.listing.findUnique.mockResolvedValue({
+        ...listing,
+        source: ListingSource.COLLECTORCRYPT,
+        sellerId: null,
+      });
+
+      await expect(service.buy('listing-1', user)).rejects.toThrow(
+        BadRequestException,
+      );
+      // Blocked BEFORE reserving the listing.
+      expect(prisma.listing.updateMany).not.toHaveBeenCalled();
+    });
+
+    it('allows buying a user-listed pulled CC card (seller set) — reaches reservation', async () => {
+      prisma.listing.findUnique.mockResolvedValue({
+        ...listing,
+        source: ListingSource.COLLECTORCRYPT,
+        sellerId: 'seller-9',
+      });
+      // Lose the atomic race so we stop early — the point is we got PAST the guard.
+      prisma.listing.updateMany.mockResolvedValueOnce({ count: 0 });
+
+      await expect(service.buy('listing-1', user)).rejects.toThrow(
+        BadRequestException,
+      );
+      expect(prisma.listing.updateMany).toHaveBeenCalled();
     });
   });
 
