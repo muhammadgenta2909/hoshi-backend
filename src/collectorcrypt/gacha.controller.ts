@@ -14,7 +14,6 @@ import {
   ApiTags,
 } from '@nestjs/swagger';
 import { Throttle } from '@nestjs/throttler';
-import { AdminGuard } from '../auth/admin.guard';
 import { CurrentUser } from '../auth/current-user.decorator';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import type { AuthUser } from '../auth/jwt.strategy';
@@ -99,21 +98,20 @@ export class GachaController {
 
   @Post('purchase')
   @ApiBearerAuth()
-  // LUBANG TREASURY — DITUTUP. Route ini DULU cuma @UseGuards(JwtAuthGuard): SETIAP user login bisa
-  // memanggilnya dan tiap panggilan membelanjakan ~$50 USDC treasury sungguhan TANPA gerbang bayar
-  // apa pun (identitas gratis via auth.service → drain tak terbatas, minimal $500/hari lewat daily cap).
-  // Jalur beli untuk user Indonesia sekarang HANYA lewat rail IDRX: POST /api/payments/pack → bayar
-  // rupiah → callback/reconciler memverifikasi PAID+MINTED → PaymentsService yang memanggil purchase()
-  // secara internal SETELAH mengklaim baris pembayaran rupiah secara atomik.
-  // Route ini DIPERTAHANKAN khusus uji coba devnet dan DIKUNCI ke AdminGuard. JANGAN PERNAH
-  // menurunkannya kembali ke JwtAuthGuard: user biasa tidak boleh lagi menyentuh purchase().
-  @UseGuards(AdminGuard)
-  // Rate limit BUKAN izin belanja — ia cuma membatasi ledakan; yang mengotorisasi pengeluaran
-  // treasury tetap service (klaim pembayaran rupiah), bukan JWT/AdminGuard dan bukan angka ini.
+  // ⚠️ DEMO MODE (DEVNET ONLY): dibuka ke SETIAP user login (Phantom atau Google/Privy) supaya
+  // bisa didemokan langsung ke stakeholder tanpa perlu akun admin. Tiap pull dibayar treasury
+  // (~$50 USDC DEVNET = uang test, bukan asli), jadi risikonya cuma treasury devnet terkuras —
+  // machine akan tampil "tidak tersedia" saat stok/saldo habis (di-handle mulus di FE).
+  //
+  // 🔒 SEBELUM MAINNET — WAJIB kembalikan ke @UseGuards(AdminGuard) (atau rail bayar IDRX
+  // POST /api/payments/pack). Di mainnet ini LUBANG TREASURY: identitas gratis via auth.service
+  // → siapa pun bisa menguras USDC asli tanpa gerbang bayar. Throttle di bawah cuma rem ledakan,
+  // BUKAN izin belanja.
+  @UseGuards(JwtAuthGuard)
   @Throttle({ default: { ttl: 60000, limit: 3 } })
   @ApiOperation({
     summary:
-      'ADMIN-ONLY (devnet) — beli pack alur treasury langsung. User biasa memakai POST /api/payments/pack.',
+      'DEMO devnet — beli pack alur treasury langsung untuk user login mana pun. Mainnet: re-lock ke admin / rail IDRX.',
     description:
       'Satu request, langsung selesai: user TIDAK menandatangani apa pun dan tidak perlu punya ' +
       'USDC/SOL. Treasury Hoshi jadi pembayar (playerAddress) sekaligus penanda tangan ' +
