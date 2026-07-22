@@ -3,12 +3,22 @@ import {
   ConflictException,
   ForbiddenException,
   Injectable,
+  Logger,
   NotFoundException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { v2 as cloudinary } from 'cloudinary';
 import { JwtService } from '@nestjs/jwt';
 import { hash, verify } from '@node-rs/argon2';
-import { ListingSource, ListingStatus, Prisma } from '@prisma/client';
+import {
+  ActivityType,
+  ListingSource,
+  ListingStatus,
+  OfferStatus,
+  Prisma,
+  StorageProvider,
+  VaultStatus,
+} from '@prisma/client';
 import { MarketplaceService } from '../marketplace/marketplace.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { AdminCreateListingDto } from './dto/admin-create-listing.dto';
@@ -299,41 +309,63 @@ export class AdminService {
     return { data, total, page, limit, totalPages: Math.ceil(total / limit) };
   }
 
+  /**
+   * Feed aktivitas admin dibaca dari tabel `Activity` (event log append-only yang
+   * ditulis real-time oleh MarketplaceService) — BUKAN lagi direkonstruksi dari
+   * status listing terkini. Rekonstruksi lama menghilangkan riwayat (listed→cancel
+   * →listed lagi jadi satu baris) dan membuat re-sync CC memunculkan event palsu.
+   */
   async listActivity(query: QueryAdminActivityDto) {
     const page = query.page ?? 1;
     const limit = query.limit ?? 20;
-    const where: Prisma.ListingWhereInput = {};
-    if (query.action === 'sold') where.status = ListingStatus.SOLD;
-    else if (query.action === 'cancelled')
-      where.status = ListingStatus.CANCELLED;
+    const where: Prisma.ActivityWhereInput = {};
+    // `action` = salah satu nilai ActivityType (mis. SALE_CARD). Nilai lain diabaikan.
+    if (query.action && query.action in ActivityType)
+      where.type = query.action as ActivityType;
     if (query.search)
-      where.name = { contains: query.search, mode: 'insensitive' };
+      where.itemName = { contains: query.search, mode: 'insensitive' };
 
-    const orderBy: Prisma.ListingOrderByWithRelationInput = {
-      updatedAt: 'desc',
-    };
     const [data, total] = await Promise.all([
-      this.prisma.listing.findMany({
+      this.prisma.activity.findMany({
         where,
-        orderBy,
+        orderBy: { createdAt: 'desc' },
         skip: (page - 1) * limit,
         take: limit,
         select: {
           id: true,
-          name: true,
-          priceIdrx: true,
-          status: true,
-          sellerAddress: true,
+          type: true,
+          itemName: true,
+          itemImage: true,
+          category: true,
+          set: true,
+          amount: true,
+          fromLabel: true,
+          toLabel: true,
+          listingId: true,
           createdAt: true,
-          updatedAt: true,
-          soldAt: true,
         },
       }),
-      this.prisma.listing.count({ where }),
+      this.prisma.activity.count({ where }),
     ]);
-    return { data, total, page, limit, totalPages: Math.ceil(total / limit) };
+
+    const mapped = data.map((a) => ({
+      id: a.id,
+      type: a.type,
+      itemName: a.itemName,
+      itemImage: a.itemImage,
+      category: a.category,
+      set: a.set,
+      amount: a.amount,
+      fromLabel: a.fromLabel,
+      toLabel: a.toLabel,
+      listingId: a.listingId,
+      createdAt: a.createdAt.toISOString(),
+    }));
+
+    return { data: mapped, total, page, limit, totalPages: Math.ceil(total / limit) };
   }
 
+  private readonly logger = new Logger(AdminService.name);
   private readonly uploadDir = path.join(__dirname, '..', '..', 'uploads');
 
   /* ---------- Contact Messages ---------- */
@@ -388,6 +420,7 @@ export class AdminService {
     limit?: number;
     listingId?: string;
     search?: string;
+    status?: string;
   }) {
     const page = query.page ?? 1;
     const limit = query.limit ?? 20;
@@ -395,11 +428,29 @@ export class AdminService {
     if (query.listingId) where.listingId = query.listingId;
     if (query.search)
       where.listing = { name: { contains: query.search, mode: 'insensitive' } };
+    // Filter status opsional. Hanya nilai enum yang valid diterima; nilai lain
+    // (mis. "ALL" atau typo) diabaikan agar tidak melempar 500.
+    if (query.status && query.status in OfferStatus)
+      where.status = query.status as OfferStatus;
 
     const [data, total] = await Promise.all([
       this.prisma.offer.findMany({
         where,
-        include: { listing: { select: { id: true, name: true } } },
+        // Ambil sekalian data yang SUDAH ada di DB supaya admin bisa menilai
+        // offer tanpa membuka listing: thumbnail, harga ask, status listing,
+        // dan wallet pembeli. Jangan pernah ikutkan `nonce` user.
+        include: {
+          listing: {
+            select: {
+              id: true,
+              name: true,
+              image: true,
+              priceIdrx: true,
+              status: true,
+            },
+          },
+          buyer: { select: { id: true, displayName: true, walletAddress: true } },
+        },
         orderBy: { createdAt: 'desc' },
         skip: (page - 1) * limit,
         take: limit,
@@ -411,10 +462,17 @@ export class AdminService {
       id: o.id,
       listingId: o.listingId,
       listingName: o.listing?.name ?? '',
+      listingImage: o.listing?.image ?? null,
+      listingStatus: o.listing?.status ?? null,
+      askPrice: o.listing?.priceIdrx ?? null,
       user: o.user,
+      buyerWallet: o.buyer?.walletAddress ?? null,
       amount: o.amount,
       status: o.status,
       createdAt: o.createdAt.toISOString(),
+      // updatedAt = kapan offer di-resolve (accept/reject/cancel) untuk baris
+      // non-PENDING. Untuk PENDING nilainya sama dengan createdAt.
+      updatedAt: o.updatedAt.toISOString(),
     }));
 
     return {
@@ -424,6 +482,83 @@ export class AdminService {
       limit,
       totalPages: Math.ceil(total / limit),
     };
+  }
+
+  /* ---------- Vault / Inventory (custody location) ---------- */
+
+  /**
+   * Daftar item vault untuk admin — menjawab "inventory kita ada di vault mana".
+   * Bisa difilter per status (STORED/MINTING/MINTED/REDEEMED) dan per provider
+   * custody, plus cari via serial / nama kartu / label lokasi.
+   */
+  async listVaultItems(query: {
+    page?: number;
+    limit?: number;
+    status?: string;
+    provider?: string;
+    search?: string;
+  }) {
+    const page = query.page ?? 1;
+    const limit = query.limit ?? 20;
+    const where: Prisma.VaultItemWhereInput = {};
+    if (query.status && query.status in VaultStatus)
+      where.status = query.status as VaultStatus;
+    if (query.provider && query.provider in StorageProvider)
+      where.storageProvider = query.provider as StorageProvider;
+    if (query.search)
+      where.OR = [
+        { serialNumber: { contains: query.search, mode: 'insensitive' } },
+        { vaultLocation: { contains: query.search, mode: 'insensitive' } },
+        { card: { name: { contains: query.search, mode: 'insensitive' } } },
+      ];
+
+    const [data, total] = await Promise.all([
+      this.prisma.vaultItem.findMany({
+        where,
+        include: {
+          card: { select: { id: true, name: true, imageUrl: true, set: true } },
+          owner: { select: { id: true, displayName: true, walletAddress: true } },
+        },
+        orderBy: { createdAt: 'desc' },
+        skip: (page - 1) * limit,
+        take: limit,
+      }),
+      this.prisma.vaultItem.count({ where }),
+    ]);
+
+    const mapped = data.map((v) => ({
+      id: v.id,
+      serialNumber: v.serialNumber,
+      status: v.status,
+      storageProvider: v.storageProvider,
+      vaultLocation: v.vaultLocation,
+      cardId: v.cardId,
+      cardName: v.card?.name ?? '',
+      cardImage: v.card?.imageUrl ?? null,
+      cardSet: v.card?.set ?? null,
+      ownerWallet: v.owner?.walletAddress ?? null,
+      ownerLabel: v.owner?.displayName ?? null,
+      createdAt: v.createdAt.toISOString(),
+      updatedAt: v.updatedAt.toISOString(),
+    }));
+
+    return { data: mapped, total, page, limit, totalPages: Math.ceil(total / limit) };
+  }
+
+  /** Admin memindahkan/mengoreksi lokasi custody sebuah item vault. */
+  async updateVaultItem(
+    id: string,
+    dto: { storageProvider?: string; vaultLocation?: string | null },
+  ) {
+    const data: Prisma.VaultItemUpdateInput = {};
+    if (dto.storageProvider !== undefined) {
+      if (!(dto.storageProvider in StorageProvider))
+        throw new BadRequestException('storageProvider tidak valid');
+      data.storageProvider = dto.storageProvider as StorageProvider;
+    }
+    if (dto.vaultLocation !== undefined) data.vaultLocation = dto.vaultLocation;
+    // P2025 (row tidak ada) dipetakan ke 404 oleh PrismaExceptionFilter global.
+    return this.prisma.vaultItem.update({ where: { id }, data });
   }
 
   /* ---------- Daily Stats (Charts) ---------- */
@@ -527,8 +662,73 @@ export class AdminService {
     return this.marketplace.rejectOfferAsAdmin(id);
   }
 
+  /**
+   * Upload gambar listing.
+   *
+   * PRODUKSI: kalau `CLOUDINARY_URL` di-set, byte diunggah ke Cloudinary dan yang
+   * dikembalikan adalah URL CDN ABSOLUT (secure_url). Ini penting karena:
+   *   1) disk container Render bersifat EPHEMERAL — file lokal hilang tiap redeploy;
+   *   2) URL relatif `/uploads/...` tidak resolve dari origin frontend (Vercel).
+   *
+   * DEV: kalau env belum di-set, jatuh balik ke disk lokal (URL relatif) supaya
+   * pengembangan lokal tetap jalan tanpa akun Cloudinary. JANGAN andalkan jalur ini
+   * di produksi. Set `CLOUDINARY_URL` di env Render.
+   */
+  /**
+   * Kredensial Cloudinary boleh diisi lewat SALAH SATU dari:
+   *   a) CLOUDINARY_URL=cloudinary://<api_key>:<api_secret>@<cloud_name>  (1 baris), atau
+   *   b) CLOUDINARY_CLOUD_NAME + CLOUDINARY_API_KEY + CLOUDINARY_API_SECRET (3 baris).
+   * Dua-duanya didukung supaya tidak tergantung format yang ditampilkan dashboard.
+   */
+  private cloudinaryReady(): boolean {
+    // SDK otomatis membaca process.env.CLOUDINARY_URL saat config() dipanggil.
+    if (cloudinary.config().cloud_name) return true;
+    const cloudName = this.config.get<string>('CLOUDINARY_CLOUD_NAME');
+    const apiKey = this.config.get<string>('CLOUDINARY_API_KEY');
+    const apiSecret = this.config.get<string>('CLOUDINARY_API_SECRET');
+    if (cloudName && apiKey && apiSecret) {
+      cloudinary.config({
+        cloud_name: cloudName,
+        api_key: apiKey,
+        api_secret: apiSecret,
+        secure: true,
+      });
+      return true;
+    }
+    return false;
+  }
+
   async uploadImage(file: Express.Multer.File): Promise<{ url: string }> {
     if (!file) throw new BadRequestException('No file uploaded');
+    if (!file.mimetype?.startsWith('image/'))
+      throw new BadRequestException('Hanya file gambar yang diperbolehkan');
+
+    const configured = this.cloudinaryReady();
+    if (configured) {
+      const dataUri = `data:${file.mimetype};base64,${file.buffer.toString('base64')}`;
+      const uploaded = await cloudinary.uploader.upload(dataUri, {
+        folder: 'hoshi/listings',
+        resource_type: 'image',
+      });
+      return { url: uploaded.secure_url };
+    }
+
+    // Di PRODUCTION jangan pernah diam-diam jatuh ke disk: URL yang dihasilkan
+    // relatif (`/uploads/...`) sehingga di-resolve ke origin FRONTEND dan selalu
+    // 404, sementara filenya hilang tiap redeploy (disk Render ephemeral). Admin
+    // akan melihat "upload sukses" lalu menyimpan gambar yang rusak permanen.
+    // Lebih baik gagal keras dan terlihat.
+    if (this.config.get<string>('NODE_ENV') === 'production')
+      throw new BadRequestException(
+        'Upload gambar belum dikonfigurasi: set CLOUDINARY_URL (atau CLOUDINARY_CLOUD_NAME + ' +
+          'CLOUDINARY_API_KEY + CLOUDINARY_API_SECRET) di environment server.',
+      );
+
+    // Fallback dev-only: tulis ke disk lokal (URL relatif — hanya berguna lokal).
+    this.logger.warn(
+      'Kredensial Cloudinary belum di-set (CLOUDINARY_URL, atau CLOUDINARY_CLOUD_NAME + ' +
+        'CLOUDINARY_API_KEY + CLOUDINARY_API_SECRET) — upload jatuh ke disk lokal (ephemeral, dev-only).',
+    );
     const ext = path.extname(file.originalname).toLowerCase() || '.png';
     const filename = `${crypto.randomUUID()}${ext}`;
     const dest = path.join(this.uploadDir, filename);
@@ -562,6 +762,11 @@ export class AdminService {
   }
 
   async seedChartData() {
+    // Guard: endpoint ini menulis 91 listing demo langsung ke tabel `listings`
+    // yang dipakai dashboard. Dilarang di production agar angka riil tidak
+    // tercemar data palsu.
+    if (this.config.get<string>('NODE_ENV') === 'production')
+      throw new ForbiddenException('Seed chart data dilarang di production.');
     const SEED_CARDS = [
       {
         name: 'Pikachu VMAX',

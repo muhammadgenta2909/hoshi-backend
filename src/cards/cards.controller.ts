@@ -9,7 +9,7 @@ import {
   UseGuards,
 } from '@nestjs/common';
 import { ApiBearerAuth, ApiOperation, ApiTags } from '@nestjs/swagger';
-import { JwtAuthGuard } from '../auth/jwt-auth.guard';
+import { AdminGuard } from '../auth/admin.guard';
 import { CardsService } from './cards.service';
 import { CreateCardDto } from './dto/create-card.dto';
 import { UpdateCardDto } from './dto/update-card.dto';
@@ -31,26 +31,30 @@ export class CardsController {
     return this.cards.findOne(id);
   }
 
+  // Mutasi katalog = ADMIN ONLY. Sebelumnya cukup JwtAuthGuard, artinya user mana
+  // pun yang login bisa membuat/mengubah/menghapus kartu katalog — padahal Card
+  // dirujuk oleh Nft, VaultItem, dan Listing. Tidak ada UI yang memakai endpoint
+  // ini (admin memakai /admin/*), jadi mengetatkannya tidak memutus fitur apa pun.
   @Post()
   @ApiBearerAuth()
-  @UseGuards(JwtAuthGuard)
-  @ApiOperation({ summary: 'Create a new card (login required)' })
+  @UseGuards(AdminGuard)
+  @ApiOperation({ summary: 'Create a new card (ADMIN ONLY)' })
   create(@Body() dto: CreateCardDto) {
     return this.cards.create(dto);
   }
 
   @Patch(':id')
   @ApiBearerAuth()
-  @UseGuards(JwtAuthGuard)
-  @ApiOperation({ summary: 'Update card (login required)' })
+  @UseGuards(AdminGuard)
+  @ApiOperation({ summary: 'Update card (ADMIN ONLY)' })
   update(@Param('id') id: string, @Body() dto: UpdateCardDto) {
     return this.cards.update(id, dto);
   }
 
   @Delete(':id')
   @ApiBearerAuth()
-  @UseGuards(JwtAuthGuard)
-  @ApiOperation({ summary: 'Delete card (login required)' })
+  @UseGuards(AdminGuard)
+  @ApiOperation({ summary: 'Delete card (ADMIN ONLY)' })
   remove(@Param('id') id: string) {
     return this.cards.remove(id);
   }

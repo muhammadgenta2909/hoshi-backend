@@ -32,6 +32,12 @@ services:
       # ── Frontend origin untuk CORS (isi URL Vercel-mu nanti, mis. https://hoshi.vercel.app) ──
       - key: FRONTEND_ORIGIN
         sync: false
+      # ── Upload gambar listing (WAJIB di produksi) ──
+      # Tanpa ini, POST /admin/upload menolak (fail-fast) agar tidak menyimpan URL
+      # rusak. Ambil di Cloudinary Dashboard → Settings → API Keys.
+      # Format: cloudinary://<api_key>:<api_secret>@<cloud_name>
+      - key: CLOUDINARY_URL
+        sync: false
       # ── Solana devnet (default aman, boleh dibiarkan) ──
       - key: SOLANA_RPC_URL
         value: https://api.devnet.solana.com

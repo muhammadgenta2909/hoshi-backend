@@ -1,4 +1,5 @@
 import {
+  BadRequestException,
   Body,
   Controller,
   Delete,
@@ -35,6 +36,7 @@ import {
   QueryAdminMessagesDto,
 } from './dto/contact-message.dto';
 import { ImportListingsDto } from './dto/import-listings.dto';
+import { UpdateVaultItemDto } from './dto/update-vault-item.dto';
 import {
   QueryAdminActivityDto,
   QueryAdminCardsDto,
@@ -184,12 +186,14 @@ export class AdminController {
     @Query('limit') limit?: string,
     @Query('listingId') listingId?: string,
     @Query('search') search?: string,
+    @Query('status') status?: string,
   ) {
     return this.admin.listOffers({
       page: page ? parseInt(page, 10) : undefined,
       limit: limit ? parseInt(limit, 10) : undefined,
       listingId,
       search,
+      status,
     });
   }
 
@@ -209,12 +213,53 @@ export class AdminController {
     return this.admin.rejectOffer(id);
   }
 
+  /* ---------- Vault / Inventory (custody location) ---------- */
+
+  @Get('vault-items')
+  @ApiBearerAuth()
+  @UseGuards(AdminGuard)
+  @ApiOperation({ summary: 'Daftar item vault (filter status/provider/search)' })
+  listVaultItems(
+    @Query('page') page?: string,
+    @Query('limit') limit?: string,
+    @Query('status') status?: string,
+    @Query('provider') provider?: string,
+    @Query('search') search?: string,
+  ) {
+    return this.admin.listVaultItems({
+      page: page ? parseInt(page, 10) : undefined,
+      limit: limit ? parseInt(limit, 10) : undefined,
+      status,
+      provider,
+      search,
+    });
+  }
+
+  @Put('vault-items/:id')
+  @ApiBearerAuth()
+  @UseGuards(AdminGuard)
+  @ApiOperation({ summary: 'Ubah lokasi/provider custody item vault' })
+  updateVaultItem(@Param('id') id: string, @Body() dto: UpdateVaultItemDto) {
+    return this.admin.updateVaultItem(id, dto);
+  }
+
   /* ---------- Image Upload ---------- */
 
   @Post('upload')
   @ApiBearerAuth()
   @UseGuards(AdminGuard)
-  @UseInterceptors(FileInterceptor('file'))
+  @UseInterceptors(
+    FileInterceptor('file', {
+      // Batasi ukuran (8MB) + hanya terima MIME image/* — FileInterceptor default
+      // tidak punya batas apa pun, jadi admin bisa saja mengunggah file raksasa
+      // atau non-gambar. Guard di sini + di service (uploadImage).
+      limits: { fileSize: 8 * 1024 * 1024 },
+      fileFilter: (_req, file, cb) => {
+        if (file.mimetype?.startsWith('image/')) cb(null, true);
+        else cb(new BadRequestException('Hanya file gambar yang diperbolehkan'), false);
+      },
+    }),
+  )
   @ApiConsumes('multipart/form-data')
   @ApiBody({
     schema: {

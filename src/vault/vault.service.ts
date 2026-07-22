@@ -22,7 +22,13 @@ export class VaultService {
     });
     if (!card) throw new NotFoundException('Card not found.');
     return this.prisma.vaultItem.create({
-      data: { cardId: dto.cardId, serialNumber: dto.serialNumber },
+      data: {
+        cardId: dto.cardId,
+        serialNumber: dto.serialNumber,
+        // storageProvider default HOSHI dari schema kalau tidak dikirim.
+        storageProvider: dto.storageProvider,
+        vaultLocation: dto.vaultLocation,
+      },
       include: { card: true },
     });
   }

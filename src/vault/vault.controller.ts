@@ -1,5 +1,6 @@
 import { Body, Controller, Get, Param, Post, UseGuards } from '@nestjs/common';
 import { ApiBearerAuth, ApiOperation, ApiTags } from '@nestjs/swagger';
+import { AdminGuard } from '../auth/admin.guard';
 import { CurrentUser } from '../auth/current-user.decorator';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import type { AuthUser } from '../auth/jwt.strategy';
@@ -13,8 +14,13 @@ import { VaultService } from './vault.service';
 export class VaultController {
   constructor(private readonly vault: VaultService) {}
 
+  // WAJIB AdminGuard: endpoint ini MEMBUAT inventory vault. Dengan JwtAuthGuard
+  // saja, siapa pun yang punya wallet (identitas gratis lewat /auth/nonce) bisa
+  // menyuntik VaultItem palsu — muncul sebagai custody "asli" di dashboard admin,
+  // lalu diklaim lewat /vault/:id/claim sehingga PLATFORM yang membayar mint NFT-nya.
   @Post()
-  @ApiOperation({ summary: 'Simpan kartu fisik ke vault (admin)' })
+  @UseGuards(AdminGuard)
+  @ApiOperation({ summary: 'Simpan kartu fisik ke vault (ADMIN ONLY)' })
   store(@Body() dto: CreateVaultItemDto) {
     return this.vault.store(dto);
   }
