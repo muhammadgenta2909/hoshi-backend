@@ -131,8 +131,16 @@ export class IdrxClient {
     apiKey: string;
     secretKeyBase64: string;
   } {
-    const apiBase =
-      this.config.get<string>('IDRX_API_BASE') ?? IDRX_DEFAULT_BASE_URL;
+    // `??` alone only catches undefined/null — an env set to an EMPTY string (a
+    // very easy mistake in a dashboard) would slip through and make every request
+    // URL relative ("Failed to parse URL"). Trim + `||` fall back on empty too, and
+    // a value missing its scheme (e.g. "idrx.co") gets https:// so fetch can parse it.
+    const configured = this.config.get<string>('IDRX_API_BASE')?.trim();
+    const apiBase = configured
+      ? /^https?:\/\//i.test(configured)
+        ? configured
+        : `https://${configured}`
+      : IDRX_DEFAULT_BASE_URL;
     const apiKey = this.config.get<string>('IDRX_API_KEY');
     const secretKeyBase64 = this.config.get<string>('IDRX_API_SECRET');
 
