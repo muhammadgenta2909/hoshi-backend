@@ -68,8 +68,12 @@ const ERROR_MAX = 500;
  * (harga $50.000) langsung jadi tanda tangan treasury senilai $50.000 — tidak ada lagi
  * popup wallet yang menahannya, karena user sudah tidak menandatangani apa pun.
  * Override lewat GACHA_MAX_PACK_PRICE_USDC.
+ *
+ * DI-EXPORT supaya PaymentsService memakai ANGKA YANG SAMA saat menolak order di depan.
+ * Kalau keduanya punya salinan sendiri, keduanya bisa melenceng — dan melencengnya dibayar
+ * user: order lolos dibuat, rupiah masuk, lalu treasury menolak di fulfillment.
  */
-const TREASURY_MAX_PACK_PRICE_USDC = 100_000_000;
+export const TREASURY_MAX_PACK_PRICE_USDC = 100_000_000;
 
 /**
  * Plafon belanja treasury dalam 24 jam berjalan (USDC base unit). Default $500.

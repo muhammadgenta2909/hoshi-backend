@@ -11,7 +11,10 @@ import { PaymentStatus } from '@prisma/client';
 import type { PaymentOrder } from '@prisma/client';
 import { PublicKey } from '@solana/web3.js';
 import type { AuthUser } from '../auth/jwt.strategy';
-import { GachaService } from '../collectorcrypt/gacha.service';
+import {
+  GachaService,
+  TREASURY_MAX_PACK_PRICE_USDC,
+} from '../collectorcrypt/gacha.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { CreatePackOrderDto } from './dto/create-pack-order.dto';
 import { IdrxClient } from './idrx.client';
@@ -1067,6 +1070,28 @@ export class PaymentsService {
    * sejati untuk mainnet: reservasi baris + advisory lock Postgres di sekitar cek+insert.
    */
   private async assertTreasuryCapacity(priceUsdc: number): Promise<void> {
+    // Plafon harga SATU pack, dicek DI SINI — sebelum order terbit — bukan cuma di dalam
+    // purchase(). GachaService menegakkan plafon yang sama saat fulfillment; kalau order
+    // sudah terlanjur terbit, penegakan itu jatuh SESUDAH rupiah user masuk dan berubah
+    // jadi REFUND_DUE: user bayar, pack tidak pernah datang. Sama persis alasannya dengan
+    // plafon harian di bawah — plafon pengaman kita tidak boleh jadi alat merampok user
+    // yang SUDAH bayar. Konstanta di-import dari GachaService agar tidak mungkin melenceng.
+    const maxPack = this.intConfig(
+      'GACHA_MAX_PACK_PRICE_USDC',
+      TREASURY_MAX_PACK_PRICE_USDC,
+      1,
+    );
+    if (priceUsdc > maxPack) {
+      this.logger.error(
+        `Harga pack ${priceUsdc} melewati plafon per-pack ${maxPack} (USDC base unit). ` +
+          'Order TIDAK diterbitkan — tidak ada rupiah user yang masuk.',
+      );
+      throw new BadRequestException(
+        'Pack ini melebihi batas nominal pembelian kami saat ini. Pilih pack lain — ' +
+          'tidak ada dana Anda yang terpotong.',
+      );
+    }
+
     const cap = this.intConfig(
       'GACHA_TREASURY_DAILY_CAP_USDC',
       TREASURY_DAILY_CAP_USDC,
