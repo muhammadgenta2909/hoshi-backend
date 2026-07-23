@@ -23,6 +23,7 @@ import { QueryActivityDto } from './dto/query-activity.dto';
 import { QueryListingDto, SortKey } from './dto/query-listing.dto';
 import { RelistListingDto } from './dto/relist-listing.dto';
 import { UpdateListingDto } from './dto/update-listing.dto';
+import { assertDemoOnly } from '../common/demo-mode';
 import {
   ActivityDto,
   displayLabel,
@@ -322,6 +323,11 @@ export class MarketplaceService {
    * TODO(pembayaran): tanpa escrow, penerimaan offer belum menarik dana pembeli.
    */
   async acceptOffer(offerId: string, user: AuthUser): Promise<OfferDto> {
+    // Menerima offer memindahkan kartu tanpa settlement, persis seperti buy().
+    // Ditaruh DI SINI, bukan di controller: acceptOfferAsAdmin() masuk lewat pintu
+    // lain ke metode yang sama, jadi penjagaan di controller akan terlewat.
+    assertDemoOnly('Menerima penawaran marketplace');
+
     const offer = await this.loadOffer(offerId);
     this.assertSeller(offer.listing.sellerId, user);
 
@@ -637,6 +643,11 @@ export class MarketplaceService {
    * POC mengasumsikan pembayaran beres, lalu mint NFT ke wallet buyer.
    */
   async buy(id: string, user: AuthUser): Promise<ListingDto> {
+    // Lihat TODO(pembayaran) di atas: metode ini me-mint TANPA settlement apa pun.
+    // Sah di demo devnet, tapi di mainnet berarti kartu asli bisa diambil gratis
+    // oleh siapa pun yang login — dan login itu gratis.
+    assertDemoOnly('Pembelian marketplace');
+
     const existing = await this.prisma.listing.findUnique({
       where: { id },
       include: { seller: { select: USER_LABEL_SELECT } },
@@ -647,7 +658,10 @@ export class MarketplaceService {
     // membelinya akan me-mint NFT Hoshi palsu & menandai SOLD (jual barang bukan
     // milik kita). Kartu CC yang di-PULL lalu dipajang seorang user (sellerId
     // terisi) MEMANG miliknya untuk dijual, jadi tidak diblokir di sini.
-    if (existing.source === ListingSource.COLLECTORCRYPT && !existing.sellerId) {
+    if (
+      existing.source === ListingSource.COLLECTORCRYPT &&
+      !existing.sellerId
+    ) {
       throw new BadRequestException(
         'Kartu katalog CollectorCrypt belum bisa dibeli lewat Hoshi. ' +
           'Pembelian kartu katalog CC akan tersedia setelah integrasi settlement CC.',

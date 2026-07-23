@@ -6,6 +6,7 @@ import {
 } from '@nestjs/common';
 import { randomInt } from 'node:crypto';
 import { InventoryService } from '../inventory/inventory.service';
+import { assertDemoOnly } from '../common/demo-mode';
 import type {
   CardRarity,
   InventoryCard,
@@ -79,6 +80,10 @@ export class PacksService {
     packId: string;
     source?: InventorySource;
   }) {
+    // Membuka pack di sini men-deliver inventory NYATA tanpa pembayaran apa pun.
+    // (Alur gacha berbayar yang sesungguhnya ada di CollectorCryptModule.)
+    assertDemoOnly('Buka pack');
+
     const pack = findPack(params.packId);
     if (!pack) throw new NotFoundException('Pack not found.');
 

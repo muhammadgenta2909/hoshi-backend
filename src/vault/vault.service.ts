@@ -7,6 +7,7 @@ import { VaultStatus } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { NftService } from '../nft/nft.service';
 import { CreateVaultItemDto } from './dto/create-vault-item.dto';
+import { assertDemoOnly } from '../common/demo-mode';
 
 @Injectable()
 export class VaultService {
@@ -69,6 +70,12 @@ export class VaultService {
     ownerAddress: string;
     vaultItemId: string;
   }) {
+    // Klaim = platform membayar mint sebuah kartu vault ke wallet user, tanpa
+    // pembayaran apa pun. Route-nya cuma ber-JwtAuthGuard (bukan AdminGuard), dan
+    // GET /vault/available membocorkan semua id yang bisa diklaim — di mainnet itu
+    // berarti daftar belanja gratis.
+    assertDemoOnly('Klaim vault');
+
     // 1) Klaim ATOMIK: hanya request yang berhasil mengubah STORED→MINTING yang lanjut.
     //    Cegah double-claim/double-mint walau ada 2 request bersamaan / double-click.
     const claimed = await this.prisma.vaultItem.updateMany({
