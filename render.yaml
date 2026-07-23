@@ -38,16 +38,62 @@ services:
       # Format: cloudinary://<api_key>:<api_secret>@<cloud_name>
       - key: CLOUDINARY_URL
         sync: false
-      # ── Solana devnet (default aman, boleh dibiarkan) ──
-      - key: SOLANA_RPC_URL
-        value: https://api.devnet.solana.com
-      - key: SOLANA_CLUSTER
-        value: devnet
-      # ── Sumber inventory: mock = tanpa DB/chain, aman untuk demo tanpa dompet ──
+      # ── Solana ──
+      # `sync: false`, BUKAN `value:`. Sebagai `value:` literal, keempat var di bawah ini
+      # dikelola blueprint — artinya sekali saja blueprint di-re-sync, nilai yang kamu set
+      # di dashboard DITIMPA dan produksi diam-diam kembali ke devnet + inventory mock.
+      # Itu jenis kegagalan yang tidak menimbulkan error apa pun; ia cuma menjual kartu palsu.
+      #
+      # ⚠️ Mengubah baris ini TIDAK mengubah nilai yang sedang berjalan di service yang sudah ada
+      #    — nilai aslinya tetap harus diisi di Render Dashboard.
+      - key: SOLANA_RPC_URL # mainnet: WAJIB RPC berbayar, endpoint publik akan kena rate-limit
+        sync: false
+      - key: SOLANA_CLUSTER # devnet | mainnet-beta
+        sync: false
       - key: INVENTORY_PROVIDER
-        value: mock
+        sync: false
       - key: DEFAULT_METADATA_URI
-        value: https://gateway.irys.xyz/6UNWfKd2igXWUGF7XY39Mwa7baeVwFHVdorDCaH1bjN2
-      # ── Opsional: hanya jika mau mint NFT beneran (dompet platform). Biarkan kosong untuk demo ──
+        sync: false
+      # ── Opsional: hanya jika mau mint NFT beneran (dompet platform) ──
       - key: PLATFORM_SECRET_KEY
+        sync: false
+
+      # ── CollectorCrypt Gacha ──
+      # BASE_URL menentukan produk yang benar-benar diterima user:
+      #   https://dev-gacha.collectorcrypt.com  → kartu TEST (devnet), tidak bernilai
+      #   https://gacha.collectorcrypt.com      → kartu ASLI (butuh API key produksi)
+      # Dideklarasikan di sini supaya nilainya WAJIB terlihat saat deploy, bukan diam-diam
+      # jatuh ke default dev di dalam kode.
+      - key: COLLECTORCRYPT_GACHA_BASE_URL
+        sync: false
+      - key: COLLECTORCRYPT_GACHA_API_KEY
+        sync: false
+
+      # ── Treasury (dompet yang MEMBAYAR setiap pack) ──
+      # SECRET_KEY = rahasia terbesar sistem ini. ADDRESS dipakai memverifikasi bahwa IDRX
+      # benar-benar mencetak ke dompet kita; kalau kosong, order yang SUDAH DIBAYAR tidak
+      # bisa diverifikasi dan tersangkut.
+      - key: HOSHI_TREASURY_SECRET_KEY
+        sync: false
+      - key: HOSHI_TREASURY_ADDRESS
+        sync: false
+      # Plafon belanja — pengaman nominal, bukan sekadar tuning.
+      - key: GACHA_MAX_PACK_PRICE_USDC
+        sync: false
+      - key: GACHA_TREASURY_DAILY_CAP_USDC
+        sync: false
+      - key: HOSHI_MAX_SLIPPAGE_BPS
+        sync: false
+
+      # ── IDRX (on-ramp rupiah) ──
+      # Divalidasi LAZY: salah isi baru ketahuan saat order PERTAMA dibuat, bukan saat boot.
+      - key: IDRX_API_KEY
+        sync: false
+      - key: IDRX_API_SECRET
+        sync: false
+      - key: IDRX_NETWORK_CHAIN_ID # Solana = 2 (terverifikasi dari frontend IDRX sendiri)
+        sync: false
+      - key: HOSHI_PAYMENT_RETURN_URL
+        sync: false
+      - key: HOSHI_PACK_MARGIN_BPS # kosong = 0 = jual seharga modal
         sync: false

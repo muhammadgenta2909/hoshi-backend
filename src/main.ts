@@ -11,6 +11,16 @@ async function bootstrap() {
   const app = await NestFactory.create<NestExpressApplication>(AppModule);
   const config = app.get(ConfigService);
 
+  // Di belakang load balancer (Render/Railway), tanpa ini Express melaporkan IP PROXY
+  // sebagai req.ip untuk SETIAP request. Akibatnya bukan sekadar rate-limit yang longgar —
+  // ia terbalik jadi ketat: seluruh dunia berbagi SATU bucket throttler, sehingga
+  // /auth/nonce dan /auth/login (10/menit) habis oleh ~5 login bersamaan dan aplikasi
+  // menolak user-nya sendiri tanpa ada penyerang sama sekali.
+  //
+  // `1`, BUKAN `true`: `true` mempercayai seluruh rantai X-Forwarded-For, sehingga klien
+  // bisa mengarang header itu dan mencetak bucket tak terbatas — persis kebalikan tujuannya.
+  app.set('trust proxy', 1);
+
   // Semua route diawali /api → GET /api/health, POST /api/auth/login, dst.
   app.setGlobalPrefix('api');
 
