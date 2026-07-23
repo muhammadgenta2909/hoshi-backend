@@ -2,6 +2,7 @@ import { Module } from '@nestjs/common';
 import { CollectorCryptModule } from '../collectorcrypt/collectorcrypt.module';
 import { IdrxClient } from './idrx.client';
 import { PaymentsController } from './payments.controller';
+import { PaymentsReconcileScheduler } from './payments-reconcile.scheduler';
 import { PaymentsService } from './payments.service';
 
 /**
@@ -19,10 +20,13 @@ import { PaymentsService } from './payments.service';
  * IdrxClient di-provide di sini (transport murni ke IDRX; ia yang meminjam penandatanganan
  * dari src/idrx/idrx.signature.ts). Tidak ada yang di-`exports`: PaymentsService cuma dipakai
  * oleh PaymentsController di modul ini.
+ *
+ * PaymentsReconcileScheduler WAJIB terdaftar di sini: callback IDRX tidak pernah di-retry, jadi
+ * penyapu berkala inilah satu-satunya yang menyelamatkan order berbayar yang callbacknya hilang.
  */
 @Module({
   imports: [CollectorCryptModule],
   controllers: [PaymentsController],
-  providers: [PaymentsService, IdrxClient],
+  providers: [PaymentsService, IdrxClient, PaymentsReconcileScheduler],
 })
 export class PaymentsModule {}
