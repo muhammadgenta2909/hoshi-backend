@@ -17,6 +17,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { CcGachaClient } from './cc-gacha.client';
 import { toCcRarity } from './cc-gacha.types';
 import type {
+  CcBuybackAvailableResponse,
   CcBuybackResponse,
   CcConfirmationStatus,
   CcMachinesNormalizedResponse,
@@ -189,6 +190,40 @@ export interface CcBuybackQuoteDto {
   refundAmountUsdc: number;
   /** Base64 UNSIGNED — user yang menandatangani, bukan kita. */
   serializedTransaction: string;
+}
+
+/** Taksiran nilai kartu menurut CollectorCrypt — READ-ONLY, tanpa efek samping. */
+export interface CcBuybackValueDto {
+  nftAddress: string;
+  /** false = di luar jendela 72 jam / tidak memenuhi syarat. */
+  available: boolean;
+  /** USDC base unit (6 desimal), sudah dinormalisasi. null bila tidak tersedia. */
+  refundAmountUsdc: number | null;
+}
+
+/**
+ * Samakan satuan `amount` dari GET /api/buyback/available ke USDC base unit.
+ *
+ * KENAPA PERLU: tipe CcBuybackAvailableResponse menandai satuan field ini BELUM
+ * DIPASTIKAN — endpoint lain di API yang sama mengirim dolar penuh. Menebak salah
+ * bukan error kecil: ia meleset sejuta kali lipat, dan yang melihatnya adalah user
+ * yang sedang menimbang menjual kartunya.
+ *
+ * Nilai kartu gacha nyata berada di kisaran sen sampai ribuan dolar, dan hanya SATU
+ * dari dua tafsir yang bisa mendarat di sana: 36_550_000 mustahil berarti $36 juta,
+ * dan 36.55 mustahil berarti 3 sen. Jadi ambang di bawah memilih tafsir yang masuk
+ * akal, bukan menebak.
+ *
+ * Batasnya jujur: kartu yang benar-benar bernilai >$100.000 akan salah dibaca. Itu
+ * tidak mungkin keluar dari mesin gacha $25–$1000, dan lebih baik daripada memasang
+ * asumsi diam-diam pada satuan yang dokumentasinya sendiri tidak menjamin.
+ */
+const BASE_UNIT_THRESHOLD = 100_000;
+function normalizeBuybackAmount(amount: number): number | null {
+  if (!Number.isFinite(amount) || amount <= 0) return null;
+  return amount >= BASE_UNIT_THRESHOLD
+    ? Math.round(amount)
+    : Math.round(amount * 1_000_000);
 }
 
 /** Hasil buyback yang sudah benar-benar diteruskan & diterima CollectorCrypt. */
@@ -806,6 +841,58 @@ export class GachaService {
       nftAddress: dto.nftAddress,
       refundAmountUsdc: res.refundAmount,
       serializedTransaction: res.serializedTransaction,
+    };
+  }
+
+  /**
+   * Taksiran nilai kartu menurut CollectorCrypt — READ-ONLY.
+   *
+   * Dipisahkan dari buyback() dengan sengaja: buyback() MENERBITKAN transaksi (ada
+   * jejaknya di sisi CC), jadi ia tidak pantas dipakai hanya untuk menampilkan
+   * angka di layar. Ini pakai GET /api/buyback/available, yang memang untuk itu.
+   */
+  async buybackValue(
+    nftAddress: string,
+    user: AuthUser,
+  ): Promise<CcBuybackValueDto> {
+    const row = await this.prisma.ccPackPurchase.findFirst({
+      where: {
+        userId: user.id,
+        nftAddress,
+        status: CcPackStatus.OPENED,
+      },
+    });
+    if (!row) {
+      throw new ForbiddenException(
+        'NFT ini bukan hasil pack yang Anda buka di Hoshi.',
+      );
+    }
+
+    let res: CcBuybackAvailableResponse;
+    try {
+      res = await this.client.buybackAvailable(user.walletAddress, nftAddress);
+    } catch (err) {
+      // Sekadar taksiran — kegagalannya tidak boleh menjatuhkan halaman kartu.
+      this.logger.warn(
+        `Taksiran buyback ${nftAddress} gagal: ${errorMessage(err)}`,
+      );
+      return { nftAddress, available: false, refundAmountUsdc: null };
+    }
+
+    const normalized = res.available
+      ? normalizeBuybackAmount(res.amount)
+      : null;
+    if (normalized != null) {
+      // Simpan supaya angka yang dilihat user dan yang tercatat di ledger sama.
+      await this.prisma.ccPackPurchase.update({
+        where: { memo: row.memo },
+        data: { buybackAmountUsdc: normalized },
+      });
+    }
+    return {
+      nftAddress,
+      available: res.available && normalized != null,
+      refundAmountUsdc: normalized,
     };
   }
 

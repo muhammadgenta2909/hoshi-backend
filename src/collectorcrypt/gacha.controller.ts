@@ -196,6 +196,20 @@ export class GachaController {
     return this.gacha.buyback(dto, user);
   }
 
+  @Get('buyback/value/:nftAddress')
+  @ApiBearerAuth()
+  @UseGuards(JwtAuthGuard)
+  @ApiOperation({
+    summary:
+      'Taksiran nilai kartu menurut CollectorCrypt (READ-ONLY, tidak menerbitkan transaksi)',
+  })
+  buybackValue(
+    @Param('nftAddress') nftAddress: string,
+    @CurrentUser() user: AuthUser,
+  ) {
+    return this.gacha.buybackValue(nftAddress, user);
+  }
+
   @Post('buyback/:memo/submit')
   @ApiBearerAuth()
   @UseGuards(JwtAuthGuard)
