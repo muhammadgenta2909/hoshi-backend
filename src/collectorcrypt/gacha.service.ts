@@ -32,6 +32,7 @@ import type {
 import { BuybackDto } from './dto/buyback.dto';
 import { GeneratePackDto } from './dto/generate-pack.dto';
 import { PurchasePackDto } from './dto/purchase-pack.dto';
+import { SubmitBuybackDto } from './dto/submit-buyback.dto';
 import { SubmitPackDto } from './dto/submit-pack.dto';
 import { TreasuryService } from './treasury.service';
 
@@ -188,6 +189,16 @@ export interface CcBuybackQuoteDto {
   refundAmountUsdc: number;
   /** Base64 UNSIGNED — user yang menandatangani, bukan kita. */
   serializedTransaction: string;
+}
+
+/** Hasil buyback yang sudah benar-benar diteruskan & diterima CollectorCrypt. */
+export interface CcSubmitBuybackResultDto {
+  packMemo: string;
+  /** Signature on-chain dari transaksi buyback. */
+  signature: string;
+  confirmationStatus: CcConfirmationStatus;
+  /** USDC base unit — nominal yang tercatat saat penawaran diterbitkan. */
+  refundAmountUsdc: number;
 }
 
 /**
@@ -795,6 +806,83 @@ export class GachaService {
       nftAddress: dto.nftAddress,
       refundAmountUsdc: res.refundAmount,
       serializedTransaction: res.serializedTransaction,
+    };
+  }
+
+  /**
+   * Teruskan transaksi buyback yang SUDAH ditandatangani user ke CollectorCrypt.
+   * Ini langkah yang benar-benar memindahkan kartu dan menarik refund — sampai di
+   * sini, buyback() barulah sebuah penawaran yang belum mengikat.
+   *
+   * `submitTransaction` TIDAK IDEMPOTEN (kata dokumentasi mereka): mengirim ulang
+   * transaksi yang sama bisa dihitung dua kali. Karena itu baris yang sudah
+   * BOUGHT_BACK ditolak di depan, bukan diteruskan "untuk jaga-jaga".
+   */
+  async submitBuyback(
+    memo: string,
+    dto: SubmitBuybackDto,
+    user: AuthUser,
+  ): Promise<CcSubmitBuybackResultDto> {
+    // Kepemilikan lewat ledger, bukan klaim klien — memo bersifat publik.
+    const row = await this.prisma.ccPackPurchase.findFirst({
+      where: { userId: user.id, memo },
+    });
+    if (!row) {
+      throw new ForbiddenException('Pack ini bukan milik Anda.');
+    }
+    if (row.status === CcPackStatus.BOUGHT_BACK) {
+      // Bukan error yang perlu ditakuti: user menekan dua kali, atau jaringan
+      // mengulang. Yang berbahaya justru meneruskannya lagi ke CC.
+      throw new BadRequestException('Kartu ini sudah dijual balik.');
+    }
+    if (row.status !== CcPackStatus.OPENED) {
+      throw new BadRequestException(
+        'Hanya kartu dari pack yang sudah dibuka yang bisa dijual balik.',
+      );
+    }
+    // buyback() selalu menuliskan nominalnya lebih dulu. Tanpa itu, tidak pernah ada
+    // penawaran yang diterbitkan untuk baris ini — jadi tidak ada yang sah untuk dikirim.
+    if (row.buybackAmountUsdc == null) {
+      throw new BadRequestException(
+        'Belum ada penawaran buyback untuk kartu ini. Minta penawaran dulu.',
+      );
+    }
+
+    let res: CcSubmitTransactionResponse;
+    try {
+      res = await this.client.submitTransaction({
+        signedTransaction: dto.signedTransaction,
+      });
+    } catch (err) {
+      // Status TIDAK diubah: submit yang gagal tidak berarti kartunya berpindah.
+      await this.flagError(row.memo, err);
+      throw err;
+    }
+
+    if (!res.success) {
+      await this.flagError(
+        row.memo,
+        new Error('submitTransaction success=false'),
+      );
+      throw new ServiceUnavailableException(
+        'CollectorCrypt menolak transaksi buyback. Kartu Anda tidak berpindah.',
+      );
+    }
+
+    await this.prisma.ccPackPurchase.update({
+      where: { memo: row.memo },
+      data: {
+        status: CcPackStatus.BOUGHT_BACK,
+        buybackSignature: res.signature,
+        error: null,
+      },
+    });
+
+    return {
+      packMemo: row.memo,
+      signature: res.signature,
+      confirmationStatus: res.confirmationStatus,
+      refundAmountUsdc: row.buybackAmountUsdc,
     };
   }
 

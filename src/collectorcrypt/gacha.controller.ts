@@ -18,6 +18,7 @@ import { CurrentUser } from '../auth/current-user.decorator';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import type { AuthUser } from '../auth/jwt.strategy';
 import { BuybackDto } from './dto/buyback.dto';
+import { SubmitBuybackDto } from './dto/submit-buyback.dto';
 import { GeneratePackDto } from './dto/generate-pack.dto';
 import { PurchasePackDto } from './dto/purchase-pack.dto';
 import { SubmitPackDto } from './dto/submit-pack.dto';
@@ -193,5 +194,20 @@ export class GachaController {
   })
   buyback(@Body() dto: BuybackDto, @CurrentUser() user: AuthUser) {
     return this.gacha.buyback(dto, user);
+  }
+
+  @Post('buyback/:memo/submit')
+  @ApiBearerAuth()
+  @UseGuards(JwtAuthGuard)
+  @ApiOperation({
+    summary:
+      'Teruskan transaksi buyback yang sudah ditandatangani user → kartu berpindah & refund cair',
+  })
+  submitBuyback(
+    @Param('memo') memo: string,
+    @Body() dto: SubmitBuybackDto,
+    @CurrentUser() user: AuthUser,
+  ) {
+    return this.gacha.submitBuyback(memo, dto, user);
   }
 }
