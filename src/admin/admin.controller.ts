@@ -133,6 +133,24 @@ export class AdminController {
     return this.admin.listCards(query);
   }
 
+  @Get('users')
+  @ApiBearerAuth()
+  @UseGuards(AdminGuard)
+  @ApiOperation({ summary: 'Daftar user terdaftar (paginated). Field aman saja.' })
+  listUsers(
+    @Query('page') page?: string,
+    @Query('limit') limit?: string,
+    @Query('search') search?: string,
+    @Query('role') role?: string,
+  ) {
+    return this.admin.listUsers({
+      page: page ? parseInt(page, 10) : undefined,
+      limit: limit ? parseInt(limit, 10) : undefined,
+      search,
+      role,
+    });
+  }
+
   @Get('activity')
   @ApiBearerAuth()
   @UseGuards(AdminGuard)

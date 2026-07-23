@@ -484,6 +484,78 @@ export class AdminService {
     };
   }
 
+  /* ---------- Users ---------- */
+
+  /**
+   * Daftar user untuk admin. Sumbernya sama dengan angka "Users" di dashboard
+   * (prisma.user.count()). PENTING: JANGAN pernah select `nonce` atau
+   * `passwordHash` — keduanya rahasia keamanan (replay-login & kredensial admin).
+   */
+  async listUsers(query: {
+    page?: number;
+    limit?: number;
+    search?: string;
+    role?: string;
+  }) {
+    const page = query.page ?? 1;
+    const limit = query.limit ?? 20;
+    const where: Prisma.UserWhereInput = {};
+    if (query.role) where.role = query.role;
+    if (query.search)
+      where.OR = [
+        { walletAddress: { contains: query.search, mode: 'insensitive' } },
+        { displayName: { contains: query.search, mode: 'insensitive' } },
+        { email: { contains: query.search, mode: 'insensitive' } },
+      ];
+
+    const [data, total] = await Promise.all([
+      this.prisma.user.findMany({
+        where,
+        orderBy: { createdAt: 'desc' },
+        skip: (page - 1) * limit,
+        take: limit,
+        select: {
+          id: true,
+          walletAddress: true,
+          displayName: true,
+          role: true,
+          email: true,
+          createdAt: true,
+          _count: {
+            select: {
+              listingsSelling: true,
+              listingsBought: true,
+              offersMade: true,
+              ccPackPurchases: true,
+            },
+          },
+        },
+      }),
+      this.prisma.user.count({ where }),
+    ]);
+
+    const mapped = data.map((u) => ({
+      id: u.id,
+      walletAddress: u.walletAddress,
+      displayName: u.displayName,
+      role: u.role,
+      email: u.email,
+      createdAt: u.createdAt.toISOString(),
+      listings: u._count.listingsSelling,
+      bought: u._count.listingsBought,
+      offers: u._count.offersMade,
+      packs: u._count.ccPackPurchases,
+    }));
+
+    return {
+      data: mapped,
+      total,
+      page,
+      limit,
+      totalPages: Math.ceil(total / limit),
+    };
+  }
+
   /* ---------- Vault / Inventory (custody location) ---------- */
 
   /**
