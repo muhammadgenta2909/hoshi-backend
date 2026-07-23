@@ -84,6 +84,15 @@ class EnvironmentVariables {
   @IsString()
   COLLECTORCRYPT_MARKET_BASE_URL?: string;
 
+  // Opsional — "true" untuk MENGAKTIFKAN pembelian kartu katalog CollectorCrypt
+  // (POST /marketplace/:id/cc-buy/*). Default MATI: jalur ini menyuruh wallet user
+  // menandatangani transaksi USDC sungguhan di jaringan yang ditunjuk
+  // COLLECTORCRYPT_MARKET_BASE_URL. Nyalakan hanya setelah diuji — mulai dari
+  // https://dev-api.collectorcrypt.com (katalog & USDC devnet).
+  @IsOptional()
+  @IsString()
+  HOSHI_CC_BUY_ENABLED?: string;
+
   // Opsional — kurs USD→IDR untuk mengubah harga katalog CC menjadi harga display
   // IDRX saat listing PERTAMA dibuat (re-sync tidak menyentuh harga). String
   // (bukan @IsInt) mengikuti pola HOSHI_PACK_MARGIN_BPS: salah ketik tidak boleh

@@ -1,4 +1,7 @@
 import { Module } from '@nestjs/common';
+import { CcBuyClient } from './cc-buy.client';
+import { CcBuyController } from './cc-buy.controller';
+import { CcBuyService } from './cc-buy.service';
 import { CcGachaClient } from './cc-gacha.client';
 import { CcMarketClient } from './cc-market.client';
 import { GachaController } from './gacha.controller';
@@ -23,8 +26,18 @@ import { TreasuryService } from './treasury.service';
  * tetap terkonsentrasi di modul ini.
  */
 @Module({
-  controllers: [GachaController],
-  providers: [CcGachaClient, CcMarketClient, GachaService, MarketSyncService, TreasuryService],
+  controllers: [GachaController, CcBuyController],
+  providers: [
+    CcGachaClient,
+    CcMarketClient,
+    // Jalur BELI marketplace CC — dipisah dari CcMarketClient yang read-only
+    // karena yang ini memindahkan uang (lihat catatan di cc-buy.client.ts).
+    CcBuyClient,
+    CcBuyService,
+    GachaService,
+    MarketSyncService,
+    TreasuryService,
+  ],
   exports: [GachaService, MarketSyncService],
 })
 export class CollectorCryptModule {}
