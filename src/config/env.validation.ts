@@ -45,7 +45,9 @@ class EnvironmentVariables {
   SOLANA_RPC_URL?: string;
 
   @IsOptional()
-  @IsString()
+  @IsIn(['devnet', 'testnet', 'mainnet-beta'], {
+    message: 'SOLANA_CLUSTER harus salah satu: devnet | testnet | mainnet-beta',
+  })
   SOLANA_CLUSTER?: string;
 
   // Opsional saat boot: endpoint mint akan memberi error jelas bila belum diisi.
@@ -187,6 +189,65 @@ class EnvironmentVariables {
   HOSHI_PACK_MARGIN_BPS?: string;
 }
 
+/**
+ * Interlock cutover mainnet. Begitu SOLANA_CLUSTER=mainnet-beta, SELURUH konfigurasi
+ * uang-asli harus konsisten. Kalau setengah jadi — cluster mainnet tapi masih menunjuk
+ * dev-gacha, RPC devnet, RPC publik yang kena rate-limit, atau treasury address kosong —
+ * backend MENOLAK START, bukan diam-diam melayani transaksi uang asli di config yang salah.
+ *
+ * Ini pelengkap assertDemoOnly (yang mematikan jalur GRATIS di produksi): yang ini menjamin
+ * begitu kamu memutuskan mainnet, kamu benar-benar sepenuhnya di mainnet. Cek TIDAK berlaku
+ * saat devnet, jadi demo yang sedang berjalan tidak terpengaruh sama sekali.
+ */
+function assertMainnetConsistency(config: Record<string, unknown>): void {
+  const str = (k: string) => {
+    const v = config[k];
+    return (typeof v === 'string' ? v : '').trim();
+  };
+  const cluster = (str('SOLANA_CLUSTER') || 'devnet').toLowerCase();
+  if (cluster !== 'mainnet-beta') return;
+
+  const problems: string[] = [];
+  const rpc = str('SOLANA_RPC_URL').toLowerCase();
+  if (!rpc) {
+    problems.push(
+      'SOLANA_RPC_URL wajib diisi di mainnet (RPC berbayar — endpoint publik akan kena rate-limit).',
+    );
+  } else if (rpc.includes('devnet') || rpc.includes('testnet')) {
+    problems.push(
+      `SOLANA_RPC_URL menunjuk non-mainnet (${str('SOLANA_RPC_URL')}) padahal cluster mainnet-beta.`,
+    );
+  } else if (rpc.includes('api.mainnet-beta.solana.com')) {
+    problems.push(
+      'SOLANA_RPC_URL memakai endpoint publik mainnet — akan kena rate-limit untuk transaksi uang asli. Pakai RPC berbayar.',
+    );
+  }
+
+  const cc = str('COLLECTORCRYPT_GACHA_BASE_URL').toLowerCase();
+  if (!cc) {
+    problems.push(
+      'COLLECTORCRYPT_GACHA_BASE_URL wajib diisi di mainnet (produksi: https://gacha.collectorcrypt.com).',
+    );
+  } else if (cc.includes('dev-gacha')) {
+    problems.push(
+      `COLLECTORCRYPT_GACHA_BASE_URL masih dev-gacha (${str('COLLECTORCRYPT_GACHA_BASE_URL')}) di mainnet — user membayar ASLI untuk kartu TEST.`,
+    );
+  }
+
+  if (!str('HOSHI_TREASURY_ADDRESS')) {
+    problems.push(
+      'HOSHI_TREASURY_ADDRESS wajib diisi di mainnet (verifikasi pembayaran + tujuan mint).',
+    );
+  }
+
+  if (problems.length > 0) {
+    throw new Error(
+      'Cutover mainnet TIDAK konsisten — backend menolak start supaya uang asli tidak jalan di config setengah jadi:\n' +
+        problems.map((p) => `  • ${p}`).join('\n'),
+    );
+  }
+}
+
 export function validateEnv(config: Record<string, unknown>) {
   const validated = plainToInstance(EnvironmentVariables, config, {
     enableImplicitConversion: true,
@@ -200,5 +261,6 @@ export function validateEnv(config: Record<string, unknown>) {
           .join('\n'),
     );
   }
+  assertMainnetConsistency(config);
   return validated;
 }
