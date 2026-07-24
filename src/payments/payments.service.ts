@@ -482,9 +482,12 @@ export class PaymentsService {
       // packType dari BARIS ORDER, bukan dari klien: kalau tidak, user bisa memesan pack
       // murah lalu menebus mesin mahal, dan cek nominal rupiah tetap lolos karena
       // di-snapshot terhadap pack yang murah.
+      // viaRupiahPayment: user SUDAH membayar rupiah — jalur ini harus fulfil bahkan di
+      // produksi, jadi ia mem-bypass pagar demo-only di purchase() (lihat komentar di sana).
       const pack = await this.gacha.purchase(
         { packType: order.packType },
         authUser,
+        { viaRupiahPayment: true },
       );
 
       const done = await this.prisma.paymentOrder.update({

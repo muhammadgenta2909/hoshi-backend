@@ -478,12 +478,14 @@ describe('PaymentsService', () => {
 
       expect(gacha.purchase).toHaveBeenCalledTimes(1);
       // packType dari BARIS ORDER (bukan klien); penerima kartu dari BARIS USER (bukan body callback).
+      // viaRupiahPayment: true — menandai jalur berbayar agar bypass pagar demo-only di produksi.
       expect(gacha.purchase).toHaveBeenCalledWith(
         { packType: 'pokemon_50' },
         expect.objectContaining({
           id: user.id,
           walletAddress: user.walletAddress,
         }) as unknown,
+        { viaRupiahPayment: true },
       );
       expect(prisma.paymentOrder.update).toHaveBeenCalledWith({
         where: { merchantOrderId: MERCHANT_ORDER_ID },

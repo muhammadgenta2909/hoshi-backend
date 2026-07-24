@@ -574,16 +574,23 @@ export class GachaService {
    *   6. submitTransaction  → sejak titik ini uang MUNGKIN sudah keluar; roll forward saja
    *   7. openPack (idempoten)  → aman diulang nanti
    */
-  async purchase(dto: PurchasePackDto, user: AuthUser): Promise<CcPackDto> {
-    // Jalur ini membelanjakan USDC TREASURY dan memberikan packnya ke user TANPA
-    // user membayar apa pun. Route-nya sengaja diturunkan ke JwtAuthGuard supaya
-    // siapa pun bisa mencoba saat demo — tapi identitas di sini GRATIS (/auth/nonce
-    // meng-upsert user untuk alamat Solana apa pun), jadi JwtAuthGuard bukan
-    // otorisasi belanja. Di produksi, tombol ini = tombol kuras treasury.
+  async purchase(
+    dto: PurchasePackDto,
+    user: AuthUser,
+    opts?: { viaRupiahPayment?: boolean },
+  ): Promise<CcPackDto> {
+    // Pagar HANYA untuk pemanggilan LANGSUNG (route /gacha/purchase), yang membelanjakan
+    // USDC treasury tanpa user membayar apa pun — di produksi itu tombol kuras treasury,
+    // dan identitas gratis (/auth/nonce meng-upsert user untuk pubkey apa pun) bukan
+    // otorisasi belanja.
     //
-    // Pagar ini menggantikan komentar "WAJIB dikunci sebelum mainnet" yang tidak
-    // dieksekusi siapa pun. Jalur berbayar yang sah adalah POST /payments/pack.
-    assertDemoOnly('Pembelian pack lewat treasury');
+    // TAPI PaymentsService memanggil method yang SAMA setelah user membayar rupiah lewat
+    // IDRX. Jalur itu SUDAH menerima uang asli dan WAJIB tetap fulfil di produksi —
+    // memagarinya berarti mengambil pembayaran user lalu tidak pernah mengirim kartunya
+    // (REFUND_DUE). Karena itu jalur berbayar mem-bypass pagar secara eksplisit.
+    if (!opts?.viaRupiahPayment) {
+      assertDemoOnly('Pembelian pack lewat treasury (jalur gratis langsung)');
+    }
 
     const treasury = this.treasuryOrRefuse();
 
