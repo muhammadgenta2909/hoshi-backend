@@ -103,6 +103,10 @@ export function toListingDto(row: ListingRow) {
     // true ⇒ CC punya buyback offer aktif untuk kartu ini (harga & eksekusi
     // milik CollectorCrypt; kita hanya meneruskan sinyalnya).
     ccHasBuyback: row.ccHasBuyback,
+    // Alamat NFT on-chain kartu (di-set saat LIST untuk kartu hasil pack, @unique).
+    // Frontend memakainya untuk mencocokkan kartu vault ↔ listing-nya SEBELUM terjual
+    // (relasi `nft` baru terisi saat mint pembelian, jadi tidak bisa dipakai di sini).
+    ccNftAddress: row.ccNftAddress ?? null,
     nft: row.nft ? toNftDto(row.nft) : null,
   };
 }
