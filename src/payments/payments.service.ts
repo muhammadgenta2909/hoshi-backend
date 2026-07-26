@@ -38,6 +38,14 @@ const QRIS_FEE_BPS = 70;
 const IDRX_MIN_MINT_IDR = 20_000;
 const IDRX_MAX_MINT_IDR = 1_000_000_000;
 
+/**
+ * SOL minimum (lamports) yang harus tetap dipegang treasury untuk fee tx + kemungkinan
+ * rent ATA saat menebus pack. Dipakai preflight: kalau SOL treasury di bawah ini, order
+ * ditolak sebelum user bayar (treasury = fee payer; kehabisan SOL = fulfillment gagal).
+ * 0,01 SOL — jauh di atas fee riil satu tx, longgar untuk rent akun bila perlu.
+ */
+const TREASURY_MIN_GAS_LAMPORTS = 10_000_000;
+
 /** Margin Hoshi. Default 0 = jual seharga modal — angka bisnis harus DIPILIH sadar, bukan diwarisi. */
 const DEFAULT_MARGIN_BPS = 0;
 
@@ -546,10 +554,20 @@ export class PaymentsService {
     // pernah ditebus. Batch RECONCILE_BATCH_MAX disediakan penuh untuk yang bisa ditindak.
     const stale = await this.prisma.paymentOrder.findMany({
       where: {
-        // PAID ikut dipindai: order yang rupiahnya sudah masuk tapi IDRX-nya belum selesai
-        // di-mint berhenti di PAID, dan kalau tidak dipoll ia menggantung selamanya.
-        status: { in: [PaymentStatus.PENDING, PaymentStatus.PAID] },
-        createdAt: { lte: cutoff, gte: floor },
+        OR: [
+          // PENDING (rupiah BELUM masuk): dibatasi `floor` — lewat RECONCILE_MAX_AGE_MS ia
+          // sudah mati (invoice IDRX kedaluwarsa) dan tak ada dana yang dipertaruhkan, jadi
+          // aman berhenti memindainya supaya reconciler tidak bekerja tanpa batas.
+          {
+            status: PaymentStatus.PENDING,
+            createdAt: { lte: cutoff, gte: floor },
+          },
+          // PAID (rupiah SUDAH masuk treasury sebagai IDRX): TANPA `floor`. Order ini menahan
+          // uang user; kalau ikut di-floor, sebuah PAID yang tak tertebus > 7 hari akan diam-diam
+          // hilang dari SEMUA polling → uang yatim tanpa yang menandai. Harus dipoll sampai
+          // tertebus atau di-refund.
+          { status: PaymentStatus.PAID, createdAt: { lte: cutoff } },
+        ],
       },
       orderBy: { createdAt: 'asc' },
       take: RECONCILE_BATCH_MAX,
@@ -562,7 +580,10 @@ export class PaymentsService {
     const stuck = await this.prisma.paymentOrder.findMany({
       where: {
         status: PaymentStatus.FULFILLING,
-        updatedAt: { lte: cutoff, gte: floor },
+        // TANPA `floor`: FULFILLING = proses tebus mati di tengah, USDC treasury MUNGKIN sudah
+        // keluar. Ini hanya DILAPORKAN (tidak ditebus ulang — risiko dobel-bayar), jadi harus
+        // tetap muncul di laporan sampai manusia menuntaskannya, bukan diam-diam hilang > 7 hari.
+        updatedAt: { lte: cutoff },
       },
       orderBy: { updatedAt: 'asc' },
       take: RECONCILE_BATCH_MAX,
@@ -1126,6 +1147,36 @@ export class PaymentsService {
       throw new ServiceUnavailableException(
         'Kuota pembelian pack sedang penuh. Coba lagi nanti — tidak ada dana Anda yang terpotong.',
       );
+    }
+
+    // Preflight kecukupan dana ON-CHAIN. Plafon di atas adalah pengaman STATIS (config);
+    // ini membaca saldo NYATA treasury dan menolak invoice bila tak cukup menutup pack ini
+    // + gas — supaya tidak pernah ada rupiah yang diterima untuk order yang tak bisa ditebus
+    // (yang akan jadi REFUND_DUE: user bayar, pack tak datang). Saldo `null` = tak diketahui
+    // (RPC mati / belum dikonfigurasi) → LEWATI dan andalkan plafon; jangan blokir order
+    // hanya karena pembacaan saldo gagal.
+    const balance = await this.gacha.treasuryBalances();
+    if (balance) {
+      const buffer = this.intConfig('TREASURY_USDC_BUFFER_USDC', 0, 0);
+      if (balance.usdcBaseUnits < priceUsdc + buffer) {
+        this.logger.error(
+          `Preflight saldo: USDC treasury ${balance.usdcBaseUnits} < harga ${priceUsdc}` +
+            (buffer ? ` (+buffer ${buffer})` : '') +
+            ' (USDC base unit). Order TIDAK diterbitkan — tidak ada rupiah user yang masuk.',
+        );
+        throw new ServiceUnavailableException(
+          'Stok pembelian pack sedang tidak mencukupi. Coba lagi nanti — tidak ada dana Anda yang terpotong.',
+        );
+      }
+      if (balance.solLamports < TREASURY_MIN_GAS_LAMPORTS) {
+        this.logger.error(
+          `Preflight saldo: SOL treasury ${balance.solLamports} lamports < minimum gas ` +
+            `${TREASURY_MIN_GAS_LAMPORTS}. Order TIDAK diterbitkan — tidak ada rupiah user yang masuk.`,
+        );
+        throw new ServiceUnavailableException(
+          'Layanan pembelian pack sedang sibuk. Coba lagi nanti — tidak ada dana Anda yang terpotong.',
+        );
+      }
     }
   }
 }

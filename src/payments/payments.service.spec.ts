@@ -54,7 +54,11 @@ describe('PaymentsService', () => {
     rates: jest.Mock;
     findMintByMerchantOrderId: jest.Mock;
   };
-  let gacha: { machines: jest.Mock; purchase: jest.Mock };
+  let gacha: {
+    machines: jest.Mock;
+    purchase: jest.Mock;
+    treasuryBalances: jest.Mock;
+  };
   let config: { get: jest.Mock };
   let configValues: Record<string, string | number | undefined>;
 
@@ -263,6 +267,9 @@ describe('PaymentsService', () => {
     gacha = {
       machines: jest.fn().mockResolvedValue([machine]),
       purchase: jest.fn().mockResolvedValue(pack),
+      // Default: saldo tak diketahui (null) → preflight dilewati, andalkan plafon config.
+      // Test yang menguji preflight menimpanya dengan saldo eksplisit.
+      treasuryBalances: jest.fn().mockResolvedValue(null),
     };
     config = { get: jest.fn((key: string) => configValues[key]) };
 
@@ -384,6 +391,58 @@ describe('PaymentsService', () => {
 
       // machine.priceUsdcBaseUnits = 50_000_000 → usdcBaseUnitsToDecimalString → "50".
       expect(idrx.rates).toHaveBeenCalledWith('50');
+    });
+
+    // PREFLIGHT SALDO ON-CHAIN. Plafon config bisa saja lebih besar dari saldo NYATA treasury
+    // (default $100/pack, $500/hari vs float bisa cuma ~$49). Tanpa preflight, order $50 lolos
+    // plafon, user bayar rupiah, lalu fulfillment gagal karena USDC kurang → REFUND_DUE. Preflight
+    // menolak SEBELUM user ditagih.
+    describe('preflight saldo treasury', () => {
+      it('menolak (ServiceUnavailable) saat USDC treasury di bawah harga pack — sebelum menagih user', async () => {
+        // Pack $50 = 50_000_000 base unit; treasury cuma $49.
+        gacha.treasuryBalances.mockResolvedValue({
+          usdcBaseUnits: 49_000_000,
+          solLamports: 100_000_000,
+        });
+
+        await expect(service.createPackOrder({}, user)).rejects.toThrow(
+          ServiceUnavailableException,
+        );
+        expect(idrx.mintRequest).not.toHaveBeenCalled();
+        expect(prisma.paymentOrder.create).not.toHaveBeenCalled();
+      });
+
+      it('menolak (ServiceUnavailable) saat SOL treasury di bawah minimum gas — sebelum menagih user', async () => {
+        // USDC cukup, tapi SOL 0,005 (< 0,01 minimum gas).
+        gacha.treasuryBalances.mockResolvedValue({
+          usdcBaseUnits: 60_000_000,
+          solLamports: 5_000_000,
+        });
+
+        await expect(service.createPackOrder({}, user)).rejects.toThrow(
+          ServiceUnavailableException,
+        );
+        expect(idrx.mintRequest).not.toHaveBeenCalled();
+        expect(prisma.paymentOrder.create).not.toHaveBeenCalled();
+      });
+
+      it('meloloskan order saat USDC dan SOL treasury cukup', async () => {
+        gacha.treasuryBalances.mockResolvedValue({
+          usdcBaseUnits: 60_000_000, // > $50 pack
+          solLamports: 100_000_000, // 0,1 SOL > minimum gas
+        });
+
+        await service.createPackOrder({}, user);
+        expect(idrx.mintRequest).toHaveBeenCalled();
+        expect(prisma.paymentOrder.create).toHaveBeenCalled();
+      });
+
+      it('saldo null (RPC/treasury tak dikonfigurasi) → preflight dilewati, order tetap terbit', async () => {
+        gacha.treasuryBalances.mockResolvedValue(null);
+
+        await service.createPackOrder({}, user);
+        expect(idrx.mintRequest).toHaveBeenCalled();
+      });
     });
   });
 

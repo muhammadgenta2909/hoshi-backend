@@ -20,6 +20,13 @@ export function createIdrxSignature(
   timestamp: string,
   secretKeyBase64: string,
 ): string {
+  // ⚠️ JANGAN "perbaiki" ini jadi `Buffer.from(secretKeyBase64, 'base64')` (raw bytes).
+  // Referensi RESMI IDRX (docs.idrx.co/api/generating-a-signature) memakai `atob(secretKey)`
+  // lalu `createHmac('sha256', secret)` dengan secret berupa STRING. `Buffer.from(b64,'base64')
+  // .toString('binary')` identik dengan `atob(b64)`, dan meneruskan STRING itu ke createHmac
+  // membuat Node meng-encode-nya sebagai UTF-8 — PERSIS seperti server IDRX. Mengganti ke raw
+  // bytes menghasilkan kunci HMAC yang berbeda dari server → SETIAP request 401. Terbukti:
+  // digest string-key === digest atob-reference, dan !== digest raw-bytes.
   const secret = Buffer.from(secretKeyBase64, 'base64').toString('binary');
   const hmac = crypto.createHmac('sha256', secret);
   hmac.update(timestamp);

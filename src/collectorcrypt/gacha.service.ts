@@ -10,6 +10,7 @@ import {
   ServiceUnavailableException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { Connection, PublicKey } from '@solana/web3.js';
 import { CcPackStatus } from '@prisma/client';
 import type { CcPackPurchase } from '@prisma/client';
 import type { AuthUser } from '../auth/jwt.strategy';
@@ -90,6 +91,17 @@ export const TREASURY_MAX_PACK_PRICE_USDC = 100_000_000;
 const TREASURY_DAILY_CAP_USDC = 500_000_000;
 
 const TREASURY_SPEND_WINDOW_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Mint SPL USDC per cluster — dibutuhkan untuk MEMBACA saldo USDC treasury pada
+ * preflight kecukupan dana (sebelum user membayar). Mainnet = USDC Circle; devnet =
+ * USDC faucet. Bisa dioverride lewat env USDC_MINT bila perlu.
+ */
+const USDC_MINT_MAINNET = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
+const USDC_MINT_DEVNET = '4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU';
+
+/** TTL cache saldo treasury — supaya tidak satu RPC-call per order. */
+const TREASURY_BALANCE_TTL_MS = 15_000;
 
 /**
  * Status yang berarti "uang treasury MUNGKIN atau SUDAH keluar" — dasar hitung plafon.
@@ -262,6 +274,80 @@ export class GachaService {
     @Optional() private readonly treasury?: TreasuryService,
     @Optional() private readonly config?: ConfigService,
   ) {}
+
+  private balanceConn: Connection | null = null;
+  private balanceCache: {
+    at: number;
+    usdcBaseUnits: number;
+    solLamports: number;
+  } | null = null;
+
+  /**
+   * Saldo ON-CHAIN treasury (USDC base unit + SOL lamports), di-cache ~15 dtk.
+   *
+   * Dipakai PaymentsService sebagai PREFLIGHT sebelum menerbitkan invoice: kalau
+   * treasury tak sanggup membayar pack ini, order ditolak SEBELUM rupiah user masuk —
+   * sehingga tidak pernah ada pembayaran yang berujung REFUND_DUE (user bayar, pack
+   * tidak datang). Plafon config adalah pengaman STATIS; ini pengaman berbasis saldo NYATA.
+   *
+   * Mengembalikan `null` = "tidak diketahui" (treasury/RPC belum dikonfigurasi, atau RPC
+   * error). Pemanggil WAJIB memperlakukan null sebagai tidak-tahu (lewati preflight,
+   * andalkan plafon) — JANGAN pernah menafsirkannya sebagai nol dan memblokir order.
+   */
+  async treasuryBalances(): Promise<{
+    usdcBaseUnits: number;
+    solLamports: number;
+  } | null> {
+    const cached = this.balanceCache;
+    if (cached && Date.now() - cached.at < TREASURY_BALANCE_TTL_MS) {
+      return {
+        usdcBaseUnits: cached.usdcBaseUnits,
+        solLamports: cached.solLamports,
+      };
+    }
+    const rpc = this.config?.get<string>('SOLANA_RPC_URL');
+    const owner = this.treasury?.isConfigured()
+      ? this.treasury.publicKey
+      : this.config?.get<string>('HOSHI_TREASURY_ADDRESS');
+    if (!rpc || !owner) return null;
+    try {
+      if (!this.balanceConn)
+        this.balanceConn = new Connection(rpc, 'confirmed');
+      const ownerPk = new PublicKey(owner);
+      const cluster = (
+        this.config?.get<string>('SOLANA_CLUSTER') || 'devnet'
+      ).toLowerCase();
+      const usdcMint = new PublicKey(
+        this.config?.get<string>('USDC_MINT') ||
+          (cluster === 'mainnet-beta' ? USDC_MINT_MAINNET : USDC_MINT_DEVNET),
+      );
+      const [solLamports, tokenAccts] = await Promise.all([
+        this.balanceConn.getBalance(ownerPk),
+        this.balanceConn.getParsedTokenAccountsByOwner(ownerPk, {
+          mint: usdcMint,
+        }),
+      ]);
+      let usdcBaseUnits = 0;
+      for (const acc of tokenAccts.value) {
+        const parsed = acc.account.data.parsed as
+          | { info?: { tokenAmount?: { amount?: string } } }
+          | undefined;
+        const amount = parsed?.info?.tokenAmount?.amount;
+        if (typeof amount === 'string' && Number.isFinite(Number(amount))) {
+          usdcBaseUnits += Number(amount);
+        }
+      }
+      this.balanceCache = { at: Date.now(), usdcBaseUnits, solLamports };
+      return { usdcBaseUnits, solLamports };
+    } catch (err) {
+      this.logger.warn(
+        `treasuryBalances: gagal baca saldo on-chain (${
+          err instanceof Error ? err.message : 'unknown'
+        }). Preflight saldo dilewati; plafon config tetap berlaku.`,
+      );
+      return null;
+    }
+  }
 
   /* --- Read-only: SUMBER KEBENARAN harga/odds/EV ada di sisi mereka, bukan di sini. --- */
 
