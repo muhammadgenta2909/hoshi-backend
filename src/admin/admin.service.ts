@@ -248,6 +248,29 @@ export class AdminService {
     });
   }
 
+  /**
+   * Activate / deactivate a listing (ACTIVE ⇄ CANCELLED). Deactivating just hides
+   * it from the marketplace; the row and its data stay intact, so it can be
+   * re-activated later — unlike deleteListing which removes it.
+   *
+   * A SOLD listing is off-limits: it changed hands via a purchase (buyer set), so
+   * flipping it back to ACTIVE would re-list a card that is no longer ours to sell.
+   */
+  async setListingStatus(id: string, status: 'ACTIVE' | 'CANCELLED') {
+    const existing = await this.prisma.listing.findUnique({ where: { id } });
+    if (!existing) throw new NotFoundException('Listing not found.');
+    if (existing.status === ListingStatus.SOLD) {
+      throw new BadRequestException(
+        'Listing yang sudah SOLD tidak bisa diaktifkan/nonaktifkan.',
+      );
+    }
+    return this.prisma.listing.update({
+      where: { id },
+      data: { status: status },
+      include: { nft: true },
+    });
+  }
+
   async importListings(dto: ImportListingsDto) {
     const seller = dto.sellerOverride ?? 'admin';
     const items = dto.items.map((item) => ({
@@ -362,7 +385,13 @@ export class AdminService {
       createdAt: a.createdAt.toISOString(),
     }));
 
-    return { data: mapped, total, page, limit, totalPages: Math.ceil(total / limit) };
+    return {
+      data: mapped,
+      total,
+      page,
+      limit,
+      totalPages: Math.ceil(total / limit),
+    };
   }
 
   private readonly logger = new Logger(AdminService.name);
@@ -449,7 +478,9 @@ export class AdminService {
               status: true,
             },
           },
-          buyer: { select: { id: true, displayName: true, walletAddress: true } },
+          buyer: {
+            select: { id: true, displayName: true, walletAddress: true },
+          },
         },
         orderBy: { createdAt: 'desc' },
         skip: (page - 1) * limit,
@@ -589,7 +620,9 @@ export class AdminService {
         where,
         include: {
           card: { select: { id: true, name: true, imageUrl: true, set: true } },
-          owner: { select: { id: true, displayName: true, walletAddress: true } },
+          owner: {
+            select: { id: true, displayName: true, walletAddress: true },
+          },
         },
         orderBy: { createdAt: 'desc' },
         skip: (page - 1) * limit,
@@ -614,7 +647,13 @@ export class AdminService {
       updatedAt: v.updatedAt.toISOString(),
     }));
 
-    return { data: mapped, total, page, limit, totalPages: Math.ceil(total / limit) };
+    return {
+      data: mapped,
+      total,
+      page,
+      limit,
+      totalPages: Math.ceil(total / limit),
+    };
   }
 
   /** Admin memindahkan/mengoreksi lokasi custody sebuah item vault. */

@@ -6,6 +6,7 @@ import {
   Get,
   Headers,
   Param,
+  Patch,
   Post,
   Put,
   Query,
@@ -22,14 +23,13 @@ import {
   ApiTags,
 } from '@nestjs/swagger';
 import { AdminGuard } from '../auth/admin.guard';
-import { CurrentUser } from '../auth/current-user.decorator';
-import type { AdminUser } from '../auth/admin-jwt.strategy';
 import { MarketSyncService } from '../collectorcrypt/market-sync.service';
 import { AdminService } from './admin.service';
 import { AdminCreateListingDto } from './dto/admin-create-listing.dto';
 import { CcSyncDto } from './dto/cc-sync.dto';
 import { AdminLoginDto } from './dto/admin-login.dto';
 import { AdminUpdateListingDto } from './dto/admin-update-listing.dto';
+import { SetListingStatusDto } from './dto/set-listing-status.dto';
 import {
   CreateContactMessageDto,
   MarkMessageReadDto,
@@ -97,6 +97,14 @@ export class AdminController {
     return this.admin.updateListing(id, dto);
   }
 
+  @Patch('listings/:id/status')
+  @ApiBearerAuth()
+  @UseGuards(AdminGuard)
+  @ApiOperation({ summary: 'Aktif/nonaktifkan listing (ACTIVE ⇄ CANCELLED)' })
+  setListingStatus(@Param('id') id: string, @Body() dto: SetListingStatusDto) {
+    return this.admin.setListingStatus(id, dto.status);
+  }
+
   @Delete('listings/:id')
   @ApiBearerAuth()
   @UseGuards(AdminGuard)
@@ -136,7 +144,9 @@ export class AdminController {
   @Get('users')
   @ApiBearerAuth()
   @UseGuards(AdminGuard)
-  @ApiOperation({ summary: 'Daftar user terdaftar (paginated). Field aman saja.' })
+  @ApiOperation({
+    summary: 'Daftar user terdaftar (paginated). Field aman saja.',
+  })
   listUsers(
     @Query('page') page?: string,
     @Query('limit') limit?: string,
@@ -236,7 +246,9 @@ export class AdminController {
   @Get('vault-items')
   @ApiBearerAuth()
   @UseGuards(AdminGuard)
-  @ApiOperation({ summary: 'Daftar item vault (filter status/provider/search)' })
+  @ApiOperation({
+    summary: 'Daftar item vault (filter status/provider/search)',
+  })
   listVaultItems(
     @Query('page') page?: string,
     @Query('limit') limit?: string,
@@ -274,7 +286,11 @@ export class AdminController {
       limits: { fileSize: 8 * 1024 * 1024 },
       fileFilter: (_req, file, cb) => {
         if (file.mimetype?.startsWith('image/')) cb(null, true);
-        else cb(new BadRequestException('Hanya file gambar yang diperbolehkan'), false);
+        else
+          cb(
+            new BadRequestException('Hanya file gambar yang diperbolehkan'),
+            false,
+          );
       },
     }),
   )
