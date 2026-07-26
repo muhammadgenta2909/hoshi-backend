@@ -29,6 +29,11 @@ export class QueryAdminListingsDto {
   @IsEnum(ListingStatus)
   status?: ListingStatus;
 
+  @ApiPropertyOptional({ description: 'Filter by exact vault location' })
+  @IsOptional()
+  @IsString()
+  vault?: string;
+
   @ApiPropertyOptional({
     description: 'Sort field: newest | price-asc | price-desc',
   })

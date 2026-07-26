@@ -73,6 +73,16 @@ export class AdminController {
     return this.admin.listListings(query);
   }
 
+  // Harus dideklarasi SEBELUM 'listings/:id' — kalau tidak, '/listings/vaults'
+  // akan tertangkap sebagai :id = "vaults".
+  @Get('listings/vaults')
+  @ApiBearerAuth()
+  @UseGuards(AdminGuard)
+  @ApiOperation({ summary: 'Distinct vault locations untuk filter dropdown' })
+  listVaults() {
+    return this.admin.listVaults();
+  }
+
   @Get('listings/:id')
   @ApiBearerAuth()
   @UseGuards(AdminGuard)

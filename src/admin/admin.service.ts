@@ -104,6 +104,7 @@ export class AdminService {
     const limit = query.limit ?? 20;
     const where: Prisma.ListingWhereInput = {};
     if (query.status) where.status = query.status;
+    if (query.vault) where.vaultLocation = query.vault;
     if (query.search) {
       where.OR = [
         { name: { contains: query.search, mode: 'insensitive' } },
@@ -127,6 +128,20 @@ export class AdminService {
       this.prisma.listing.count({ where }),
     ]);
     return { data, total, page, limit, totalPages: Math.ceil(total / limit) };
+  }
+
+  /** Distinct, non-empty vault locations across all listings — powers the admin
+   *  "filter by vault" dropdown. Sorted alphabetically for a stable menu. */
+  async listVaults(): Promise<string[]> {
+    const rows = await this.prisma.listing.findMany({
+      where: { vaultLocation: { not: null } },
+      distinct: ['vaultLocation'],
+      select: { vaultLocation: true },
+      orderBy: { vaultLocation: 'asc' },
+    });
+    return rows
+      .map((r) => r.vaultLocation)
+      .filter((v): v is string => !!v && v.trim().length > 0);
   }
 
   async getListing(id: string) {
