@@ -464,6 +464,22 @@ describe('GachaService', () => {
       });
       expect(res.rarity).toBe('Epic');
     });
+
+    // GUARD: hanya pack yang SUDAH DIBAYAR (SUBMITTED) yang boleh dibuka. Membuka pack
+    // GENERATED (transaksi dibuat, belum di-submit, belum ada uang bergerak) berarti
+    // mengeluarkan kartu tanpa pembayaran terkonfirmasi — harus ditolak keras.
+    it('refuses to open a pack that is not yet paid (GENERATED) and never calls CollectorCrypt', async () => {
+      prisma.ccPackPurchase.findUnique.mockResolvedValue({
+        ...row,
+        status: CcPackStatus.GENERATED,
+      });
+
+      await expect(service.open(MEMO, user)).rejects.toThrow(
+        BadRequestException,
+      );
+      expect(client.openPack).not.toHaveBeenCalled();
+      expect(prisma.ccPackPurchase.update).not.toHaveBeenCalled();
+    });
   });
 
   describe('submit', () => {
@@ -978,6 +994,29 @@ describe('GachaService', () => {
       )
         .map(([arg]) => arg.data.status)
         .filter((status) => status !== undefined);
+
+    // FLOW "beli dulu, buka nanti": dengan deferOpen, purchase BERHENTI di SUBMITTED —
+    // pack dibayar & dimiliki user, tapi VRF (openPack) TIDAK dijalankan. Kartunya belum
+    // diundi sampai user menekan Open. Ledger tidak pernah menyentuh OPENED.
+    it('with deferOpen pays + submits but does NOT open the pack (stops at SUBMITTED)', async () => {
+      armHappyPurchase();
+      prisma.ccPackPurchase.update.mockResolvedValue({
+        ...row,
+        playerAddress: TREASURY_WALLET,
+        status: CcPackStatus.SUBMITTED,
+        purchaseSignature: 'BuySig',
+      });
+
+      const res = await service.purchase({}, user, {
+        viaRupiahPayment: true,
+        deferOpen: true,
+      });
+
+      expect(client.submitTransaction).toHaveBeenCalledTimes(1);
+      expect(client.openPack).not.toHaveBeenCalled();
+      expect(res.status).toBe(CcPackStatus.SUBMITTED);
+      expect(statusesWritten()).not.toContain(CcPackStatus.OPENED);
+    });
 
     // INI TES YANG PALING PENTING DI FILE INI. Pembayar dan penerima kartu kini BEDA
     // wallet, dan itu persis bentuk yang biasanya dipakai mencuri: kalau body request

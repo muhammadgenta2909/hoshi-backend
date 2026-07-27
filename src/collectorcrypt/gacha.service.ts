@@ -560,6 +560,20 @@ export class GachaService {
       return toCcPackDto(row);
     }
 
+    // Hanya pack yang SUDAH DIBAYAR yang boleh dibuka. GENERATED = transaksi dibuat tapi
+    // belum di-submit (belum ada uang), SUBMITTING = hasil submit belum pasti, FAILED/
+    // BOUGHT_BACK = tidak membuka. Membuka salah satunya = mengeluarkan kartu tanpa
+    // pembayaran yang terkonfirmasi. (OPENED sudah ditangani cache di atas; diizinkan di
+    // sini juga sebagai retry idempoten bila nft_address sempat belum terbit.)
+    if (
+      row.status !== CcPackStatus.SUBMITTED &&
+      row.status !== CcPackStatus.OPENED
+    ) {
+      throw new BadRequestException(
+        'Pack ini belum dikonfirmasi terbayar, jadi belum bisa dibuka.',
+      );
+    }
+
     let res: CcOpenPackResponse;
     try {
       res = await this.client.openPack({ memo });
@@ -663,7 +677,7 @@ export class GachaService {
   async purchase(
     dto: PurchasePackDto,
     user: AuthUser,
-    opts?: { viaRupiahPayment?: boolean },
+    opts?: { viaRupiahPayment?: boolean; deferOpen?: boolean },
   ): Promise<CcPackDto> {
     // Pagar HANYA untuk pemanggilan LANGSUNG (route /gacha/purchase), yang membelanjakan
     // USDC treasury tanpa user membayar apa pun — di produksi itu tombol kuras treasury,
@@ -811,7 +825,7 @@ export class GachaService {
       throw err;
     }
 
-    await this.prisma.ccPackPurchase.update({
+    const submittedRow = await this.prisma.ccPackPurchase.update({
       where: { memo },
       data: {
         status: CcPackStatus.SUBMITTED,
@@ -819,6 +833,16 @@ export class GachaService {
         error: null,
       },
     });
+
+    // Flow "beli dulu, buka nanti" (jalur rupiah): berhenti di SUBMITTED. Pack SUDAH
+    // dibayar & dimiliki user, tapi BELUM dibuka — kartunya belum diundi. openPack (VRF)
+    // ditunda sampai user menekan "Open Pack" (open(memo)), yang idempoten & aman ditunda.
+    // Ini BUKAN celah dana: SUBMITTED = uang treasury sudah keluar untuk pack yang jadi
+    // milik user; membukanya kapan pun tidak membayar lagi. Suspense gacha jadi nyata —
+    // hasil kartu baru ditentukan saat user membuka, bukan saat membayar.
+    if (opts?.deferOpen) {
+      return toCcPackDto(submittedRow);
+    }
 
     // Sejak titik ini pack SUDAH DIBAYAR. Apa pun yang gagal setelah ini TIDAK BOLEH
     // menurunkan status: openPack idempoten, jadi baris SUBMITTED selalu bisa
