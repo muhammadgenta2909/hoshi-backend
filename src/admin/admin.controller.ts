@@ -24,6 +24,7 @@ import {
 } from '@nestjs/swagger';
 import { AdminGuard } from '../auth/admin.guard';
 import { MarketSyncService } from '../collectorcrypt/market-sync.service';
+import { GachaService } from '../collectorcrypt/gacha.service';
 import { AdminService } from './admin.service';
 import { AdminCreateListingDto } from './dto/admin-create-listing.dto';
 import { CcSyncDto } from './dto/cc-sync.dto';
@@ -49,7 +50,38 @@ export class AdminController {
   constructor(
     private readonly admin: AdminService,
     private readonly ccSync: MarketSyncService,
+    private readonly gacha: GachaService,
   ) {}
+
+  @Get('treasury')
+  @ApiBearerAuth()
+  @UseGuards(AdminGuard)
+  @ApiOperation({
+    summary:
+      'Saldo treasury on-chain (USDC/SOL/IDRX) + status untuk indikator admin',
+  })
+  async treasury() {
+    // Read-only. gacha.treasuryBalances() reads the treasury's on-chain balances
+    // (cached ~15s) and returns null when it cannot (RPC/treasury not configured).
+    const bal = await this.gacha.treasuryBalances();
+    if (!bal) {
+      return {
+        configured: false,
+        usdc: null,
+        sol: null,
+        idrx: null,
+        status: 'unknown' as const,
+      };
+    }
+    const usdc = bal.usdcBaseUnits / 1_000_000; // 6 desimal
+    const sol = bal.solLamports / 1_000_000_000;
+    const idrx = bal.idrxBaseUnits === null ? null : bal.idrxBaseUnits / 100; // IDRX 2 desimal → Rupiah
+    // Ambang kasar untuk lampu status (bisnis pack $25). Preflight tetap gerbang keras
+    // yang sebenarnya; ini cuma isyarat "kapan isi ulang".
+    const status: 'healthy' | 'low' | 'critical' =
+      usdc < 25 || sol < 0.01 ? 'critical' : usdc < 75 ? 'low' : 'healthy';
+    return { configured: true, usdc, sol, idrx, status };
+  }
 
   @Post('login')
   @ApiOperation({ summary: 'Admin login with email + password' })

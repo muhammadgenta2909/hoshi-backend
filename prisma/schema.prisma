@@ -708,3 +708,92 @@ model PaymentOrder {
   @@index([userId])
   @@map("payment_orders")
 }
+
+/// Siklus hidup satu swap IDRX → USDC.
+///
+/// Pembagiannya mengikuti satu pertanyaan: APAKAH SUDAH ADA TRANSAKSI YANG DIKIRIM KE JARINGAN?
+/// Sebelum dikirim, kegagalan itu murah (tidak ada dana bergerak) dan boleh diulang. Sesudah
+/// dikirim, "gagal" TIDAK sama dengan "tidak terjadi apa-apa" — transaksi bisa mendarat detik
+/// berikutnya, jadi mengulanginya berarti menukar dua kali.
+enum TreasurySwapStatus {
+  QUOTED /// baris write-ahead sudah ditulis, BELUM ada transaksi dikirim. Aman diulang.
+  SUBMITTED /// transaksi SUDAH dikirim ke jaringan. JANGAN PERNAH diulang otomatis.
+  CONFIRMED /// terkonfirmasi on-chain; USDC benar-benar masuk ke treasury
+  FAILED /// terbukti gagal SEBELUM transaksi dikirim — tidak ada dana yang bergerak
+  NEEDS_CHECK /// sudah dikirim tapi hasilnya tidak terbaca → WAJIB diperiksa manusia
+}
+
+/// Buku besar swap treasury IDRX → USDC.
+///
+/// KENAPA ADA: rupiah user masuk ke treasury sebagai IDRX, sedangkan pack dibayar dengan USDC.
+/// Tanpa jalur yang menutup lingkaran itu, saldo USDC turun tiap penjualan dan tidak pernah naik.
+/// Tabel ini adalah jejak audit satu-satunya untuk uang yang berpindah bentuk di dalam dompet kita
+/// sendiri — tidak ada order user yang bisa dipakai merekonstruksinya.
+///
+/// Baris ditulis WRITE-AHEAD (status QUOTED) SEBELUM transaksi ditandatangani, dengan alasan yang
+/// sama seperti CcPackPurchase: sesudah submit, satu-satunya jalan yang jujur adalah ROLL FORWARD.
+model TreasurySwap {
+  id String @id @default(cuid())
+
+  /// IDRX base unit (2 DESIMAL — Rp 448.353 = 44.835.300). BigInt, bukan Int: Rp 1 miliar
+  /// (batas mint IDRX) = 100.000.000.000 base unit, jauh di atas plafon Int 2.147.483.647.
+  idrxBaseUnits BigInt
+
+  /// USDC base unit (6 desimal) yang DIPERKIRAKAN kuotasi. Perkiraan, bukan janji.
+  quotedUsdcBaseUnits BigInt
+
+  /// Batas bawah yang DITEGAKKAN ON-CHAIN (otherAmountThreshold Jupiter). Kalau eksekusi
+  /// menghasilkan kurang dari ini, transaksinya GAGAL — bukan diam-diam menerima harga buruk.
+  minUsdcBaseUnits BigInt
+
+  /// Yang BENAR-BENAR diterima, dibaca dari saldo setelah konfirmasi. Null selama belum pasti.
+  receivedUsdcBaseUnits BigInt?
+
+  /// Kurs efektif kuotasi (rupiah per USDC, dibulatkan) — disimpan supaya spread terhadap
+  /// kuotasi IDRX bisa dipantau lintas waktu tanpa menghitung ulang dari base unit.
+  rateIdrPerUsdc Int?
+
+  /// Price impact kuotasi dalam bps. Inilah biaya likuiditas yang kita bayar.
+  priceImpactBps Int?
+
+  /// Toleransi slippage yang diminta ke Jupiter saat kuotasi dibuat.
+  slippageBps Int
+
+  /// Signature transaksi swap. @unique: kalaupun ada dua jalur yang entah bagaimana
+  /// mengirim transaksi yang sama, hanya satu baris yang bisa mencatatnya.
+  signature String? @unique
+
+  status TreasurySwapStatus @default(QUOTED)
+
+  /// Pesan kegagalan terakhir. JANGAN pernah menuliskan secret key ke sini.
+  error String?
+
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  submittedAt DateTime?
+  confirmedAt DateTime?
+
+  @@index([status])
+  @@index([createdAt])
+  @@map("treasury_swaps")
+}
+
+/// Kunci single-flight untuk swap treasury — SATU baris saja (id = "singleton").
+///
+/// Scheduler punya penjaga in-process, tapi itu hanya berlaku dalam SATU proses. Begitu ada dua
+/// instance (atau satu deploy yang tumpang tindih dengan instance lama), dua penyapu bisa
+/// menguotasi saldo IDRX yang sama dan mengirim dua transaksi. Klaim atomik di baris ini —
+/// updateMany berpredikat, lalu cek count === 1 — adalah pola yang sama dengan klaim PaymentOrder,
+/// dan aman di bawah connection pooling (beda dari advisory lock yang terikat sesi).
+model TreasurySwapLock {
+  id String @id
+
+  /// Null = bebas. Terisi = ada yang memegang. Pemegang yang mati ditangani lewat batas usia
+  /// (lihat TreasurySwapService) — kunci yang tidak pernah bisa basi = swap berhenti selamanya.
+  lockedAt DateTime?
+
+  /// Identitas pemegang, untuk log. Hanya pemegang yang sama yang boleh melepas.
+  lockedBy String?
+
+  @@map("treasury_swap_lock")
+}

@@ -14,6 +14,7 @@ import {
   ApiTags,
 } from '@nestjs/swagger';
 import { Throttle } from '@nestjs/throttler';
+import { AdminGuard } from '../auth/admin.guard';
 import { CurrentUser } from '../auth/current-user.decorator';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import type { AuthUser } from '../auth/jwt.strategy';
@@ -23,6 +24,7 @@ import { GeneratePackDto } from './dto/generate-pack.dto';
 import { PurchasePackDto } from './dto/purchase-pack.dto';
 import { SubmitPackDto } from './dto/submit-pack.dto';
 import { GachaService } from './gacha.service';
+import { TreasurySwapService } from './treasury-swap.service';
 
 /**
  * Gacha CollectorCrypt — mount di /api/gacha (prefix global 'api' dari main.ts).
@@ -50,7 +52,10 @@ import { GachaService } from './gacha.service';
 @ApiTags('gacha')
 @Controller('gacha')
 export class GachaController {
-  constructor(private readonly gacha: GachaService) {}
+  constructor(
+    private readonly gacha: GachaService,
+    private readonly swap: TreasurySwapService,
+  ) {}
 
   /* --- Publik. Read-only, tidak menyentuh ledger maupun wallet siapa pun. --- */
 
@@ -223,5 +228,56 @@ export class GachaController {
     @CurrentUser() user: AuthUser,
   ) {
     return this.gacha.submitBuyback(memo, dto, user);
+  }
+
+  /* --- Admin: treasury. Satu-satunya jendela ke DUA saldo yang menentukan apakah
+         penjualan bisa jalan — USDC (yang membayar pack) dan IDRX (rupiah user yang
+         belum berubah bentuk). Sebelum endpoint ini ada, tidak ada cara melihat
+         keduanya tanpa membuka explorer. --- */
+
+  @Get('admin/treasury')
+  @ApiBearerAuth()
+  @UseGuards(AdminGuard)
+  @ApiOperation({
+    summary:
+      'Admin: saldo treasury (USDC + SOL + IDRX) & ringkasan swap IDRX→USDC terakhir',
+  })
+  async treasuryStatus() {
+    const [balances, lastSwaps] = await Promise.all([
+      this.gacha.treasuryBalances(),
+      this.swap.recentSwaps(5),
+    ]);
+    return {
+      // null = TIDAK TERBACA, bukan nol. Dibedakan supaya pembaca tidak menyimpulkan
+      // "treasury kosong" dari RPC yang sedang error.
+      balances: balances
+        ? {
+            usdc: (balances.usdcBaseUnits / 1e6).toFixed(2),
+            usdcBaseUnits: balances.usdcBaseUnits,
+            sol: (balances.solLamports / 1e9).toFixed(6),
+            solLamports: balances.solLamports,
+            idr:
+              balances.idrxBaseUnits !== null
+                ? Math.floor(balances.idrxBaseUnits / 100)
+                : null,
+            idrxBaseUnits: balances.idrxBaseUnits,
+          }
+        : null,
+      lastSwaps,
+    };
+  }
+
+  @Post('admin/treasury/swap')
+  @ApiBearerAuth()
+  @UseGuards(AdminGuard)
+  @ApiOperation({
+    summary:
+      'Admin: paksa satu putaran swap IDRX→USDC sekarang (plafon & gerbang harga tetap berlaku)',
+  })
+  // Pemicu manual memakai JALUR YANG SAMA dengan penyapu otomatis — termasuk kunci
+  // atomik, plafon harian, dan gerbang harga. Tidak ada "mode admin" yang melewati
+  // pengaman: kalau pengamannya salah, ia harus salah di kedua jalur sekaligus.
+  swapNow() {
+    return this.swap.sweep();
   }
 }

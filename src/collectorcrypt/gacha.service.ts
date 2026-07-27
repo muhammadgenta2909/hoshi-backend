@@ -31,6 +31,7 @@ import type {
   CcSubmitTransactionResponse,
   CcVrfVerifyResponse,
 } from './cc-gacha.types';
+import { IDRX_MINT_SOLANA } from './jupiter.client';
 import { BuybackDto } from './dto/buyback.dto';
 import { GeneratePackDto } from './dto/generate-pack.dto';
 import { PurchasePackDto } from './dto/purchase-pack.dto';
@@ -232,6 +233,31 @@ export interface CcBuybackValueDto {
  * asumsi diam-diam pada satuan yang dokumentasinya sendiri tidak menjamin.
  */
 const BASE_UNIT_THRESHOLD = 100_000;
+
+/**
+ * Jumlahkan saldo semua token account milik satu mint. Sengaja MENJUMLAH, bukan mengambil
+ * yang pertama: satu wallet bisa punya lebih dari satu account untuk mint yang sama (ATA
+ * plus account lama), dan membaca salah satunya saja berarti melaporkan saldo lebih kecil
+ * dari yang sebenarnya — untuk preflight, itu menolak order yang seharusnya bisa dilayani.
+ *
+ * Account dengan nominal tak terbaca DILEWATI, bukan dianggap nol keseluruhan.
+ */
+function sumTokenAccounts(
+  accounts: readonly { account: { data: unknown } }[],
+): number {
+  let total = 0;
+  for (const acc of accounts) {
+    const parsed = acc.account.data as
+      | { parsed?: { info?: { tokenAmount?: { amount?: string } } } }
+      | undefined;
+    const amount = parsed?.parsed?.info?.tokenAmount?.amount;
+    if (typeof amount === 'string' && Number.isFinite(Number(amount))) {
+      total += Number(amount);
+    }
+  }
+  return total;
+}
+
 function normalizeBuybackAmount(amount: number): number | null {
   if (!Number.isFinite(amount) || amount <= 0) return null;
   return amount >= BASE_UNIT_THRESHOLD
@@ -280,10 +306,11 @@ export class GachaService {
     at: number;
     usdcBaseUnits: number;
     solLamports: number;
+    idrxBaseUnits: number | null;
   } | null = null;
 
   /**
-   * Saldo ON-CHAIN treasury (USDC base unit + SOL lamports), di-cache ~15 dtk.
+   * Saldo ON-CHAIN treasury (USDC base unit + SOL lamports + IDRX base unit), di-cache ~15 dtk.
    *
    * Dipakai PaymentsService sebagai PREFLIGHT sebelum menerbitkan invoice: kalau
    * treasury tak sanggup membayar pack ini, order ditolak SEBELUM rupiah user masuk —
@@ -293,16 +320,26 @@ export class GachaService {
    * Mengembalikan `null` = "tidak diketahui" (treasury/RPC belum dikonfigurasi, atau RPC
    * error). Pemanggil WAJIB memperlakukan null sebagai tidak-tahu (lewati preflight,
    * andalkan plafon) — JANGAN pernah menafsirkannya sebagai nol dan memblokir order.
+   *
+   * `idrxBaseUnits` punya null-nya SENDIRI, terpisah dari null di level hasil. Sebelum ini
+   * sistem buta total terhadap IDRX: rupiah user mendarat sebagai IDRX di dompet yang sama,
+   * tapi tidak ada satu pun kode yang membacanya — jadi treasury bisa "kehabisan USDC" sambil
+   * memegang IDRX senilai ratusan dolar tanpa ada yang tahu. Pembacaannya dipisah ke try/catch
+   * sendiri karena kegagalannya TIDAK BOLEH menjatuhkan preflight USDC/SOL: IDRX cuma ada di
+   * mainnet, dan di devnet mint-nya memang tidak ada.
    */
   async treasuryBalances(): Promise<{
     usdcBaseUnits: number;
     solLamports: number;
+    /** null = tidak terbaca (bukan nol). Jangan pernah ditafsirkan sebagai "tidak punya IDRX". */
+    idrxBaseUnits: number | null;
   } | null> {
     const cached = this.balanceCache;
     if (cached && Date.now() - cached.at < TREASURY_BALANCE_TTL_MS) {
       return {
         usdcBaseUnits: cached.usdcBaseUnits,
         solLamports: cached.solLamports,
+        idrxBaseUnits: cached.idrxBaseUnits,
       };
     }
     const rpc = this.config?.get<string>('SOLANA_RPC_URL');
@@ -327,23 +364,53 @@ export class GachaService {
           mint: usdcMint,
         }),
       ]);
-      let usdcBaseUnits = 0;
-      for (const acc of tokenAccts.value) {
-        const parsed = acc.account.data.parsed as
-          | { info?: { tokenAmount?: { amount?: string } } }
-          | undefined;
-        const amount = parsed?.info?.tokenAmount?.amount;
-        if (typeof amount === 'string' && Number.isFinite(Number(amount))) {
-          usdcBaseUnits += Number(amount);
-        }
-      }
-      this.balanceCache = { at: Date.now(), usdcBaseUnits, solLamports };
-      return { usdcBaseUnits, solLamports };
+      const usdcBaseUnits = sumTokenAccounts(tokenAccts.value);
+      const idrxBaseUnits = await this.readIdrxBalance(ownerPk, cluster);
+      this.balanceCache = {
+        at: Date.now(),
+        usdcBaseUnits,
+        solLamports,
+        idrxBaseUnits,
+      };
+      return { usdcBaseUnits, solLamports, idrxBaseUnits };
     } catch (err) {
       this.logger.warn(
         `treasuryBalances: gagal baca saldo on-chain (${
           err instanceof Error ? err.message : 'unknown'
         }). Preflight saldo dilewati; plafon config tetap berlaku.`,
+      );
+      return null;
+    }
+  }
+
+  /**
+   * Saldo IDRX treasury. Dipisah dari treasuryBalances() karena KEGAGALANNYA HARUS MURAH:
+   * IDRX hanya ada di mainnet, jadi di devnet panggilan ini wajar-wajar saja tidak menemukan
+   * apa pun — dan itu tidak boleh membuat preflight USDC ikut buta (yang akibatnya order
+   * diterbitkan tanpa cek saldo sama sekali).
+   *
+   * Mengembalikan null = TIDAK TERBACA. Nol = terbaca dan memang kosong. Bedanya penting:
+   * alarm "IDRX menumpuk" tidak boleh diam hanya karena RPC-nya sedang error.
+   */
+  private async readIdrxBalance(
+    ownerPk: PublicKey,
+    cluster: string,
+  ): Promise<number | null> {
+    // Di luar mainnet, IDRX memang tidak ada. Mengembalikan null (bukan 0) supaya tidak ada
+    // yang menyimpulkan "treasury tidak punya IDRX" dari lingkungan yang tidak bisa punya.
+    if (cluster !== 'mainnet-beta') return null;
+    try {
+      const conn = this.balanceConn;
+      if (!conn) return null;
+      const accts = await conn.getParsedTokenAccountsByOwner(ownerPk, {
+        mint: new PublicKey(IDRX_MINT_SOLANA),
+      });
+      return sumTokenAccounts(accts.value);
+    } catch (err) {
+      this.logger.warn(
+        `treasuryBalances: saldo IDRX tidak terbaca (${
+          err instanceof Error ? err.message : 'unknown'
+        }). Saldo USDC/SOL tetap dipakai.`,
       );
       return null;
     }

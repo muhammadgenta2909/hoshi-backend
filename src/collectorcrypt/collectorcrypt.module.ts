@@ -6,7 +6,10 @@ import { CcGachaClient } from './cc-gacha.client';
 import { CcMarketClient } from './cc-market.client';
 import { GachaController } from './gacha.controller';
 import { GachaService } from './gacha.service';
+import { JupiterClient } from './jupiter.client';
 import { MarketSyncService } from './market-sync.service';
+import { TreasurySwapScheduler } from './treasury-swap.scheduler';
+import { TreasurySwapService } from './treasury-swap.service';
 import { TreasuryService } from './treasury.service';
 
 /**
@@ -18,8 +21,17 @@ import { TreasuryService } from './treasury.service';
  * yang sudah didaftarkan AuthModule secara global lewat Passport.
  *
  * TreasuryService SENGAJA tidak di-`exports`: ia memegang private key yang membayar
- * tiap pack, jadi satu-satunya yang boleh menyuruhnya menandatangani adalah GachaService
- * di modul ini. Modul lain yang butuh gacha cukup lewat GachaService.
+ * tiap pack. Yang boleh menyuruhnya menandatangani hanya provider DI MODUL INI, dan
+ * saat ini ada TEPAT DUA:
+ *
+ *   - GachaService       → menandatangani pembelian pack (USDC keluar)
+ *   - TreasurySwapService → menandatangani swap IDRX→USDC (uang berpindah BENTUK)
+ *
+ * TreasurySwapService diletakkan di sini justru KARENA batasan itu: menutup lingkaran
+ * modal kerja butuh tanda tangan treasury, dan memindahkannya ke modul lain berarti
+ * meng-export TreasuryService — yang akan membuat private key tersedia bagi modul mana
+ * pun yang mengimpornya. Lebih baik satu file "asing" secara tema di dalam modul ini
+ * daripada satu private key yang bocor lintas modul.
  *
  * MarketSyncService (+ CcMarketClient, katalog publik tanpa key) di-export untuk
  * AdminModule: sync katalog adalah aksi admin, tapi pengetahuan tentang API CC
@@ -37,7 +49,11 @@ import { TreasuryService } from './treasury.service';
     GachaService,
     MarketSyncService,
     TreasuryService,
+    // Penutup lingkaran modal kerja: IDRX (rupiah user) → USDC (yang membayar pack).
+    JupiterClient,
+    TreasurySwapService,
+    TreasurySwapScheduler,
   ],
-  exports: [GachaService, MarketSyncService],
+  exports: [GachaService, MarketSyncService, TreasurySwapService],
 })
 export class CollectorCryptModule {}

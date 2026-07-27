@@ -97,3 +97,21 @@ services:
         sync: false
       - key: HOSHI_PACK_MARGIN_BPS # kosong = 0 = jual seharga modal
         sync: false
+
+      # ── Swap treasury IDRX → USDC (penutup lingkaran modal kerja) ──
+      # Rupiah user masuk sebagai IDRX; pack dibayar dengan USDC. Tanpa swap, saldo USDC
+      # hanya turun dan IDRX menumpuk — gejalanya baru terlihat saat order mulai ditolak.
+      # SEMUANYA punya default aman di kode; isi di dashboard hanya bila mau mengubahnya.
+      # Nilai default & alasan tiap angka ada di .env.example.
+      - key: TREASURY_SWAP_ENABLED # "0" = matikan swap
+        sync: false
+      - key: TREASURY_SWAP_SCHEDULER_ENABLED # "0" = matikan timer DAN alarm saldo
+        sync: false
+      - key: TREASURY_SWAP_MAX_IDR # plafon satu swap (rupiah penuh). Default 10 juta.
+        sync: false
+      - key: TREASURY_SWAP_DAILY_CAP_IDR # plafon 24 jam (rupiah penuh)
+        sync: false
+      - key: TREASURY_SWAP_MAX_PRICE_IMPACT_BPS # tolak swap yang dampak harganya di atas ini
+        sync: false
+      - key: TREASURY_USDC_LOW_PACKS # alarm USDC menipis, dalam kelipatan harga pack termahal
+        sync: false
