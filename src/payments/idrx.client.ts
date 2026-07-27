@@ -9,6 +9,8 @@ import {
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { buildIdrxRequest } from '../idrx/idrx.signature';
+import { detectProductionSignal } from '../common/demo-mode';
+import { IdrxMockStore } from './idrx-mock.store';
 import type {
   IdrxErrorBody,
   IdrxMintRequestInput,
@@ -49,7 +51,10 @@ type IdrxMethod = 'GET' | 'POST';
 export class IdrxClient {
   private readonly logger = new Logger(IdrxClient.name);
 
-  constructor(private readonly config: ConfigService) {}
+  constructor(
+    private readonly config: ConfigService,
+    private readonly mockStore: IdrxMockStore,
+  ) {}
 
   /**
    * ON-RAMP. `destinationWalletAddress` di input WAJIB alamat treasury Hoshi — klien ini
@@ -57,6 +62,7 @@ export class IdrxClient {
    * berarti kita mencetak IDRX ke wallet mereka dan tetap membayari packnya.
    */
   mintRequest(input: IdrxMintRequestInput): Promise<IdrxMintRequestResponse> {
+    if (this.mockEnabled()) return this.mockMintRequest(input);
     return this.request<IdrxMintRequestResponse>(
       'POST',
       '/api/transaction/mint-request',
@@ -82,6 +88,7 @@ export class IdrxClient {
   async findMintByMerchantOrderId(
     merchantOrderId: string,
   ): Promise<IdrxTransactionRecord | null> {
+    if (this.mockEnabled()) return this.mockFindMint(merchantOrderId);
     const path = this.withQuery('/api/transaction/user-transaction-history', {
       transactionType: 'MINT',
       merchantOrderId,
@@ -113,11 +120,108 @@ export class IdrxClient {
    * pack itu di `data.buyAmount`. Kurs bergerak — hasilnya wajib di-snapshot ke order.
    */
   rates(usdtAmount: string, chainId?: string): Promise<IdrxRatesResponse> {
+    if (this.mockEnabled()) return this.mockRates(usdtAmount);
     const path = this.withQuery('/api/transaction/rates', {
       usdtAmount,
       ...(chainId ? { chainId } : {}),
     });
     return this.request<IdrxRatesResponse>('GET', path);
+  }
+
+  /* --- IDRX MOCK (staging/devnet saja — TIDAK PERNAH di produksi) --- */
+
+  /**
+   * Mock aktif HANYA bila IDRX_MOCK=1 DAN deployment tidak terlihat produksi
+   * (detectProductionSignal() === null). Jadi walau flag kepencet di mainnet, jalur
+   * asli yang dipakai — mock tak akan pernah menyentuh uang/rupiah nyata.
+   */
+  private mockEnabled(): boolean {
+    return (
+      this.config.get<string>('IDRX_MOCK') === '1' &&
+      detectProductionSignal() === null
+    );
+  }
+
+  /** Base URL publik backend ini — dipakai membangun paymentUrl halaman bayar palsu. */
+  private mockPublicBase(): string {
+    const configured = this.config.get<string>('IDRX_MOCK_PUBLIC_URL')?.trim();
+    const base =
+      configured && configured.length > 0 ? configured : 'http://localhost:3001';
+    return base.replace(/\/+$/, '');
+  }
+
+  private mockMintRequest(
+    input: IdrxMintRequestInput,
+  ): Promise<IdrxMintRequestResponse> {
+    const merchantOrderId = `MOCK-${Date.now()}-${Math.floor(
+      Math.random() * 1_000_000,
+    )}`;
+    this.mockStore.remember(merchantOrderId, {
+      destinationWalletAddress: input.destinationWalletAddress,
+      toBeMinted: input.toBeMinted,
+      returnUrl: input.returnUrl,
+    });
+    const paymentUrl = `${this.mockPublicBase()}/api/idrx-mock/pay?order=${encodeURIComponent(
+      merchantOrderId,
+    )}`;
+    this.logger.warn(
+      `IDRX MOCK: mint-request → ${merchantOrderId} (paymentUrl ${paymentUrl})`,
+    );
+    return Promise.resolve({
+      statusCode: 200,
+      message: 'ok (mock)',
+      data: {
+        id: merchantOrderId,
+        merchantOrderId,
+        merchantCode: 'MOCK',
+        reference: `MOCKREF-${merchantOrderId}`,
+        paymentUrl,
+        amount: input.toBeMinted,
+        statusCode: 200,
+        statusMessage: 'created (mock)',
+      },
+    });
+  }
+
+  /**
+   * WAITING sebelum tombol "Bayar" ditekan, PAID+MINTED sesudahnya. Meng-echo treasury +
+   * nominal supaya assertRecordMatchesOrder di PaymentsService tetap lolos apa adanya.
+   */
+  private mockFindMint(
+    merchantOrderId: string,
+  ): Promise<IdrxTransactionRecord | null> {
+    const order = this.mockStore.get(merchantOrderId);
+    if (!order) return Promise.resolve(null);
+    const paid = this.mockStore.isPaid(merchantOrderId);
+    return Promise.resolve({
+      id: merchantOrderId,
+      merchantOrderId,
+      paymentStatus: paid ? 'PAID' : 'WAITING_FOR_PAYMENT',
+      userMintStatus: paid ? 'MINTED' : 'PROCESSING',
+      destinationWalletAddress: order.destinationWalletAddress,
+      requestType: 'idrx',
+      toBeMinted: order.toBeMinted,
+      ...(paid ? { txHash: `MOCKTX-${merchantOrderId}` } : {}),
+    });
+  }
+
+  private mockRates(usdtAmount: string): Promise<IdrxRatesResponse> {
+    const usd = Number(usdtAmount);
+    const rate = 16_000; // IDR per USD (mock, realistis; IDRX 1:1 IDR)
+    const buyAmount = Math.max(
+      20_000,
+      Math.round((Number.isFinite(usd) ? usd : 0) * rate),
+    );
+    return Promise.resolve({
+      statusCode: 200,
+      message: 'ok (mock)',
+      data: {
+        price: rate,
+        buyAmount,
+        chainId: '2',
+        quote: { expectedResult: { min: buyAmount, max: buyAmount } },
+      },
+    });
   }
 
   /* --- Internal --- */

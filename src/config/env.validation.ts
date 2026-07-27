@@ -187,6 +187,20 @@ class EnvironmentVariables {
   @IsOptional()
   @IsString()
   HOSHI_PACK_MARGIN_BPS?: string;
+
+  // IDRX MOCK (staging/devnet). "1" mengaktifkan mock IDRX: mint-request & verifikasi
+  // dijawab lokal + halaman bayar palsu, tanpa akun/kredensial IDRX. HANYA berlaku bila
+  // deployment tidak terlihat produksi (lihat detectProductionSignal) — di mainnet, flag
+  // ini diabaikan total. Biarkan kosong/tidak diisi di produksi.
+  @IsOptional()
+  @IsString()
+  IDRX_MOCK?: string;
+
+  // Base URL publik backend ini — dipakai IDRX mock membangun paymentUrl halaman bayar
+  // palsu (mis. https://hoshi-backend-staging.onrender.com). Default http://localhost:3001.
+  @IsOptional()
+  @IsString()
+  IDRX_MOCK_PUBLIC_URL?: string;
 }
 
 /**

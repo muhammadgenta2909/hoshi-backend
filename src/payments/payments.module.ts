@@ -1,6 +1,8 @@
 import { Module } from '@nestjs/common';
 import { CollectorCryptModule } from '../collectorcrypt/collectorcrypt.module';
 import { IdrxClient } from './idrx.client';
+import { IdrxMockController } from './idrx-mock.controller';
+import { IdrxMockStore } from './idrx-mock.store';
 import { PaymentsController } from './payments.controller';
 import { PaymentsReconcileScheduler } from './payments-reconcile.scheduler';
 import { PaymentsService } from './payments.service';
@@ -26,7 +28,12 @@ import { PaymentsService } from './payments.service';
  */
 @Module({
   imports: [CollectorCryptModule],
-  controllers: [PaymentsController],
-  providers: [PaymentsService, IdrxClient, PaymentsReconcileScheduler],
+  controllers: [PaymentsController, IdrxMockController],
+  providers: [
+    PaymentsService,
+    IdrxClient,
+    IdrxMockStore,
+    PaymentsReconcileScheduler,
+  ],
 })
 export class PaymentsModule {}

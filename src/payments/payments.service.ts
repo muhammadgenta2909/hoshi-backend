@@ -492,12 +492,14 @@ export class PaymentsService {
       // di-snapshot terhadap pack yang murah.
       // viaRupiahPayment: user SUDAH membayar rupiah — jalur ini harus fulfil bahkan di
       // produksi, jadi ia mem-bypass pagar demo-only di purchase() (lihat komentar di sana).
-      // deferOpen: berhenti di SUBMITTED (pack tersegel dimiliki user), TIDAK membuka. User
-      // membuka sendiri lewat "Open Pack" (open(memo)) — beli-dulu-buka-nanti, suspense nyata.
+      // Pack DIBUKA di tempat (generate→submit→open): begitu order FULFILLED, kartu sudah
+      // ke-mint dan frontend langsung memainkan animasi reveal — auto-reveal, tanpa langkah
+      // "buka manual". (Opsi deferOpen tetap ada di GachaService bila suatu saat mau balik ke
+      // alur beli-dulu-buka-nanti.)
       const pack = await this.gacha.purchase(
         { packType: order.packType },
         authUser,
-        { viaRupiahPayment: true, deferOpen: true },
+        { viaRupiahPayment: true },
       );
 
       const done = await this.prisma.paymentOrder.update({
