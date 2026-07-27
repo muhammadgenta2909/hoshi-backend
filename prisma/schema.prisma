@@ -97,6 +97,10 @@ model User {
   // Thread support (user ↔ admin).
   supportThreads SupportThread[]
 
+  // Thread pesan marketplace (pembeli ↔ penjual) di mana user ini jadi salah satu sisi.
+  marketThreadsAsBuyer  MarketThread[] @relation("MarketThreadBuyer")
+  marketThreadsAsSeller MarketThread[] @relation("MarketThreadSeller")
+
   @@map("users")
 }
 
@@ -296,6 +300,9 @@ model Listing {
   // Offer records (separate table, bukan JSON lagi)
   offerRecords Offer[]
 
+  // Thread pesan pembeli ↔ penjual untuk listing ini.
+  marketThreads MarketThread[]
+
   // Baris feed aktivitas yang menyebut listing ini.
   activities Activity[]
 
@@ -465,6 +472,58 @@ model SupportMessage {
 
   @@index([threadId, createdAt])
   @@map("support_messages")
+}
+
+// ── Pesan marketplace (pembeli ↔ penjual) ────────────────────────────────────
+// Beda dari SupportThread (user↔admin): ini antara DUA user untuk satu listing,
+// supaya "Message Seller" benar-benar sampai ke penjual (bukan ke inbox admin).
+enum MarketThreadStatus {
+  OPEN
+  CLOSED
+}
+
+enum MarketSenderType {
+  BUYER
+  SELLER
+}
+
+model MarketThread {
+  id        String  @id @default(cuid())
+  listingId String
+  listing   Listing @relation(fields: [listingId], references: [id], onDelete: Cascade)
+
+  // Satu thread per (listing, pembeli): pembeli membuka percakapan; penjual membalas.
+  buyerId String
+  buyer   User   @relation("MarketThreadBuyer", fields: [buyerId], references: [id], onDelete: Cascade)
+  sellerId String
+  seller   User   @relation("MarketThreadSeller", fields: [sellerId], references: [id], onDelete: Cascade)
+
+  status   MarketThreadStatus @default(OPEN)
+  messages MarketMessage[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([listingId, buyerId])
+  @@index([buyerId])
+  @@index([sellerId])
+  @@map("market_threads")
+}
+
+model MarketMessage {
+  id       String       @id @default(cuid())
+  threadId String
+  thread   MarketThread @relation(fields: [threadId], references: [id], onDelete: Cascade)
+
+  senderType MarketSenderType
+  body       String
+  readByBuyer  Boolean @default(false)
+  readBySeller Boolean @default(false)
+
+  createdAt DateTime @default(now())
+
+  @@index([threadId, createdAt])
+  @@map("market_messages")
 }
 
 /// Status siklus hidup satu pembelian pack di gacha CollectorCrypt.
