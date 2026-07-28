@@ -193,15 +193,19 @@ export class IdrxClient {
     const order = this.mockStore.get(merchantOrderId);
     if (!order) return Promise.resolve(null);
     const paid = this.mockStore.isPaid(merchantOrderId);
+    const settled = this.mockStore.isSettled(merchantOrderId);
     return Promise.resolve({
       id: merchantOrderId,
       merchantOrderId,
+      // Sudah bayar tapi belum settle = PAID + PROCESSING — persis IDRX asli (uang masuk,
+      // mint on-chain belum kelar). Gate fulfilment menuntut PAID+MINTED, jadi order MENUNGGU
+      // sampai settle → frontend menempuh state "menunggu konfirmasi" yang sama dengan real.
       paymentStatus: paid ? 'PAID' : 'WAITING_FOR_PAYMENT',
-      userMintStatus: paid ? 'MINTED' : 'PROCESSING',
+      userMintStatus: settled ? 'MINTED' : paid ? 'PROCESSING' : 'NOT_AVAILABLE',
       destinationWalletAddress: order.destinationWalletAddress,
       requestType: 'idrx',
       toBeMinted: order.toBeMinted,
-      ...(paid ? { txHash: `MOCKTX-${merchantOrderId}` } : {}),
+      ...(settled ? { txHash: `MOCKTX-${merchantOrderId}` } : {}),
     });
   }
 
