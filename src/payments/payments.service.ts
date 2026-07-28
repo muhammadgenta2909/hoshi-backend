@@ -680,6 +680,25 @@ export class PaymentsService {
       );
       throw new ForbiddenException('Order ini bukan milik Anda.');
     }
+
+    // Poll frontend jadi PEMICU fulfilment. Kalau order belum final, coba fulfil SEKARANG:
+    // verifyAndFulfil idempoten + fail-closed (klaim atomik PENDING|PAID→FULFILLING; no-op bila
+    // IDRX belum PAID+MINTED), jadi aman dipanggil tiap poll. Reconciler tetap jaring pengaman.
+    // Tanpa ini, order berbayar baru ke-fulfil tiap ~2 menit (interval sweep) — spinner lama.
+    if (
+      order.status === PaymentStatus.PENDING ||
+      order.status === PaymentStatus.PAID
+    ) {
+      try {
+        await this.verifyAndFulfil(merchantOrderId);
+        const refreshed = await this.prisma.paymentOrder.findUnique({
+          where: { merchantOrderId },
+        });
+        if (refreshed) return toPaymentOrderDto(refreshed);
+      } catch {
+        // Kembalikan status apa adanya; reconciler yang menyusul.
+      }
+    }
     return toPaymentOrderDto(order);
   }
 
