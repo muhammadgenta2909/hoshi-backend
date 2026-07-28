@@ -10,6 +10,7 @@ import { ConfigService } from '@nestjs/config';
 import type { Response } from 'express';
 import { detectProductionSignal } from '../common/demo-mode';
 import { IdrxMockStore } from './idrx-mock.store';
+import { PaymentsService } from './payments.service';
 
 /**
  * Halaman bayar PALSU untuk IDRX MOCK (staging/devnet). Meniru pengalaman redirect ke
@@ -27,6 +28,7 @@ export class IdrxMockController {
   constructor(
     private readonly store: IdrxMockStore,
     private readonly config: ConfigService,
+    private readonly payments: PaymentsService,
   ) {}
 
   private assertMockActive(): void {
@@ -48,9 +50,12 @@ export class IdrxMockController {
     res.type('html').send(payPageHtml(order, rec.toBeMinted));
   }
 
-  /** Tombol "Bayar" mengarah ke sini → tandai lunas → redirect balik ke returnUrl. */
+  /** Tombol "Bayar" mengarah ke sini → tandai lunas → fulfil segera → redirect balik. */
   @Get('pay/complete')
-  complete(@Query('order') order: string, @Res() res: Response): void {
+  async complete(
+    @Query('order') order: string,
+    @Res() res: Response,
+  ): Promise<void> {
     this.assertMockActive();
     const rec = order ? this.store.get(order) : undefined;
     if (!rec) {
@@ -58,8 +63,21 @@ export class IdrxMockController {
       return;
     }
     this.store.markPaid(order);
+    // Mock tak punya webhook IDRX, dan reconciler menyapu tiap ~2 menit. Panggil jalur
+    // fulfilment yang SAMA dengan callback asli SEKARANG supaya order sudah FULFILLED saat
+    // user tiba kembali di /open-packs → animasi langsung main, bukan spinner 2 menit.
+    // handleCallback tidak pernah throw; try/catch cuma pengaman ekstra (reconciler backup).
+    try {
+      await this.payments.handleCallback({ merchantOrderId: order });
+    } catch (err) {
+      this.logger.warn(
+        `IDRX MOCK: fulfil segera gagal untuk ${order} (${
+          err instanceof Error ? err.message : 'unknown'
+        }) — reconciler akan menyusul.`,
+      );
+    }
     this.logger.warn(
-      `IDRX MOCK: order ${order} → PAID+MINTED (simulasi). Redirect ke ${rec.returnUrl}`,
+      `IDRX MOCK: order ${order} → PAID+MINTED + fulfilled (simulasi). Redirect ke ${rec.returnUrl}`,
     );
     res.redirect(302, rec.returnUrl);
   }
