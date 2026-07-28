@@ -492,12 +492,14 @@ export class PaymentsService {
       // di-snapshot terhadap pack yang murah.
       // viaRupiahPayment: user SUDAH membayar rupiah — jalur ini harus fulfil bahkan di
       // produksi, jadi ia mem-bypass pagar demo-only di purchase() (lihat komentar di sana).
-      // deferOpen: berhenti di SUBMITTED (pack tersegel dimiliki user), TIDAK membuka. User
-      // membuka sendiri lewat "Open Pack" (open(memo)) — beli-dulu-buka-nanti, suspense nyata.
+      // Pack DIBUKA di tempat (generate→submit→open): begitu order FULFILLED, kartu sudah
+      // ke-mint dan frontend langsung memainkan animasi reveal — auto-reveal, tanpa langkah
+      // "buka manual". (Opsi deferOpen tetap ada di GachaService bila suatu saat mau balik ke
+      // alur beli-dulu-buka-nanti.)
       const pack = await this.gacha.purchase(
         { packType: order.packType },
         authUser,
-        { viaRupiahPayment: true, deferOpen: true },
+        { viaRupiahPayment: true },
       );
 
       const done = await this.prisma.paymentOrder.update({
@@ -677,6 +679,25 @@ export class PaymentsService {
         `Akses order ${merchantOrderId} ditolak untuk user ${user.id} (pemilik: ${order.userId}).`,
       );
       throw new ForbiddenException('Order ini bukan milik Anda.');
+    }
+
+    // Poll frontend jadi PEMICU fulfilment. Kalau order belum final, coba fulfil SEKARANG:
+    // verifyAndFulfil idempoten + fail-closed (klaim atomik PENDING|PAID→FULFILLING; no-op bila
+    // IDRX belum PAID+MINTED), jadi aman dipanggil tiap poll. Callback IDRX + reconciler tetap
+    // jaring pengaman. Tanpa ini, reveal baru main saat callback/sweep tiba (bisa telat).
+    if (
+      order.status === PaymentStatus.PENDING ||
+      order.status === PaymentStatus.PAID
+    ) {
+      try {
+        await this.verifyAndFulfil(merchantOrderId);
+        const refreshed = await this.prisma.paymentOrder.findUnique({
+          where: { merchantOrderId },
+        });
+        if (refreshed) return toPaymentOrderDto(refreshed);
+      } catch {
+        // Kembalikan status apa adanya; callback/reconciler yang menyusul.
+      }
     }
     return toPaymentOrderDto(order);
   }
