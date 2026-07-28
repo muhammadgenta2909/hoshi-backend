@@ -18,13 +18,15 @@ export class CreateListingDto {
   @IsString()
   name!: string;
 
-  @ApiProperty({ example: 'Classic' })
+  @ApiPropertyOptional({ example: 'Classic' })
+  @IsOptional()
   @IsString()
-  set!: string;
+  set?: string;
 
-  @ApiProperty({ example: 'Legendary Rare' })
+  @ApiPropertyOptional({ example: 'Legendary Rare' })
+  @IsOptional()
   @IsString()
-  rarity!: string;
+  rarity?: string;
 
   @ApiProperty({ example: '/card1.png' })
   @IsString()
@@ -60,34 +62,55 @@ export class CreateListingDto {
   @Max(IDRX_MAX)
   buyback?: number;
 
-  @ApiProperty({ example: 'PSA 10' })
+  /* --- Grade ---------------------------------------------------------------
+   *
+   * WAJIB untuk listing Hoshi biasa (penjual mendeklarasikan slab-nya sendiri),
+   * dan DIABAIKAN sepenuhnya kalau `fromPackMemo` diisi: grade kartu hasil pull
+   * dibaca server dari katalog CollectorCrypt. Klien tidak boleh bisa menerbitkan
+   * "PSA 10" untuk kartu yang grade aslinya tidak diketahui.
+   */
+  @ApiPropertyOptional({
+    example: 'PSA 10',
+    description:
+      'Wajib kecuali `fromPackMemo` diisi (grade ditentukan server).',
+  })
+  @IsOptional()
   @IsString()
-  grade!: string;
+  grade?: string;
 
-  @ApiProperty({ enum: Grader, example: Grader.PSA })
+  @ApiPropertyOptional({ enum: Grader, example: Grader.PSA })
+  @IsOptional()
   @IsEnum(Grader)
-  grader!: Grader;
+  grader?: Grader;
 
-  @ApiProperty({ example: 10 })
+  @ApiPropertyOptional({ example: 10 })
+  @IsOptional()
   @IsNumber()
   @Min(0)
-  gradeScore!: number;
+  gradeScore?: number;
 
-  @ApiProperty({ example: 'English', description: '"English" | "Japan"' })
+  @ApiPropertyOptional({
+    example: 'English',
+    description: '"English" | "Japan"',
+  })
+  @IsOptional()
   @IsString()
-  language!: string;
+  language?: string;
 
-  @ApiProperty({ example: 'Classic' })
+  @ApiPropertyOptional({ example: 'Classic' })
+  @IsOptional()
   @IsString()
-  era!: string;
+  era?: string;
 
-  @ApiProperty({ example: 'Fire' })
+  @ApiPropertyOptional({ example: 'Fire' })
+  @IsOptional()
   @IsString()
-  element!: string;
+  element?: string;
 
-  @ApiProperty({ example: 'Character Illustration' })
+  @ApiPropertyOptional({ example: 'Character Illustration' })
+  @IsOptional()
   @IsString()
-  category!: string;
+  category?: string;
 
   @ApiPropertyOptional({ description: 'Tautan opsional ke katalog Card.' })
   @IsOptional()

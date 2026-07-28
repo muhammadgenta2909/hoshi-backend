@@ -45,7 +45,10 @@ export class CcMarketClient {
    * Respons berisi `filterNFtCard[]`; kartu tanpa sub-objek `listing` sedang
    * tidak dijual (pemanggil yang memutuskan mau memakai atau melewatinya).
    */
-  browse(query: CcMarketBrowseQuery): Promise<CcMarketBrowseResponse> {
+  browse(
+    query: CcMarketBrowseQuery,
+    opts?: { timeoutMs?: number },
+  ): Promise<CcMarketBrowseResponse> {
     const params: Record<string, string> = {};
     if (query.page !== undefined) params.page = String(query.page);
     if (query.step !== undefined) params.step = String(query.step);
@@ -66,6 +69,7 @@ export class CcMarketClient {
     const qs = new URLSearchParams(params).toString();
     return this.request<CcMarketBrowseResponse>(
       qs ? `/marketplace?${qs}` : '/marketplace',
+      opts?.timeoutMs,
     );
   }
 
@@ -78,9 +82,10 @@ export class CcMarketClient {
     return base.replace(/\/+$/, '');
   }
 
-  private async request<T>(path: string): Promise<T> {
+  private async request<T>(path: string, timeoutMs?: number): Promise<T> {
+    const budget = timeoutMs ?? CC_MARKET_TIMEOUT_MS;
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), CC_MARKET_TIMEOUT_MS);
+    const timer = setTimeout(() => controller.abort(), budget);
 
     let res: FetchResponse;
     try {
@@ -92,7 +97,7 @@ export class CcMarketClient {
     } catch (err) {
       // Pakai signal.aborted, bukan err.name — konsisten dengan CcGachaClient.
       const detail = controller.signal.aborted
-        ? `timeout ${CC_MARKET_TIMEOUT_MS}ms`
+        ? `timeout ${budget}ms`
         : err instanceof Error
           ? err.message
           : 'network error';

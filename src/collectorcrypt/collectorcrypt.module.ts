@@ -2,6 +2,7 @@ import { Module } from '@nestjs/common';
 import { CcBuyClient } from './cc-buy.client';
 import { CcBuyController } from './cc-buy.controller';
 import { CcBuyService } from './cc-buy.service';
+import { CcCardFactsService } from './cc-card-facts.service';
 import { CcGachaClient } from './cc-gacha.client';
 import { CcMarketClient } from './cc-market.client';
 import { GachaController } from './gacha.controller';
@@ -36,12 +37,18 @@ import { TreasuryService } from './treasury.service';
  * MarketSyncService (+ CcMarketClient, katalog publik tanpa key) di-export untuk
  * AdminModule: sync katalog adalah aksi admin, tapi pengetahuan tentang API CC
  * tetap terkonsentrasi di modul ini.
+ *
+ * CcCardFactsService di-export untuk MarketplaceModule dengan alasan yang sama:
+ * grade sebuah kartu adalah FAKTA MILIK CC, dan satu-satunya cara membacanya
+ * (katalog publik mereka) harus tetap tinggal di modul ini. Yang menyeberang
+ * hanyalah jawabannya.
  */
 @Module({
   controllers: [GachaController, CcBuyController],
   providers: [
     CcGachaClient,
     CcMarketClient,
+    CcCardFactsService,
     // Jalur BELI marketplace CC — dipisah dari CcMarketClient yang read-only
     // karena yang ini memindahkan uang (lihat catatan di cc-buy.client.ts).
     CcBuyClient,
@@ -54,6 +61,11 @@ import { TreasuryService } from './treasury.service';
     TreasurySwapService,
     TreasurySwapScheduler,
   ],
-  exports: [GachaService, MarketSyncService, TreasurySwapService],
+  exports: [
+    GachaService,
+    MarketSyncService,
+    TreasurySwapService,
+    CcCardFactsService,
+  ],
 })
 export class CollectorCryptModule {}

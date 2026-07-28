@@ -15,6 +15,7 @@ import { CcPackStatus } from '@prisma/client';
 import type { CcPackPurchase } from '@prisma/client';
 import type { AuthUser } from '../auth/jwt.strategy';
 import { PrismaService } from '../prisma/prisma.service';
+import { CcCardFactsService } from './cc-card-facts.service';
 import { CcGachaClient } from './cc-gacha.client';
 import { toCcRarity } from './cc-gacha.types';
 import type {
@@ -144,6 +145,12 @@ export interface CcPackDto {
   openSignature: string | null;
   rarity: CcRarity | null;
   nftAddress: string | null;
+  /**
+   * Nama METADATA on-chain. Dibatasi 32 karakter oleh standar metadata, jadi judul
+   * katalog CC yang panjang datang TERPOTONG — dan grade yang menempel di judul itu
+   * bisa ikut terpotong. JANGAN pernah dipakai untuk menyimpulkan grade; pakai
+   * `ccGrade*` di bawah, atau `ccItemName` untuk judul lengkapnya.
+   */
   nftName: string | null;
   /** URL gambar kartu: links.image ?? files[0].cdn_uri ?? files[0].uri. */
   nftImage: string | null;
@@ -153,6 +160,21 @@ export interface CcPackDto {
   error: string | null;
   createdAt: Date;
   openedAt: Date | null;
+
+  /* --- Fakta kartu dari KATALOG CollectorCrypt. null = CC belum memberi tahu
+     kita; frontend WAJIB menampilkannya sebagai "belum diketahui", bukan
+     mengarang nilai (dan bukan "Ungraded" — tidak tahu ≠ tidak bergrade). --- */
+  /** Judul katalog LENGKAP, mis. "2024 #056 Froakie PSA 10 Obf EN-Obsidian Flames". */
+  ccItemName: string | null;
+  /** Perusahaan grading APA ADANYA: 'PSA' | 'CGC' | 'Beckett' | 'SGC' | … */
+  ccGradeCompany: string | null;
+  ccGradeScore: number | null;
+  /** Label mentah CC, mis. 'GEM-MT 10'. */
+  ccGradeLabel: string | null;
+  /** Nomor sertifikat grading. */
+  ccGradeCert: string | null;
+  /** Nama vault fisik CC, mis. 'OmniVault'. */
+  ccVault: string | null;
 }
 
 /**
@@ -299,7 +321,23 @@ export class GachaService {
     private readonly client: CcGachaClient,
     @Optional() private readonly treasury?: TreasuryService,
     @Optional() private readonly config?: ConfigService,
+    @Optional() private readonly ccFacts?: CcCardFactsService,
   ) {}
+
+  /**
+   * Ambil fakta kartu (grade dkk) dari katalog CC untuk pack yang BARU terbuka.
+   *
+   * Sengaja TANPA await di jalur buka-pack: pack sudah terbuka on-chain dan tidak
+   * bisa dibatalkan, jadi katalog CC yang lambat/down tidak boleh menahan — apalagi
+   * menggagalkan — penyerahan kartunya. Yang belum sempat terisi diperbaiki nanti
+   * lewat `CcCardFactsService.repairMissing()` saat vault dibuka.
+   */
+  private syncCardFacts(row: CcPackPurchase): void {
+    if (!this.ccFacts || !row.nftAddress) return;
+    void this.ccFacts.ensureFacts(row).catch(() => {
+      /* best-effort: sudah dicatat di dalam service, dan pack tetap sah tanpanya */
+    });
+  }
 
   private balanceConn: Connection | null = null;
   private balanceCache: {
@@ -692,6 +730,7 @@ export class GachaService {
         error: rarity === null ? unrecognisedRarityNote(res.rarity) : null,
       },
     });
+    this.syncCardFacts(updated);
     return toCcPackDto(updated);
   }
 
@@ -960,6 +999,7 @@ export class GachaService {
         error: rarity === null ? unrecognisedRarityNote(opened.rarity) : null,
       },
     });
+    this.syncCardFacts(done);
     return toCcPackDto(done);
   }
 
@@ -980,6 +1020,16 @@ export class GachaService {
       where: { userId },
       orderBy: { createdAt: 'desc' },
     });
+
+    // Kartu yang faktanya belum terisi (katalog CC sedang down saat pack dibuka)
+    // diperbaiki di latar belakang: pemuatan vault TIDAK menunggu CC, dan
+    // pemuatan berikutnya sudah membawa grade yang benar. Sampai saat itu tiba
+    // frontend menampilkan "belum diketahui" — bukan grade tebakan.
+    if (this.ccFacts && rows.some((r) => r.nftAddress && !r.ccFactsSyncedAt)) {
+      void this.ccFacts.repairMissing(userId).catch(() => {
+        /* best-effort; sudah dicatat di dalam service */
+      });
+    }
     return rows.map(toCcPackDto);
   }
 
@@ -1498,5 +1548,11 @@ function toCcPackDto(row: CcPackPurchase): CcPackDto {
     error: row.error,
     createdAt: row.createdAt,
     openedAt: row.openedAt,
+    ccItemName: row.ccItemName,
+    ccGradeCompany: row.ccGradeCompany,
+    ccGradeScore: row.ccGradeScore,
+    ccGradeLabel: row.ccGradeLabel,
+    ccGradeCert: row.ccGradeCert,
+    ccVault: row.ccVault,
   };
 }

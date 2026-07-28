@@ -2,6 +2,7 @@ import {
   BadRequestException,
   ConflictException,
   ForbiddenException,
+  UnprocessableEntityException,
 } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
 import {
@@ -10,6 +11,7 @@ import {
   ListingSource,
   ListingStatus,
 } from '@prisma/client';
+import { CcCardFactsService } from '../collectorcrypt/cc-card-facts.service';
 import { NftService } from '../nft/nft.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { MarketplaceService } from './marketplace.service';
@@ -35,6 +37,7 @@ describe('MarketplaceService', () => {
     ccPackPurchase: { findFirst: jest.Mock };
   };
   let nft: { mintForUser: jest.Mock };
+  let ccFacts: { ensureFacts: jest.Mock };
 
   const now = new Date('2026-07-05T00:00:00.000Z');
   const user = {
@@ -93,11 +96,32 @@ describe('MarketplaceService', () => {
     };
     nft = { mintForUser: jest.fn() };
 
+    // Grade kartu hasil pull dibaca dari katalog CC lewat service ini, bukan dari
+    // payload klien. Default di test: CC mengenali kartunya sebagai CGC 9.5 —
+    // sengaja BEDA dari "PSA 9" yang dikirim `fromPackDto`, supaya terlihat versi
+    // siapa yang benar-benar tersimpan.
+    ccFacts = {
+      ensureFacts: jest.fn().mockResolvedValue({
+        itemName: '2001 #16 Zubat CGC 9.5 Neo Destiny',
+        gradeCompany: 'CGC',
+        gradeScore: 9.5,
+        gradeLabel: 'MINT+ 9.5',
+        gradeCert: '1234567',
+        set: 'Neo Destiny',
+        category: 'Pokemon',
+        language: 'English',
+        year: 2001,
+        vault: 'OmniVault',
+        serial: '16/105',
+      }),
+    };
+
     const moduleRef = await Test.createTestingModule({
       providers: [
         MarketplaceService,
         { provide: PrismaService, useValue: prisma },
         { provide: NftService, useValue: nft },
+        { provide: CcCardFactsService, useValue: ccFacts },
       ],
     }).compile();
 
@@ -409,6 +433,77 @@ describe('MarketplaceService', () => {
           }),
         }),
       );
+    });
+
+    it('takes the grade from the CC catalog and IGNORES what the client sent', async () => {
+      prisma.ccPackPurchase.findFirst.mockResolvedValue({
+        nftAddress: 'CCAsset123',
+        status: CcPackStatus.OPENED,
+        rarity: 'Rare',
+        nftName: '2001 #16 Zubat CGC 9.5 Neo D',
+      });
+      prisma.listing.findUnique.mockResolvedValue(null);
+      prisma.listing.create.mockResolvedValue(listing);
+
+      // Klien mengirim "PSA 9" — persis bentuk data yang dulu bisa dikarang oleh
+      // default form. Yang tersimpan harus jawaban CC, bukan itu.
+      await service.create(fromPackDto, puller);
+
+      expect(prisma.listing.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            grade: 'CGC 9.5',
+            grader: Grader.CGC,
+            gradeScore: 9.5,
+            certificate: '1234567',
+            name: '2001 #16 Zubat CGC 9.5 Neo Destiny',
+            // CC tidak punya konsep "element" — kosong, bukan "Poison" kiriman klien.
+            element: '',
+            era: 'Classic',
+            vaultLocation: 'CollectorCrypt OmniVault',
+          }),
+        }),
+      );
+    });
+
+    it('refuses to list when CC cannot tell us the grade (no invented default)', async () => {
+      prisma.ccPackPurchase.findFirst.mockResolvedValue({
+        nftAddress: 'CCAsset123',
+        status: CcPackStatus.OPENED,
+      });
+      prisma.listing.findUnique.mockResolvedValue(null);
+      ccFacts.ensureFacts.mockResolvedValue(null);
+
+      await expect(service.create(fromPackDto, puller)).rejects.toThrow(
+        UnprocessableEntityException,
+      );
+      expect(prisma.listing.create).not.toHaveBeenCalled();
+    });
+
+    it('refuses a grader outside PSA/CGC/BGS instead of rounding it to the nearest one', async () => {
+      prisma.ccPackPurchase.findFirst.mockResolvedValue({
+        nftAddress: 'CCAsset123',
+        status: CcPackStatus.OPENED,
+      });
+      prisma.listing.findUnique.mockResolvedValue(null);
+      ccFacts.ensureFacts.mockResolvedValue({
+        itemName: 'Zubat',
+        gradeCompany: 'SGC',
+        gradeScore: 9,
+        gradeLabel: 'MINT 9',
+        gradeCert: null,
+        set: null,
+        category: null,
+        language: null,
+        year: null,
+        vault: null,
+        serial: null,
+      });
+
+      await expect(service.create(fromPackDto, puller)).rejects.toThrow(
+        UnprocessableEntityException,
+      );
+      expect(prisma.listing.create).not.toHaveBeenCalled();
     });
 
     it('rejects when the pull is not the caller’s / not OPENED', async () => {
