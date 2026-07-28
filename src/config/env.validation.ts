@@ -201,6 +201,14 @@ class EnvironmentVariables {
   @IsOptional()
   @IsString()
   IDRX_MOCK_PUBLIC_URL?: string;
+
+  // CC MOCK (staging/devnet). "1" mengaktifkan mock CollectorCrypt gacha: katalog mesin +
+  // buka pack dijawab lokal dengan kartu palsu — tanpa API key CC, tanpa treasury ber-USDC,
+  // tanpa transaksi on-chain. HANYA berlaku bila deployment tidak terlihat produksi
+  // (detectProductionSignal). Biarkan kosong di produksi.
+  @IsOptional()
+  @IsString()
+  CC_MOCK?: string;
 }
 
 /**

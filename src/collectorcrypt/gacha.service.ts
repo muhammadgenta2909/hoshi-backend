@@ -38,7 +38,9 @@ import { PurchasePackDto } from './dto/purchase-pack.dto';
 import { SubmitBuybackDto } from './dto/submit-buyback.dto';
 import { SubmitPackDto } from './dto/submit-pack.dto';
 import { TreasuryService } from './treasury.service';
-import { assertDemoOnly } from '../common/demo-mode';
+import { randomUUID } from 'crypto';
+import { assertDemoOnly, detectProductionSignal } from '../common/demo-mode';
+import { CC_MOCK_MACHINES, pickMockCard } from './cc-mock';
 
 /** Mesin default CollectorCrypt bila klien tidak menyebut packType. */
 const DEFAULT_PACK_TYPE = 'pokemon_50';
@@ -334,6 +336,14 @@ export class GachaService {
     /** null = tidak terbaca (bukan nol). Jangan pernah ditafsirkan sebagai "tidak punya IDRX". */
     idrxBaseUnits: number | null;
   } | null> {
+    if (this.ccMockEnabled()) {
+      // Preflight lolos tanpa treasury ber-USDC: mock tak pernah membelanjakan apa pun.
+      return {
+        usdcBaseUnits: 1_000_000_000_000,
+        solLamports: 1_000_000_000,
+        idrxBaseUnits: null,
+      };
+    }
     const cached = this.balanceCache;
     if (cached && Date.now() - cached.at < TREASURY_BALANCE_TTL_MS) {
       return {
@@ -419,7 +429,57 @@ export class GachaService {
   /* --- Read-only: SUMBER KEBENARAN harga/odds/EV ada di sisi mereka, bukan di sini. --- */
 
   machines(): Promise<CcMachinesNormalizedResponse> {
+    if (this.ccMockEnabled()) return Promise.resolve(CC_MOCK_MACHINES);
     return this.client.machines();
+  }
+
+  /**
+   * CC MOCK (staging/devnet saja — TIDAK PERNAH di produksi). Aktif hanya bila CC_MOCK=1
+   * DAN deployment tidak terlihat produksi (detectProductionSignal() === null). Saat aktif,
+   * machines/treasuryBalances/purchase dijawab lokal dengan kartu palsu — tanpa API key CC,
+   * tanpa treasury ber-USDC, tanpa transaksi on-chain.
+   */
+  private ccMockEnabled(): boolean {
+    return (
+      this.config?.get<string>('CC_MOCK') === '1' &&
+      detectProductionSignal() === null
+    );
+  }
+
+  /** Tulis satu baris pack OPENED palsu (kartu di-undi lokal) dan kembalikan DTO-nya. */
+  private async mockPurchase(
+    packType: string,
+    user: AuthUser,
+  ): Promise<CcPackDto> {
+    const machine = CC_MOCK_MACHINES.find((m) => m.code === packType);
+    const priceUsdc = machine?.priceUsdcBaseUnits ?? 50_000_000;
+    const card = pickMockCard();
+    const memo = `mock-${randomUUID()}`;
+    const row = await this.prisma.ccPackPurchase.create({
+      data: {
+        memo,
+        userId: user.id,
+        playerAddress:
+          this.config?.get<string>('HOSHI_TREASURY_ADDRESS') ?? 'MOCK_TREASURY',
+        packType,
+        turbo: false,
+        priceUsdc,
+        status: CcPackStatus.OPENED,
+        rarity: card.rarity,
+        nftAddress: `MOCKNFT${memo.replace(/-/g, '').slice(4, 20)}`,
+        nftName: card.nftName,
+        nftImage: card.nftImage,
+        purchaseSignature: `MOCKBUY-${memo}`,
+        openSignature: `MOCKOPEN-${memo}`,
+        roll: card.roll,
+        points: card.points,
+        openedAt: new Date(),
+      },
+    });
+    this.logger.warn(
+      `CC MOCK: pack OPENED palsu ${memo} (${card.rarity} ${card.nftName}) untuk user ${user.id}`,
+    );
+    return toCcPackDto(row);
   }
 
   stock(): Promise<CcStockResponse> {
@@ -746,6 +806,11 @@ export class GachaService {
     user: AuthUser,
     opts?: { viaRupiahPayment?: boolean; deferOpen?: boolean },
   ): Promise<CcPackDto> {
+    // CC MOCK (staging/devnet): buka pack jadi kartu palsu tanpa treasury/CC/on-chain.
+    if (this.ccMockEnabled()) {
+      return this.mockPurchase(dto.packType ?? DEFAULT_PACK_TYPE, user);
+    }
+
     // Pagar HANYA untuk pemanggilan LANGSUNG (route /gacha/purchase), yang membelanjakan
     // USDC treasury tanpa user membayar apa pun — di produksi itu tombol kuras treasury,
     // dan identitas gratis (/auth/nonce meng-upsert user untuk pubkey apa pun) bukan
