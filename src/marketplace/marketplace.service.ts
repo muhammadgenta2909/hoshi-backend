@@ -5,6 +5,7 @@ import {
   Injectable,
   Logger,
   NotFoundException,
+  UnprocessableEntityException,
 } from '@nestjs/common';
 import {
   ActivityType,
@@ -15,7 +16,10 @@ import {
   OfferStatus,
   Prisma,
 } from '@prisma/client';
+import type { CcPackPurchase, Grader } from '@prisma/client';
 import type { AuthUser } from '../auth/jwt.strategy';
+import { eraFromYear, listableGrade } from '../collectorcrypt/cc-card-facts';
+import { CcCardFactsService } from '../collectorcrypt/cc-card-facts.service';
 import { NftService } from '../nft/nft.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { CreateListingDto } from './dto/create-listing.dto';
@@ -38,6 +42,30 @@ import {
 
 // Urutan tier (cermin TIER_ORDER frontend); dipakai utk sort "rarity".
 const TIER_ORDER = ['Common', 'Rare', 'Epic', 'Legendary', 'Legendary Rare'];
+
+/**
+ * Atribut listing yang ditentukan SERVER dari katalog CollectorCrypt untuk kartu
+ * hasil pull — bukan dari payload klien.
+ *
+ * `undefined` berarti "biarkan apa adanya" (semantik Prisma), dipakai hanya untuk
+ * field yang CC memang tidak sebutkan. Field grade TIDAK PERNAH undefined: kalau
+ * grade-nya tak diketahui, listing-nya ditolak, bukan ditambal.
+ */
+type CcListingAttrs = {
+  name?: string;
+  grade: string;
+  grader: Grader;
+  gradeScore: number;
+  certificate: string | null;
+  set: string;
+  category: string;
+  language: string;
+  era: string;
+  rarity: string;
+  element: string;
+  vaultLocation: string;
+  cardNumber: string | null;
+};
 const tierRank = (rarity: string) => {
   const i = TIER_ORDER.indexOf(rarity);
   return i === -1 ? -1 : i;
@@ -88,6 +116,7 @@ export class MarketplaceService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly nft: NftService,
+    private readonly ccFacts: CcCardFactsService,
   ) {}
 
   /** Listing ACTIVE + filter + sort. Bentuk cocok dgn lib/market.ts frontend. */
@@ -474,6 +503,59 @@ export class MarketplaceService {
     }
   }
 
+  /**
+   * Atribut kartu hasil pull menurut KATALOG CollectorCrypt — nilai-nilai ini
+   * menimpa payload klien saat listing dibuat/dipajang ulang.
+   *
+   * `undefined` = "jangan sentuh field ini" (Prisma memperlakukannya begitu), dan
+   * dipakai untuk field yang CC memang tidak sebutkan.
+   */
+  private async ccListingAttrs(pack: CcPackPurchase): Promise<CcListingAttrs> {
+    const facts = await this.ccFacts.ensureFacts(pack);
+    if (!facts) {
+      throw new UnprocessableEntityException(
+        'Data kartu ini belum bisa diambil dari CollectorCrypt, jadi grade-nya ' +
+          'belum diketahui. Coba pajang lagi beberapa saat lagi — kami tidak ' +
+          'memajang kartu dengan grade yang tidak terverifikasi.',
+      );
+    }
+
+    const grade = listableGrade(facts);
+    if (!grade) {
+      // Dua sebab: perusahaan grading di luar PSA/CGC/Beckett (mis. SGC — enum
+      // Grader kita belum memuatnya), atau angka grade tak terbaca. Keduanya
+      // TIDAK boleh ditambal dengan grader terdekat: slab SGC yang dilabeli PSA
+      // adalah kebohongan yang persis sama dengan default "PSA 10".
+      throw new UnprocessableEntityException(
+        facts.gradeCompany
+          ? `Grade "${facts.gradeLabel ?? facts.gradeCompany}" dari ${facts.gradeCompany} belum didukung marketplace Hoshi (baru PSA, CGC, dan Beckett).`
+          : 'CollectorCrypt tidak mencantumkan grade untuk kartu ini, jadi kartunya belum bisa dipajang.',
+      );
+    }
+
+    return {
+      // Judul katalog CC yang LENGKAP; `nftName` on-chain terpotong 32 karakter.
+      name: facts.itemName ?? pack.nftName ?? undefined,
+      grade: grade.grade,
+      grader: grade.grader,
+      gradeScore: grade.gradeScore,
+      certificate: facts.gradeCert,
+      set: facts.set ?? '',
+      category: facts.category ?? '',
+      language: facts.language ?? '',
+      era: eraFromYear(facts.year),
+      // Rarity APA ADANYA dari undian VRF CollectorCrypt (Common|Uncommon|Rare|
+      // Epic) — bukan 5-tier Hoshi, dan bukan tebakan dari harga.
+      rarity: pack.rarity ?? '',
+      // CC tidak punya konsep "element" untuk kartu. Kosong, bukan "Fire".
+      element: '',
+      vaultLocation: facts.vault
+        ? `CollectorCrypt ${facts.vault}`
+        : 'CollectorCrypt',
+      cardNumber: facts.serial,
+    };
+  }
+
   /** User memajang kartu miliknya. sellerId = user login. */
   async create(dto: CreateListingDto, user: AuthUser): Promise<ListingDto> {
     if (dto.cardId) {
@@ -483,12 +565,37 @@ export class MarketplaceService {
       if (!card) throw new NotFoundException('Card not found.');
     }
 
+    // Listing Hoshi biasa: penjual mendeklarasikan grade slab-nya sendiri, jadi
+    // field-nya wajib — tapi ia harus MENGISINYA. Tidak ada default: form yang
+    // datang tanpa grade ditolak, bukan diterbitkan sebagai "PSA 10".
+    // (Kartu hasil pull lewat jalur lain: grade-nya dibaca server dari CC.)
+    let declaredGrade: {
+      grade: string;
+      grader: Grader;
+      gradeScore: number;
+    } | null = null;
+    if (!dto.fromPackMemo) {
+      if (!dto.grade || !dto.grader || dto.gradeScore === undefined) {
+        throw new BadRequestException(
+          'Grade kartu wajib diisi (grade, grader, gradeScore).',
+        );
+      }
+      declaredGrade = {
+        grade: dto.grade,
+        grader: dto.grader,
+        gradeScore: dto.gradeScore,
+      };
+    }
+
     // Kartu hasil PACK yang mau dijual: verifikasi user benar-benar memiliki
     // pull-nya (baris CcPackPurchase miliknya, status OPENED), lalu tautkan
     // listing ke NFT aslinya. Ini yang membedakan "jual kartu hasil pull" dari
     // sekadar mengetik kartu baru: listing mewakili aset on-chain yang nyata.
     let source: ListingSource = ListingSource.HOSHI;
     let ccNftAddress: string | undefined;
+    // Atribut kartu yang DITENTUKAN SERVER dari katalog CC untuk kartu hasil pull.
+    // Selama ini kosong ⇒ nilai dari `dto` yang dipakai.
+    let ccAttrs: CcListingAttrs | null = null;
     if (dto.fromPackMemo) {
       const pack = await this.prisma.ccPackPurchase.findFirst({
         where: {
@@ -502,9 +609,14 @@ export class MarketplaceService {
           'Pull tidak ditemukan, belum dibuka, atau bukan milik Anda.',
         );
       }
+
       // Satu NFT hanya boleh punya satu listing (ccNftAddress @unique). Kalau
       // sudah pernah dipajang: aktif ⇒ tolak; sudah tidak aktif & milik user ⇒
       // pajang ulang (relist) alih-alih menabrak unique index dengan 500.
+      //
+      // Cek ini SEBELUM menghubungi katalog CC: kartu yang sudah dipajang atau
+      // bukan milik penelepon harus dijawab dengan alasan SEBENARNYA (409/403),
+      // bukan tertutup oleh "grade belum bisa diambil" karena kebetulan CC lambat.
       const existing = await this.prisma.listing.findUnique({
         where: { ccNftAddress: pack.nftAddress },
       });
@@ -517,6 +629,11 @@ export class MarketplaceService {
         if (existing.sellerId !== user.id) {
           throw new ForbiddenException('Kartu ini bukan milik Anda.');
         }
+        // Memajang ulang = menerbitkan klaim grade yang sama ke pasar, jadi
+        // syaratnya sama ketatnya dengan memajang baru: harus diverifikasi ulang
+        // ke CC. Sekaligus memperbaiki baris lama yang dulu tersimpan dengan
+        // grade default form ("PSA 10").
+        ccAttrs = await this.ccListingAttrs(pack);
         const relisted = await this.prisma.listing.update({
           where: { id: existing.id },
           data: {
@@ -526,6 +643,10 @@ export class MarketplaceService {
             buybackIdrx: dto.buyback ?? 0,
             buyerId: null,
             soldAt: null,
+            // Relist = kesempatan memperbaiki baris lama. Kalau listing ini dulu
+            // dibuat dengan grade default form ("PSA 10"), pajang ulang menimpanya
+            // dengan grade yang benar-benar dikatakan CC.
+            ...ccAttrs,
           },
           include: { nft: true },
         });
@@ -540,30 +661,50 @@ export class MarketplaceService {
         });
         return toListingDto(relisted);
       }
+
+      // Grade kartu ini adalah FAKTA MILIK CC, bukan isian penjual. Klien juga
+      // mengirim `grade`/`grader`/`gradeScore`, tapi di jalur ini nilai-nilai itu
+      // SENGAJA diabaikan: form lama memberi default "PSA 10" saat grade tak
+      // terbaca, sehingga kartu yang grade aslinya tidak diketahui bisa terbit ke
+      // marketplace sebagai PSA 10. Server yang membaca, server yang memutuskan.
+      ccAttrs = await this.ccListingAttrs(pack);
       source = ListingSource.COLLECTORCRYPT;
       ccNftAddress = pack.nftAddress;
+    }
+
+    // Kartu hasil pull ⇒ versi CC. Selain itu ⇒ deklarasi penjual yang sudah
+    // divalidasi di atas. Tidak ada cabang ketiga: listing tanpa grade yang
+    // dipertanggungjawabkan tidak pernah sampai ke sini.
+    const gradeData = ccAttrs ?? declaredGrade;
+    if (!gradeData) {
+      throw new BadRequestException(
+        'Grade kartu wajib diisi (grade, grader, gradeScore).',
+      );
     }
 
     const row = await this.prisma.listing.create({
       data: {
         name: dto.name,
-        set: dto.set,
-        rarity: dto.rarity,
+        set: dto.set ?? '',
+        rarity: dto.rarity ?? '',
         image: dto.image,
         imageBack: dto.imageBack,
         priceIdrx: dto.price,
         expectedValueIdrx: dto.expectedValue,
         buybackIdrx: dto.buyback ?? 0,
-        grade: dto.grade,
-        grader: dto.grader,
-        gradeScore: dto.gradeScore,
-        language: dto.language,
-        era: dto.era,
-        element: dto.element,
-        category: dto.category,
+        grade: gradeData.grade,
+        grader: gradeData.grader,
+        gradeScore: gradeData.gradeScore,
+        language: dto.language ?? '',
+        era: dto.era ?? '',
+        element: dto.element ?? '',
+        category: dto.category ?? '',
         certificate: dto.certificate,
         vaultLocation: dto.vaultLocation,
         cardNumber: dto.cardNumber,
+        // Kartu hasil pull: atribut versi CC menang atas apa pun yang dikirim
+        // klien. Ditaruh SETELAH field `dto` di atas justru supaya menimpanya.
+        ...(ccAttrs ?? {}),
         // On-chain address of the real pulled NFT (falls back to any address the
         // caller supplied for a plain Hoshi listing).
         contractAddress: ccNftAddress ?? dto.contractAddress,

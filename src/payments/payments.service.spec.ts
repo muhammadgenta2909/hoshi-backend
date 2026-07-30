@@ -186,6 +186,14 @@ describe('PaymentsService', () => {
     error: null,
     createdAt: now,
     openedAt: now,
+    // Fakta katalog CC (nullable) — tidak diuji di sini, cukup penuhi kontrak DTO.
+    ccItemName: null,
+    ccGradeCompany: null,
+    ccGradeScore: null,
+    ccGradeLabel: null,
+    ccGradeCert: null,
+    ccSet: null,
+    ccVault: null,
   };
 
   const ratesResponse = (buyAmount: number): IdrxRatesResponse => ({

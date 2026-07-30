@@ -683,8 +683,8 @@ export class PaymentsService {
 
     // Poll frontend jadi PEMICU fulfilment. Kalau order belum final, coba fulfil SEKARANG:
     // verifyAndFulfil idempoten + fail-closed (klaim atomik PENDING|PAID→FULFILLING; no-op bila
-    // IDRX belum PAID+MINTED), jadi aman dipanggil tiap poll. Reconciler tetap jaring pengaman.
-    // Tanpa ini, order berbayar baru ke-fulfil tiap ~2 menit (interval sweep) — spinner lama.
+    // IDRX belum PAID+MINTED), jadi aman dipanggil tiap poll. Callback IDRX + reconciler tetap
+    // jaring pengaman. Tanpa ini, reveal baru main saat callback/sweep tiba (bisa telat).
     if (
       order.status === PaymentStatus.PENDING ||
       order.status === PaymentStatus.PAID
@@ -696,7 +696,7 @@ export class PaymentsService {
         });
         if (refreshed) return toPaymentOrderDto(refreshed);
       } catch {
-        // Kembalikan status apa adanya; reconciler yang menyusul.
+        // Kembalikan status apa adanya; callback/reconciler yang menyusul.
       }
     }
     return toPaymentOrderDto(order);

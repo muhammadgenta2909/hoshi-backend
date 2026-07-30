@@ -1,8 +1,9 @@
 import { BadRequestException, Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { Grader, ListingSource, Prisma } from '@prisma/client';
+import { ListingSource, Prisma } from '@prisma/client';
 import { IDRX_MAX } from '../marketplace/marketplace.constants';
 import { PrismaService } from '../prisma/prisma.service';
+import { eraFromYear, mapGrader, parseGradeScore } from './cc-card-facts';
 import { CcMarketClient } from './cc-market.client';
 import type { CcMarketCard } from './cc-market.types';
 
@@ -64,10 +65,12 @@ export interface CcSyncResult {
  * bukan tersebar):
  * - Grader: PSA→PSA, CGC→CGC, Beckett→BGS. Selain itu SKIP (enum Grader kita cuma
  *   tiga; menambah nilai enum = migrasi + UI. Mayoritas kartu Pokemon CC ber-PSA.)
- * - Rarity: CC tidak punya konsep rarity untuk kartu tunggal → heuristik tier dari
- *   nilai dolar (display-only, untuk badge & sort; BUKAN data resmi CC).
- * - Era: dari tahun kartu (≤2010 Classic, >2010 Modern) — menyesuaikan opsi filter
- *   frontend yang ada.
+ *   Logikanya tinggal di cc-card-facts.ts, dipakai bersama jalur kartu hasil pull —
+ *   satu kartu tidak boleh punya dua jawaban grade tergantung halaman yang membuka.
+ * - Rarity: KOSONG. CC tidak punya konsep rarity untuk kartu tunggal; dulu di sini
+ *   ada heuristik harga→tier ("$2.000+ ⇒ Legendary Rare") yang tampil di UI seolah
+ *   atribut kartu padahal karangan kita sendiri.
+ * - Era: dari TAHUN kartu; tahun tak diketahui ⇒ kosong (bukan 'Classic').
  */
 @Injectable()
 export class MarketSyncService {
@@ -207,21 +210,22 @@ export class MarketSyncService {
     card: CcMarketCard,
     rate: number,
     result: CcSyncResult,
-  ):
-    | { create: Prisma.ListingCreateInput; update: Prisma.ListingUpdateInput }
-    | null {
+  ): {
+    create: Prisma.ListingCreateInput;
+    update: Prisma.ListingUpdateInput;
+  } | null {
     if (!card.nftAddress || !card.itemName) {
       result.skipped.invalid++;
       return null;
     }
 
-    const grader = this.mapGrader(card.gradingCompany);
+    const grader = mapGrader(card.gradingCompany);
     if (!grader) {
       result.skipped.grader++;
       return null;
     }
 
-    const gradeScore = this.parseGradeScore(card);
+    const gradeScore = parseGradeScore(card);
     if (gradeScore === null) {
       result.skipped.invalid++;
       return null;
@@ -254,14 +258,20 @@ export class MarketSyncService {
     const metadata = {
       name: card.itemName,
       set: card.set ?? card.category ?? '',
-      rarity: this.rarityHeuristic(evUsd),
+      // CC TIDAK punya konsep rarity untuk kartu tunggal. Dulu di sini ada
+      // heuristik harga→tier ("$2000+ ⇒ Legendary Rare") — itu label karangan
+      // kita, bukan atribut kartunya. Kosong = jujur; frontend menyembunyikan
+      // badge rarity yang kosong.
+      rarity: '',
       image,
       imageBack,
       grade: `${grader} ${gradeScore}`,
       grader,
       gradeScore,
-      language: card.language ?? 'English',
-      era: this.eraFromYear(card.year),
+      // Bahasa yang tidak disebut CC tidak otomatis "English" — kartu Jepang yang
+      // field-nya kosong akan salah label. Kosongkan saja.
+      language: card.language ?? '',
+      era: eraFromYear(card.year),
       element: '',
       // Kategori kita dipakai sebagai badge bebas — nama franchise CC ("Pokemon")
       // informatif di sana walau listing lokal memakainya untuk jenis ilustrasi.
@@ -365,59 +375,6 @@ export class MarketSyncService {
       }),
     ]);
     return marked.count;
-  }
-
-  private mapGrader(company: string | null | undefined): Grader | null {
-    switch ((company ?? '').trim().toUpperCase()) {
-      case 'PSA':
-        return Grader.PSA;
-      case 'CGC':
-        return Grader.CGC;
-      case 'BECKETT':
-      case 'BGS':
-        return Grader.BGS;
-      default:
-        return null;
-    }
-  }
-
-  /** "MINT 9" → 9, "GEM-MT 10" → 10, "NM-MT 8.5" → 8.5; fallback gradeNum. */
-  private parseGradeScore(card: CcMarketCard): number | null {
-    const fromLabel = /(\d+(?:\.\d+)?)\s*$/.exec(card.grade ?? '');
-    if (fromLabel) return Number(fromLabel[1]);
-    if (typeof card.gradeNum === 'number' && card.gradeNum > 0)
-      return card.gradeNum;
-    return null;
-  }
-
-  /**
-   * Heuristik tier dari nilai dolar — HANYA untuk badge/sort display; CC tidak
-   * punya konsep rarity untuk kartu tunggal. Ambang mengikuti rasa harga katalog
-   * mereka (mayoritas $20–$500).
-   */
-  private rarityHeuristic(valueUsd: number): string {
-    if (valueUsd >= 2_000) return 'Legendary Rare';
-    if (valueUsd >= 500) return 'Legendary';
-    if (valueUsd >= 150) return 'Epic';
-    if (valueUsd >= 50) return 'Rare';
-    return 'Common';
-  }
-
-  /**
-   * Era Pokémon TCG dari tahun kartu — nilai HARUS salah satu union `Era` di
-   * frontend (lib/market.ts): Scarlet & Violet / Sword & Shield / Sun & Moon /
-   * XY / Black & White / Classic / Vintage. Batas tahun mengikuti jadwal rilis
-   * TCG internasional.
-   */
-  private eraFromYear(year: number | null | undefined): string {
-    if (typeof year !== 'number' || year <= 0) return 'Classic';
-    if (year >= 2023) return 'Scarlet & Violet';
-    if (year >= 2020) return 'Sword & Shield';
-    if (year >= 2017) return 'Sun & Moon';
-    if (year >= 2014) return 'XY';
-    if (year >= 2011) return 'Black & White';
-    if (year >= 1999) return 'Classic';
-    return 'Vintage';
   }
 
   private usdIdrRate(): number {

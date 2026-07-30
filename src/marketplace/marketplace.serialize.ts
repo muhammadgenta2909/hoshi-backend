@@ -144,8 +144,15 @@ export function toCardDetailDto(row: ListingRow, related: ListingRow[]) {
   ];
 
   return {
+    // Objek listing penuh (image, price, status, source, views, dst.) — frontend
+    // (LeftColumn/RightColumn) mendestrukturnya; TANPA ini halaman detail throw.
     listing,
-    title: `${row.name.toUpperCase()} - ${row.category} - ${row.grade}`,
+    // Judul = nama katalog CollectorCrypt apa adanya (row.name = facts.itemName),
+    // identik dengan H1 halaman Vault (pull.ccItemName). Dulu di sini di-UPPERCASE
+    // dan ditempeli " - {category} - {grade}", membuat kartu yang sama tampak beda
+    // di dua halaman; grade sudah muncul sebagai tag + baris "Card Grade" dan
+    // category sudah jadi baris detail, jadi imbuhan itu memang berlebih.
+    title: row.name,
     tags: [row.grade, languageTag, row.era] as [string, string, string],
     consignedBy: row.sellerAddress,
     certificate: row.certificate ?? null,

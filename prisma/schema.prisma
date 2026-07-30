@@ -595,6 +595,33 @@ model CcPackPurchase {
 
   error String? // pesan error terakhir bila FAILED
 
+  /// ── Fakta kartu menurut KATALOG CollectorCrypt (GET /marketplace?search=<nftAddress>) ──
+  ///
+  /// KENAPA ADA: `nftName` di atas adalah nama METADATA on-chain — dibatasi 32
+  /// karakter dan tidak menjamin memuat grade. Menebak grade dengan regex atas nama
+  /// itu membuat kartu PSA 10 tampil "Ungraded" di vault sementara marketplace
+  /// (yang membaca field terstruktur CC) menampilkan grade sebenarnya.
+  ///
+  /// SEMUA nullable dan HANYA diisi dari jawaban CC. null = CC belum memberi tahu
+  /// kita ⇒ UI menampilkan "belum diketahui" dan listing DITOLAK. Tidak ada nilai
+  /// default di sini: kolom kosong itu jujur, kolom tertebak itu bohong.
+  ccItemName     String? /// judul katalog LENGKAP (nftName sering terpotong)
+  ccGradeCompany String? /// 'PSA' | 'CGC' | 'Beckett' | 'SGC' | … APA ADANYA
+  ccGradeScore   Float? /// 10 / 9.5 / 8
+  ccGradeLabel   String? /// label mentah, mis. 'GEM-MT 10'
+  ccGradeCert    String? /// gradingID (nomor sertifikat)
+  ccSet          String?
+  ccCategory     String?
+  ccLanguage     String?
+  ccYear         Int?
+  ccVault        String? /// nama vault fisik CC, mis. 'OmniVault'
+  ccSerial       String?
+  /// Terisi HANYA saat lookup berhasil — penanda "fakta ini nyata, bukan kosong bawaan".
+  ccFactsSyncedAt  DateTime?
+  /// Percobaan lookup TERAKHIR (berhasil atau tidak) — pembatas retry supaya kartu
+  /// yang memang tidak ada di katalog CC tidak dicari ulang tiap request.
+  ccFactsAttemptAt DateTime?
+
   createdAt DateTime  @default(now())
   updatedAt DateTime  @updatedAt
   openedAt  DateTime?
