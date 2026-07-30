@@ -173,6 +173,13 @@ export interface CcPackDto {
   ccGradeLabel: string | null;
   /** Nomor sertifikat grading. */
   ccGradeCert: string | null;
+  /**
+   * Seri/set kartu menurut katalog CC (`card.set`, jatuh ke `card.category` kalau
+   * `set` kosong) — mis. 'Mega Dream ex - M2a - Japanese'. Sudah lama tersimpan di
+   * kolom `ccPackPurchase.ccSet` tapi tidak pernah ikut keluar, jadi kartu hasil pull
+   * tidak bisa ikut filter "Series" di /account. null = CC belum memberi tahu.
+   */
+  ccSet: string | null;
   /** Nama vault fisik CC, mis. 'OmniVault'. */
   ccVault: string | null;
 }
@@ -1553,6 +1560,7 @@ function toCcPackDto(row: CcPackPurchase): CcPackDto {
     ccGradeScore: row.ccGradeScore,
     ccGradeLabel: row.ccGradeLabel,
     ccGradeCert: row.ccGradeCert,
+    ccSet: row.ccSet,
     ccVault: row.ccVault,
   };
 }

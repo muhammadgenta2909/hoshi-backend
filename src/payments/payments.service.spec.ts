@@ -192,6 +192,7 @@ describe('PaymentsService', () => {
     ccGradeScore: null,
     ccGradeLabel: null,
     ccGradeCert: null,
+    ccSet: null,
     ccVault: null,
   };
 

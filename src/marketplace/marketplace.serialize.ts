@@ -87,6 +87,11 @@ export function toListingDto(row: ListingRow) {
     buyback: row.buybackIdrx,
     seller: row.sellerAddress,
     listedAt: row.listedAt.toISOString(),
+    // Kapan kartu ini BERPINDAH TANGAN. `listedAt` adalah kapan PENJUAL memajangnya
+    // — untuk kartu hasil sync CollectorCrypt itu waktu sync, sama sekali tak terkait
+    // dengan kapan pembeli mendapatkannya. Tab Assets di /account mengurutkan koleksi
+    // milik user, jadi ia butuh waktu perolehan, bukan waktu pajang. null = belum terjual.
+    soldAt: row.soldAt?.toISOString() ?? null,
     grade: row.grade,
     grader: row.grader,
     gradeScore: row.gradeScore,
