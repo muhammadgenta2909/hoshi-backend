@@ -66,8 +66,12 @@ const DEFAULT_MAX_OPEN_ORDERS = 3;
  */
 const DEFAULT_MAX_SLIPPAGE_BPS = 500;
 
-/** Plafon belanja treasury 24 jam — cermin GachaService, dipakai untuk MENOLAK SEBELUM user bayar. */
-const TREASURY_DAILY_CAP_USDC = 500_000_000;
+/** Plafon belanja treasury 24 jam — cermin GachaService, dipakai untuk MENOLAK SEBELUM user bayar.
+ *  STAGING (branch staging-live): dinaikkan ke $100k supaya testing berulang tidak
+ *  ketahan cap — aman karena staging memakai CC_MOCK (belanja treasury disimulasi, tak
+ *  ada USDC nyata keluar). Prod (main) tetap default $500. Override runtime tetap bisa
+ *  lewat env GACHA_TREASURY_DAILY_CAP_USDC. */
+const TREASURY_DAILY_CAP_USDC = 100_000_000_000;
 const TREASURY_SPEND_WINDOW_MS = 24 * 60 * 60 * 1000;
 
 /** Batas satu putaran reconciler — supaya backlog tidak pernah menyandera worker. */

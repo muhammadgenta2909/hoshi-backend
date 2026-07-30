@@ -91,8 +91,12 @@ export const TREASURY_MAX_PACK_PRICE_USDC = 100_000_000;
  * user untuk alamat Solana APA PUN), jadi rate-limit per-user bisa dikalahkan Sybil,
  * tapi plafon ini berlaku untuk SELURUH treasury. Override lewat
  * GACHA_TREASURY_DAILY_CAP_USDC — turunkan, jangan naikkan, sampai gerbang bayar ada.
+ *
+ * STAGING (branch staging-live): dinaikkan ke $100k agar testing berulang tidak ketahan
+ * cap. Aman karena staging pakai CC_MOCK → belanja treasury disimulasi, tak ada USDC nyata
+ * keluar. Prod (main) tetap $500. (Gerbang bayar assertTreasuryCapacity sudah ada.)
  */
-const TREASURY_DAILY_CAP_USDC = 500_000_000;
+const TREASURY_DAILY_CAP_USDC = 100_000_000_000;
 
 const TREASURY_SPEND_WINDOW_MS = 24 * 60 * 60 * 1000;
 

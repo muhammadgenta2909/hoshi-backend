@@ -1327,8 +1327,12 @@ describe('GachaService', () => {
     // untuk alamat Solana APA PUN) dan isi treasury kita.
     it('refuses once the 24h treasury spend cap would be exceeded, before calling CollectorCrypt', async () => {
       armHappyPurchase();
+      // "Sudah terpakai" = tepat sebesar plafon harian efektif, jadi pack berikutnya
+      // (harga apa pun > 0) menjatuhkannya melewati batas. Nilai ini mengikuti
+      // TREASURY_DAILY_CAP_USDC default (staging-live: $100k) — test menegakkan gerbang,
+      // bukan angka spesifik. Config tidak di-inject di sini, jadi service memakai default.
       prisma.ccPackPurchase.aggregate.mockResolvedValue({
-        _sum: { priceUsdc: 500_000_000 },
+        _sum: { priceUsdc: 100_000_000_000 },
       });
 
       await expect(service.purchase({}, user)).rejects.toThrow(
