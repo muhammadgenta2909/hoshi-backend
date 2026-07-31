@@ -43,42 +43,33 @@ describe('IdrxClient — pagar IDRX MOCK', () => {
     expect(res.data.paymentUrl).toContain('/api/idrx-mock/pay?order=');
   });
 
-  it('MOCK verifier: WAITING → PAID+PROCESSING (bayar) → PAID+MINTED (settle) — echo treasury', async () => {
-    jest.useFakeTimers();
-    try {
-      process.env.SOLANA_CLUSTER = 'devnet';
-      const store = new IdrxMockStore();
-      const config = {
-        get: (k: string) =>
-          ({ IDRX_MOCK: '1', IDRX_MOCK_PUBLIC_URL: 'http://localhost:3001' })[k],
-      } as unknown as ConfigService;
-      const client = new IdrxClient(config, store);
+  it('MOCK verifier: WAITING → PAID+MINTED langsung saat bayar (settle instan) — echo treasury', async () => {
+    process.env.SOLANA_CLUSTER = 'devnet';
+    const store = new IdrxMockStore();
+    const config = {
+      get: (k: string) =>
+        ({ IDRX_MOCK: '1', IDRX_MOCK_PUBLIC_URL: 'http://localhost:3001' })[k],
+    } as unknown as ConfigService;
+    const client = new IdrxClient(config, store);
 
-      const res = await client.mintRequest(mintInput);
-      const moid = res.data.merchantOrderId;
+    const res = await client.mintRequest(mintInput);
+    const moid = res.data.merchantOrderId;
 
-      const before = await client.findMintByMerchantOrderId(moid);
-      expect(before?.paymentStatus).toBe('WAITING_FOR_PAYMENT');
-      expect(before?.userMintStatus).not.toBe('MINTED');
+    const before = await client.findMintByMerchantOrderId(moid);
+    expect(before?.paymentStatus).toBe('WAITING_FOR_PAYMENT');
+    expect(before?.userMintStatus).not.toBe('MINTED');
 
-      // Bayar, tapi mint BELUM settle → PAID + PROCESSING (fulfilment harus MENUNGGU).
-      store.markPaid(moid);
-      const paidNotSettled = await client.findMintByMerchantOrderId(moid);
-      expect(paidNotSettled?.paymentStatus).toBe('PAID');
-      expect(paidNotSettled?.userMintStatus).not.toBe('MINTED');
-
-      // Lewat jeda settlement → baru PAID + MINTED (persis IDRX asli).
-      jest.advanceTimersByTime(IdrxMockStore.SETTLE_DELAY_MS + 100);
-      const settled = await client.findMintByMerchantOrderId(moid);
-      expect(settled?.paymentStatus).toBe('PAID');
-      expect(settled?.userMintStatus).toBe('MINTED');
-      expect(settled?.destinationWalletAddress).toBe(
-        mintInput.destinationWalletAddress,
-      );
-      expect(settled?.requestType).toBe('idrx');
-    } finally {
-      jest.useRealTimers();
-    }
+    // Bayar → SETTLE_DELAY_MS=0 → LANGSUNG PAID + MINTED. Ini yang membuat pay/complete
+    // bisa memenuhi order SINKRON sebelum redirect (tak ada jendela PROCESSING menggantung
+    // yang bisa stuck kalau instance Render efemeral kehilangan state in-memory-nya).
+    store.markPaid(moid);
+    const settled = await client.findMintByMerchantOrderId(moid);
+    expect(settled?.paymentStatus).toBe('PAID');
+    expect(settled?.userMintStatus).toBe('MINTED');
+    expect(settled?.destinationWalletAddress).toBe(
+      mintInput.destinationWalletAddress,
+    );
+    expect(settled?.requestType).toBe('idrx');
   });
 
   it('TANPA IDRX_MOCK → jalur ASLI (credentials() melempar karena tak ada API key)', async () => {

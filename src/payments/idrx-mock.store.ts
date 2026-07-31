@@ -29,12 +29,17 @@ export class IdrxMockStore {
   private static readonly MAX = 500;
 
   /**
-   * Simulasi SETTLEMENT ASYNC IDRX asli. Di produksi, setelah user bayar, mint TIDAK langsung
-   * MINTED — ada jeda (biasanya beberapa detik–menit). Tanpa jeda ini, mock cuma menguji jalur
-   * instan dan MELEWATI state "menunggu konfirmasi + polling" yang justru dilewati alur asli.
-   * Dengan jeda ini, frontend menempuh urutan yang SAMA: bayar → menunggu → MINTED → reveal.
+   * SETTLE INSTAN (0 ms). Dulu 2500 ms untuk meniru jeda mint async IDRX asli, TAPI itu
+   * justru MENGALAHKAN fulfil-segera di pay/complete: `complete` menandai paidAt lalu SEGERA
+   * memanggil handleCallback (t≈0 ms) yang butuh MINTED — dengan jeda 2,5 dtk order belum
+   * settle, jadi fulfil-nya gagal dan order menggantung menunggu poll frontend. Di instance
+   * Render efemeral, kalau restart/sleep terjadi di jendela itu, `paidAt` in-memory HILANG →
+   * isSettled tak pernah true → order STUCK "menunggu konfirmasi" selamanya (reconciler pun
+   * butuh MINTED yang tak akan datang). Dengan 0, isSettled langsung true → handleCallback
+   * memenuhi order SINKRON sebelum redirect → order sudah FULFILLED (durable di DB) saat user
+   * kembali → tak ada jendela stuck. (Alur asli tetap async: hanya MOCK yang instan.)
    */
-  static readonly SETTLE_DELAY_MS = 2500;
+  static readonly SETTLE_DELAY_MS = 0;
 
   remember(
     merchantOrderId: string,
