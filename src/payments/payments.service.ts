@@ -7,8 +7,9 @@ import {
   ServiceUnavailableException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { PaymentStatus } from '@prisma/client';
+import { ListingStatus, PaymentStatus } from '@prisma/client';
 import type { PaymentOrder } from '@prisma/client';
+import { detectProductionSignal } from '../common/demo-mode';
 import { PublicKey } from '@solana/web3.js';
 import type { AuthUser } from '../auth/jwt.strategy';
 import {
@@ -307,6 +308,145 @@ export class PaymentsService {
     return toPaymentOrderDto(order);
   }
 
+  /**
+   * Terbitkan tagihan rupiah untuk membeli satu kartu KATALOG CollectorCrypt lewat jalur
+   * RESELLER — pembeli bayar HARGA KITA (IDRX), treasury yang nanti membeli kartu di CC
+   * (USDC) dan men-transfer-nya ke pembeli; selisihnya margin Hoshi. TIDAK ADA USDC yang
+   * bergerak di sini — hanya di fulfilment.
+   *
+   * Urutan = properti keamanannya, sama seperti createPackOrder:
+   *   0. kuota order per-user + validasi listing  → menolak SEBELUM bayar itu gratis
+   *   1. snapshot biaya CC (USDC) dari baris listing  → jadi PLAFON saat treasury menebus
+   *   2. cek harga kita menutup biaya CC  → jangan sampai jual rugi
+   *   3. plafon treasury 24 jam  → dicek di sini, bukan cuma saat fulfilment
+   *   4. mint-request IDRX  → merchantOrderId lahir di sana
+   *   5. persist baris PENDING (listingId != null = jalur reseller)
+   */
+  async createListingOrder(
+    listingId: string,
+    user: AuthUser,
+  ): Promise<PaymentOrderDto> {
+    const treasuryAddress = this.treasuryAddressOrRefuse();
+    await this.assertOrderQuota(user.id);
+
+    // 0. Listing WAJIB kartu katalog CC yang masih dijual: source=COLLECTORCRYPT, TANPA penjual
+    //    user (sellerId null = mirror katalog, bukan kartu user), ACTIVE, punya alamat on-chain.
+    const listing = await this.prisma.listing.findUnique({
+      where: { id: listingId },
+    });
+    if (!listing || listing.status !== 'ACTIVE') {
+      throw new BadRequestException(
+        'Listing tidak ditemukan atau sudah tidak dijual.',
+      );
+    }
+    if (
+      listing.source !== 'COLLECTORCRYPT' ||
+      listing.sellerId != null ||
+      !listing.ccNftAddress ||
+      listing.ccPriceUsd == null
+    ) {
+      throw new BadRequestException(
+        'Kartu ini bukan produk katalog CollectorCrypt — belum bisa dibeli lewat jalur ini.',
+      );
+    }
+
+    // 1. Biaya CC (USDC base unit) di-snapshot dari harga dolar terakhir yang tersimpan. Ini
+    //    PLAFON saat treasury menebus: kalau harga live CC naik melewati ini, fulfilment tolak
+    //    (refund) alih-alih diam-diam menggerus treasury — persis semantik snapshot pack gacha.
+    const priceUsdc = Math.round(listing.ccPriceUsd * 1_000_000);
+    if (!Number.isSafeInteger(priceUsdc) || priceUsdc <= 0) {
+      this.logger.error(
+        `Harga CC listing ${listingId} tidak masuk akal: ccPriceUsd=${listing.ccPriceUsd}. Order ditolak.`,
+      );
+      throw new ServiceUnavailableException(
+        'Harga kartu dari CollectorCrypt sedang tidak wajar. Coba lagi nanti.',
+      );
+    }
+
+    // 2. Harga KITA (priceIdrx = yang harus DITERIMA treasury, sudah termasuk margin) wajib
+    //    menutup biaya CC dalam rupiah. Kalau admin menyetel di bawah modal → tolak, jangan
+    //    jual rugi. Kurs pembanding sama dengan yang dipakai market-sync (HOSHI_USD_IDR_RATE).
+    const usdIdrRate = this.intConfig('HOSHI_USD_IDR_RATE', 16_000, 1);
+    const ccCostIdr = Math.ceil(listing.ccPriceUsd * usdIdrRate);
+    if (listing.priceIdrx < ccCostIdr) {
+      this.logger.error(
+        `Listing ${listingId} priceIdrx ${listing.priceIdrx} < biaya CC ${ccCostIdr} IDR — jual rugi, order ditolak.`,
+      );
+      throw new ServiceUnavailableException(
+        'Harga kartu ini sedang tidak wajar. Coba lagi nanti.',
+      );
+    }
+
+    // 3. Treasury akan membelanjakan ~priceUsdc → plafon HARIAN + preflight saldo SAMA dengan
+    //    gacha, tapi plafon PER-ITEM pakai batas per-kartu tersendiri (bukan plafon pack $100
+    //    gacha, yang akan menolak hampir semua kartu graded CC di depan).
+    await this.assertTreasuryCapacity(
+      priceUsdc,
+      this.intConfig('HOSHI_CC_MAX_CARD_PRICE_USDC', 5_000_000_000, 1),
+    );
+
+    // 4. Pembeli bayar HARGA KITA + fee QRIS di atasnya (treasury tetap menerima priceIdrx).
+    const priceIdr = applyBps(listing.priceIdrx, BPS_DENOMINATOR + QRIS_FEE_BPS);
+    if (priceIdr < IDRX_MIN_MINT_IDR || priceIdr > IDRX_MAX_MINT_IDR) {
+      throw new BadRequestException(
+        `Harga kartu ini (Rp ${priceIdr}) di luar batas pembayaran IDRX ` +
+          `(Rp ${IDRX_MIN_MINT_IDR}–Rp ${IDRX_MAX_MINT_IDR}).`,
+      );
+    }
+
+    const expiryMinutes = this.intConfig(
+      'HOSHI_ORDER_EXPIRY_MINUTES',
+      DEFAULT_EXPIRY_MINUTES,
+      1,
+    );
+    const mint = await this.idrx.mintRequest({
+      toBeMinted: String(priceIdr),
+      destinationWalletAddress: treasuryAddress,
+      networkChainId: this.requiredConfig('IDRX_NETWORK_CHAIN_ID'),
+      returnUrl: this.requiredConfig('HOSHI_PAYMENT_RETURN_URL'),
+      expiryPeriod: expiryMinutes,
+      productDetails: `Hoshi CC ${listing.name}`.slice(0, 255),
+      // HOSTED (paymentMethod/channelId dikosongkan) → halaman Duitku penuh (QRIS+e-wallet+VA).
+    });
+    const data = mint.data;
+    if (
+      !data ||
+      typeof data.merchantOrderId !== 'string' ||
+      !data.merchantOrderId
+    ) {
+      throw new ServiceUnavailableException(
+        'IDRX tidak mengembalikan merchantOrderId. Order tidak dibuat — coba lagi.',
+      );
+    }
+
+    // 5. Baris ini gerbang belanja treasury untuk jalur reseller. `listingId` mengarahkan
+    //    fulfilment ke settlement CC; `packType` sentinel; `packMemo` tetap null.
+    const order = await this.prisma.paymentOrder.create({
+      data: {
+        merchantOrderId: data.merchantOrderId,
+        idrxRequestId: data.id != null ? String(data.id) : null,
+        reference: data.reference ?? null,
+        userId: user.id,
+        packType: 'MARKETPLACE',
+        listingId: listing.id,
+        priceIdr,
+        priceUsdc,
+        paymentMethod: 'HOSTED',
+        qrContent: data.qrContent ?? null,
+        virtualAccountNo: data.virtualAccountNo ?? null,
+        paymentUrl: data.paymentUrl ?? null,
+        expiresAt: new Date(Date.now() + expiryMinutes * 60_000),
+        status: PaymentStatus.PENDING,
+      },
+    });
+
+    this.logger.log(
+      `Order marketplace ${order.merchantOrderId} dibuat: listing ${listing.id} ` +
+        `(${listing.name}), Rp ${priceIdr}, biaya CC ${priceUsdc} USDC base unit (user ${user.id}).`,
+    );
+    return toPaymentOrderDto(order);
+  }
+
   /* ─────────────────────────── Callback IDRX ─────────────────────────── */
 
   /**
@@ -472,6 +612,12 @@ export class PaymentsService {
       );
     }
 
+    // Order MARKETPLACE (reseller kartu CC): jalur settlement TERSENDIRI — cek harga & delivery
+    // spesifik-listing, BUKAN gacha.purchase() + assertPriceStillHonourable (yang untuk pack).
+    if (order.listingId) {
+      return this.fulfilListing(order, user);
+    }
+
     // Harga bergerak antara "user bayar" dan "kita tebus". Berapa banyak drift yang kita
     // TELAN adalah keputusan yang dipilih (HOSHI_MAX_SLIPPAGE_BPS), bukan kecelakaan. Cek ini
     // PRA-belanja: belum ada USDC treasury yang bergerak, jadi kegagalannya boleh dibedakan —
@@ -534,6 +680,94 @@ export class PaymentsService {
       // "kirim pack-nya" atau "kembalikan uangnya".
       return this.failToRefund(order, errorMessage(err));
     }
+  }
+
+  /**
+   * Settlement RESELLER kartu katalog CC untuk order yang sudah diklaim (FULFILLING).
+   *
+   * DUIT TREASURY: jalur real MEMBELANJAKAN USDC treasury (beli di CC) + SOL (gas transfer).
+   * Karena itu GANDA-DIGERBANG dan default TIDAK belanja apa pun:
+   *   • MOCK (staging/devnet, CC_MOCK): "kirim" kartu tanpa on-chain — NOL USDC/SOL.
+   *   • REAL tapi HOSHI_CC_RESELL_ENABLED MATI (default): TIDAK belanja; user perlu di-refund.
+   *   • REAL + flag NYALA: baru benar-benar beli di CC + transfer (diarmed sadar, treasury didanai).
+   */
+  private async fulfilListing(
+    order: PaymentOrder,
+    user: { id: string; walletAddress: string },
+  ): Promise<FulfilOutcome> {
+    const listing = order.listingId
+      ? await this.prisma.listing.findUnique({ where: { id: order.listingId } })
+      : null;
+    if (!listing) {
+      return this.failToRefund(
+        order,
+        `Listing ${order.listingId} hilang — order tidak bisa diselesaikan.`,
+      );
+    }
+
+    const mock = this.ccMockEnabled();
+    const armed =
+      (this.config.get<string>('HOSHI_CC_RESELL_ENABLED') ?? '')
+        .trim()
+        .toLowerCase() === 'true';
+
+    // GERBANG BELANJA. Bukan mock DAN belum diarmed → JANGAN sentuh on-chain, JANGAN tandai
+    // listing terjual. User sudah bayar → ini UTANG (refund manual), bukan izin kuras treasury.
+    if (!mock && !armed) {
+      return this.failToRefund(
+        order,
+        'Reseller CC belum diaktifkan (HOSHI_CC_RESELL_ENABLED=false) — pembayaran perlu di-refund manual.',
+      );
+    }
+    if (!mock && armed) {
+      // TODO(phase-2-real): treasury cc-buy (wallet=treasury → TreasuryService.sign → broadcast)
+      // + transfer NFT CC ke user.walletAddress; margin (IDRX masuk − USDC keluar) di treasury.
+      return this.failToRefund(
+        order,
+        'Settlement reseller CC real belum diimplement — pembayaran perlu di-refund manual.',
+      );
+    }
+
+    // MOCK: klaim listing ACTIVE→SOLD (dua order untuk satu listing → satu menang) lalu tandai
+    // order FULFILLED — DALAM SATU transaksi. Kalau write kedua gagal (transient / pod restart),
+    // seluruh transaksi rollback: listing TIDAK jadi SOLD dan order tetap FULFILLING (bisa
+    // di-retry), bukan kondisi setengah jadi "listing terjual tapi order nyangkut selamanya".
+    // TIDAK ADA USDC/SOL treasury yang bergerak.
+    const claimedCount = await this.prisma.$transaction(async (tx) => {
+      const claim = await tx.listing.updateMany({
+        where: { id: listing.id, status: ListingStatus.ACTIVE },
+        data: { status: ListingStatus.SOLD, buyerId: user.id, soldAt: new Date() },
+      });
+      if (claim.count !== 1) return claim.count;
+      await tx.paymentOrder.update({
+        where: { merchantOrderId: order.merchantOrderId },
+        data: {
+          status: PaymentStatus.FULFILLED,
+          fulfilledAt: new Date(),
+          error: null,
+        },
+      });
+      return claim.count;
+    });
+    if (claimedCount !== 1) {
+      return this.failToRefund(
+        order,
+        `Listing ${listing.id} sudah terjual lebih dulu — pembayaran perlu di-refund manual.`,
+      );
+    }
+    this.logger.warn(
+      `MOCK reseller: listing ${listing.id} (${listing.name}) "terkirim" ke user ${user.id} ` +
+        `TANPA belanja treasury (order ${order.merchantOrderId} FULFILLED).`,
+    );
+    return 'FULFILLED';
+  }
+
+  /** MOCK CC aktif: staging/devnet + CC_MOCK=1 + bukan sinyal produksi. Sama dgn GachaService. */
+  private ccMockEnabled(): boolean {
+    return (
+      this.config.get<string>('CC_MOCK') === '1' &&
+      detectProductionSignal() === null
+    );
   }
 
   /* ─────────────────────────── Reconciler ─────────────────────────── */
@@ -1120,26 +1354,36 @@ export class PaymentsService {
    * penyerang) dan tertutup di produksi dengan menjaga treasury didanai di atas plafon. Penutup
    * sejati untuk mainnet: reservasi baris + advisory lock Postgres di sekitar cek+insert.
    */
-  private async assertTreasuryCapacity(priceUsdc: number): Promise<void> {
-    // Plafon harga SATU pack, dicek DI SINI — sebelum order terbit — bukan cuma di dalam
+  private async assertTreasuryCapacity(
+    priceUsdc: number,
+    perItemCapUsdc?: number,
+  ): Promise<void> {
+    // Plafon harga SATU item, dicek DI SINI — sebelum order terbit — bukan cuma di dalam
     // purchase(). GachaService menegakkan plafon yang sama saat fulfillment; kalau order
     // sudah terlanjur terbit, penegakan itu jatuh SESUDAH rupiah user masuk dan berubah
     // jadi REFUND_DUE: user bayar, pack tidak pernah datang. Sama persis alasannya dengan
     // plafon harian di bawah — plafon pengaman kita tidak boleh jadi alat merampok user
     // yang SUDAH bayar. Konstanta di-import dari GachaService agar tidak mungkin melenceng.
-    const maxPack = this.intConfig(
-      'GACHA_MAX_PACK_PRICE_USDC',
-      TREASURY_MAX_PACK_PRICE_USDC,
-      1,
-    );
-    if (priceUsdc > maxPack) {
+    //
+    // Default = plafon per-pack gacha ($100). Jalur reseller CC MENGOPER plafon per-kartu
+    // tersendiri (HOSHI_CC_MAX_CARD_PRICE_USDC): kartu graded CC rutin di atas $100, jadi
+    // plafon pack gacha akan menolak hampir semua kartu di depan. Plafon HARIAN + preflight
+    // saldo on-chain di bawah tetap berlaku identik untuk kedua jalur.
+    const usingDefaultCap = perItemCapUsdc == null;
+    const maxItem = usingDefaultCap
+      ? this.intConfig('GACHA_MAX_PACK_PRICE_USDC', TREASURY_MAX_PACK_PRICE_USDC, 1)
+      : perItemCapUsdc;
+    if (priceUsdc > maxItem) {
       this.logger.error(
-        `Harga pack ${priceUsdc} melewati plafon per-pack ${maxPack} (USDC base unit). ` +
+        `Harga item ${priceUsdc} melewati plafon per-item ${maxItem} (USDC base unit). ` +
           'Order TIDAK diterbitkan — tidak ada rupiah user yang masuk.',
       );
       throw new BadRequestException(
-        'Pack ini melebihi batas nominal pembelian kami saat ini. Pilih pack lain — ' +
-          'tidak ada dana Anda yang terpotong.',
+        usingDefaultCap
+          ? 'Pack ini melebihi batas nominal pembelian kami saat ini. Pilih pack lain — ' +
+              'tidak ada dana Anda yang terpotong.'
+          : 'Nominal pembelian kartu ini melebihi batas kami saat ini — ' +
+              'tidak ada dana Anda yang terpotong.',
       );
     }
 

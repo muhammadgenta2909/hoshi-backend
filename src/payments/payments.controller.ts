@@ -19,6 +19,7 @@ import { AdminGuard } from '../auth/admin.guard';
 import { CurrentUser } from '../auth/current-user.decorator';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import type { AuthUser } from '../auth/jwt.strategy';
+import { CreateListingOrderDto } from './dto/create-listing-order.dto';
 import { CreatePackOrderDto } from './dto/create-pack-order.dto';
 import { PaymentsService } from './payments.service';
 
@@ -64,6 +65,26 @@ export class PaymentsController {
     @CurrentUser() user: AuthUser,
   ) {
     return this.payments.createPackOrder(dto, user);
+  }
+
+  @Post('listing')
+  @ApiBearerAuth()
+  @UseGuards(JwtAuthGuard)
+  @Throttle({ default: { ttl: 60000, limit: 10 } })
+  @ApiOperation({
+    summary:
+      'Terbitkan tagihan rupiah untuk membeli satu kartu katalog CollectorCrypt (jalur reseller)',
+    description:
+      'Pembeli bayar HARGA KITA (IDRX). Nominal & penerima TIDAK PERNAH dari body: harga di-snapshot ' +
+      'server dari baris Listing (priceIdrx + fee QRIS), penerima IDRX selalu treasury. Saat IDRX ' +
+      'PAID+MINTED, treasury membeli kartu di CollectorCrypt (USDC) lalu men-transfer-nya ke pembeli; ' +
+      'selisih harga = margin Hoshi. Kartu belum berpindah di request ini.',
+  })
+  createListingOrder(
+    @Body() dto: CreateListingOrderDto,
+    @CurrentUser() user: AuthUser,
+  ) {
+    return this.payments.createListingOrder(dto.listingId, user);
   }
 
   @Get('me/orders')
