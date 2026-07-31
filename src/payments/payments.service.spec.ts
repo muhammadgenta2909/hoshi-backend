@@ -48,6 +48,8 @@ describe('PaymentsService', () => {
     };
     user: { findUnique: jest.Mock };
     ccPackPurchase: { aggregate: jest.Mock };
+    listing: { findUnique: jest.Mock; updateMany: jest.Mock };
+    $transaction: jest.Mock;
   };
   let idrx: {
     mintRequest: jest.Mock;
@@ -139,6 +141,7 @@ describe('PaymentsService', () => {
     idrxUserMintStatus: null,
     txHash: null,
     packMemo: null,
+    listingId: null,
     error: null,
     createdAt: now,
     updatedAt: now,
@@ -265,6 +268,13 @@ describe('PaymentsService', () => {
       ccPackPurchase: {
         aggregate: jest.fn().mockResolvedValue({ _sum: { priceUsdc: null } }),
       },
+      // Jalur reseller CC. Default: findUnique kosong (test isi per kasus); updateMany menang
+      // klaim ACTIVE→SOLD. $transaction jalankan callback dengan prisma mock sebagai tx client.
+      listing: {
+        findUnique: jest.fn().mockResolvedValue(null),
+        updateMany: jest.fn().mockResolvedValue({ count: 1 }),
+      },
+      $transaction: jest.fn((cb: (tx: typeof prisma) => unknown) => cb(prisma)),
     };
     idrx = {
       mintRequest: jest.fn().mockResolvedValue(mintResponse(MERCHANT_ORDER_ID)),
@@ -459,6 +469,147 @@ describe('PaymentsService', () => {
    * PEMICU, bukan BUKTI. Setiap keputusan uang diambil dari History API, dan tepat satu pemenang
    * klaim atomik yang boleh membeli pack.
    */
+  /**
+   * JALUR RESELLER CC (createListingOrder + fulfilListing). Pembeli bayar HARGA KITA via IDRX;
+   * treasury (nanti) menebus kartu di CollectorCrypt. Uji: (1) plafon per-pack $100 gacha TIDAK
+   * mengunci kartu CC mahal, (2) diskriminator katalog, (3) plafon per-kartu tetap membatasi,
+   * (4) gerbang settlement TIDAK belanja saat mati, (5) MOCK settle = listing SOLD tanpa on-chain.
+   */
+  describe('createListingOrder / fulfilListing (jalur reseller CC)', () => {
+    // Kartu katalog CC yang sah: source COLLECTORCRYPT, TANPA penjual user, ACTIVE, punya alamat
+    // on-chain + harga dolar. $250 — SENGAJA di atas plafon pack $100 gacha.
+    const catalogListing = {
+      id: 'listing-cc-1',
+      name: 'Charizard PSA 10',
+      source: 'COLLECTORCRYPT',
+      sellerId: null as string | null,
+      ccNftAddress: 'CcNftAddrBase58',
+      ccPriceUsd: 250,
+      priceIdrx: 5_000_000, // harga kita (rupiah); biaya CC 250×16.000 = 4.000.000 → margin +
+      status: 'ACTIVE',
+    };
+
+    const resellerOrder: PaymentOrder = {
+      ...baseOrder,
+      packType: 'MARKETPLACE',
+      listingId: catalogListing.id,
+      priceUsdc: 250_000_000,
+    };
+
+    it('kartu katalog CC $250 TIDAK ditolak plafon pack $100 — order MARKETPLACE terbit', async () => {
+      prisma.listing.findUnique.mockResolvedValue(catalogListing);
+
+      await service.createListingOrder(catalogListing.id, user);
+
+      // Tidak dilempar plafon per-pack: mintRequest terbit & order MARKETPLACE tercatat dengan
+      // priceUsdc 250_000_000 (jauh di atas plafon pack $100 = 100_000_000).
+      expect(idrx.mintRequest).toHaveBeenCalledTimes(1);
+      expect(prisma.paymentOrder.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            packType: 'MARKETPLACE',
+            listingId: catalogListing.id,
+            priceUsdc: 250_000_000,
+          }) as unknown,
+        }),
+      );
+    });
+
+    it('menolak listing non-katalog (sellerId terisi = kartu user) tanpa mintRequest', async () => {
+      prisma.listing.findUnique.mockResolvedValue({
+        ...catalogListing,
+        sellerId: 'user-2',
+      });
+
+      await expect(
+        service.createListingOrder(catalogListing.id, user),
+      ).rejects.toBeInstanceOf(BadRequestException);
+      expect(idrx.mintRequest).not.toHaveBeenCalled();
+      expect(prisma.paymentOrder.create).not.toHaveBeenCalled();
+    });
+
+    it('plafon per-kartu TETAP membatasi: kartu di atas HOSHI_CC_MAX_CARD_PRICE_USDC ditolak', async () => {
+      // $6.000 → 6.000.000.000 base unit > default 5.000.000.000. Margin tetap lolos (priceIdrx tinggi).
+      prisma.listing.findUnique.mockResolvedValue({
+        ...catalogListing,
+        ccPriceUsd: 6000,
+        priceIdrx: 120_000_000, // >= 6000×16.000 = 96.000.000
+      });
+
+      await expect(
+        service.createListingOrder(catalogListing.id, user),
+      ).rejects.toBeInstanceOf(BadRequestException);
+      expect(idrx.mintRequest).not.toHaveBeenCalled();
+    });
+
+    it('gerbang settlement MATI (CC_MOCK off, RESELL off) → REFUND_DUE, NOL belanja, listing tak di-SOLD', async () => {
+      prisma.paymentOrder.findUnique.mockResolvedValue(resellerOrder);
+      prisma.listing.findUnique.mockResolvedValue(catalogListing);
+
+      const outcome = await service.handleCallback({
+        merchantOrderId: MERCHANT_ORDER_ID,
+      });
+
+      expect(outcome).toBe('REFUND_DUE');
+      // NOL on-chain: gacha.purchase tak pernah dipanggil; listing TIDAK ditandai SOLD.
+      expect(gacha.purchase).not.toHaveBeenCalled();
+      expect(prisma.listing.updateMany).not.toHaveBeenCalled();
+      const written = allStatusesWritten();
+      expect(written).toContain(PaymentStatus.REFUND_DUE);
+      expect(written).not.toContain(PaymentStatus.FULFILLED);
+      expect(written).not.toContain(PaymentStatus.FAILED);
+    });
+
+    it('MOCK settle: listing ACTIVE→SOLD + order FULFILLED, NOL belanja (gacha.purchase tak dipanggil)', async () => {
+      // ccMockEnabled = CC_MOCK==='1' && detectProductionSignal()===null. Bersihkan 3 sinyal
+      // produksi (env) agar deterministik, restore setelahnya.
+      const saved = {
+        SOLANA_CLUSTER: process.env.SOLANA_CLUSTER,
+        SOLANA_RPC_URL: process.env.SOLANA_RPC_URL,
+        COLLECTORCRYPT_GACHA_BASE_URL: process.env.COLLECTORCRYPT_GACHA_BASE_URL,
+      };
+      delete process.env.SOLANA_CLUSTER;
+      delete process.env.SOLANA_RPC_URL;
+      delete process.env.COLLECTORCRYPT_GACHA_BASE_URL;
+      configValues.CC_MOCK = '1';
+      prisma.paymentOrder.findUnique.mockResolvedValue(resellerOrder);
+      prisma.listing.findUnique.mockResolvedValue(catalogListing);
+
+      try {
+        const outcome = await service.handleCallback({
+          merchantOrderId: MERCHANT_ORDER_ID,
+        });
+
+        expect(outcome).toBe('FULFILLED');
+        // MOCK = nol on-chain: TIDAK ada pembelian gacha/treasury.
+        expect(gacha.purchase).not.toHaveBeenCalled();
+        // Listing diklaim ACTIVE→SOLD ke pembeli, order jadi FULFILLED (satu transaksi).
+        expect(prisma.listing.updateMany).toHaveBeenCalledWith(
+          expect.objectContaining({
+            where: { id: catalogListing.id, status: 'ACTIVE' },
+            data: expect.objectContaining({
+              status: 'SOLD',
+              buyerId: user.id,
+            }) as unknown,
+          }),
+        );
+        expect(prisma.paymentOrder.update).toHaveBeenCalledWith(
+          expect.objectContaining({
+            where: { merchantOrderId: MERCHANT_ORDER_ID },
+            data: expect.objectContaining({
+              status: PaymentStatus.FULFILLED,
+            }) as unknown,
+          }),
+        );
+      } finally {
+        for (const [k, v] of Object.entries(saved)) {
+          if (v === undefined) delete process.env[k];
+          else process.env[k] = v;
+        }
+      }
+    });
+  });
+
   describe('handleCallback / verifyAndFulfil (gerbang pembayaran)', () => {
     // Callback PALSU: penyerang tahu merchantOrderId (kita sendiri yang menyerahkannya ke frontend)
     // dan mengarang body "PAID/MINTED". Keputusan HARUS datang dari History API — yang di sini
