@@ -17,6 +17,12 @@ const RETRY_AFTER_MS = 60 * 60 * 1_000;
 /** Batas baris yang diperbaiki per pemanggilan `repairMissing` (jaga latensi). */
 const REPAIR_BATCH = 8;
 
+/** Pull MOCK (staging/devnet) — memo `mock-…`, nftAddress `MOCKNFT…` (lihat
+ *  GachaService CC MOCK). Tidak akan pernah ada di katalog CC, jadi kita lewati. */
+function isMockPack(memo: string, nftAddress: string): boolean {
+  return memo.startsWith('mock-') || nftAddress.startsWith('MOCKNFT');
+}
+
 /** Kolom fakta CC pada baris pull — dibaca/ditulis sebagai satu kesatuan. */
 type PackFactsRow = Pick<
   CcPackPurchase,
@@ -82,7 +88,10 @@ export class CcCardFactsService {
         (c) => c.nftAddress === nftAddress,
       );
       if (!card) {
-        this.logger.warn(`Kartu ${nftAddress} tidak ada di katalog CC.`);
+        // Hasil NORMAL, bukan kesalahan: kartu devnet/mock/baru memang belum tentu ada
+        // di katalog publik CC. Debug, bukan warn — supaya log tidak banjir (mis. saat
+        // banyak pack mock dibuka di staging). Kegagalan NYATA (catch di bawah) tetap warn.
+        this.logger.debug(`Kartu ${nftAddress} tidak ada di katalog CC.`);
         return null;
       }
       return readCardFacts(card);
@@ -107,6 +116,9 @@ export class CcCardFactsService {
   async ensureFacts(pack: PackFactsRow): Promise<CcCardFacts | null> {
     if (pack.ccFactsSyncedAt) return this.storedFacts(pack);
     if (!pack.nftAddress) return null;
+    // Pull MOCK (staging/devnet) tidak akan PERNAH ada di katalog CC — jangan buang
+    // panggilan katalog + log untuknya. Memo-nya `mock-…`, nftAddress-nya `MOCKNFT…`.
+    if (isMockPack(pack.memo, pack.nftAddress)) return null;
 
     // Kartu yang baru saja gagal dicari (mis. NFT devnet yang memang tidak ada di
     // katalog produksi CC) tidak dicoba ulang tiap request.
@@ -134,6 +146,9 @@ export class CcCardFactsService {
         userId,
         nftAddress: { not: null },
         ccFactsSyncedAt: null,
+        // Jangan pernah repair pull MOCK — sama seperti ensureFacts, mereka tak akan
+        // ada di katalog CC, jadi hanya membuang panggilan tiap siklus repair.
+        memo: { not: { startsWith: 'mock-' } },
         OR: [{ ccFactsAttemptAt: null }, { ccFactsAttemptAt: { lt: stale } }],
       },
       orderBy: { openedAt: 'desc' },
