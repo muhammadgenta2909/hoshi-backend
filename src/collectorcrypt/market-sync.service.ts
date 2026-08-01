@@ -14,6 +14,10 @@ const DEFAULT_USD_IDR_RATE = 16_000;
 const RATE_MIN = 1_000;
 const RATE_MAX = 1_000_000;
 
+/** Denominator basis poin + plafon markup reseller (100_000 bps = 1000%, jaga-jaga salah ketik). */
+const BPS_DENOMINATOR = 10_000;
+const CC_MARGIN_BPS_MAX = 100_000;
+
 /** Ukuran halaman default saat menarik katalog CC (maks 100 di sisi mereka). */
 const DEFAULT_STEP = 50;
 
@@ -236,7 +240,12 @@ export class MarketSyncService {
       result.skipped.price++;
       return null;
     }
-    const priceIdrx = Math.round(priceUsd * rate);
+    // Harga jual = biaya CC × kurs × (1 + markup reseller). Markup 0 (default) = impas
+    // (perilaku lama). Markup HANYA di harga jual — expectedValue & ccPriceUsd tetap murni.
+    const marginBps = this.ccMarginBps();
+    const priceIdrx = Math.round(
+      (priceUsd * rate * (BPS_DENOMINATOR + marginBps)) / BPS_DENOMINATOR,
+    );
     if (priceIdrx > IDRX_MAX) {
       result.skipped.price++;
       return null;
@@ -388,5 +397,22 @@ export class MarketSyncService {
       );
     }
     return rate;
+  }
+
+  /** Markup RESELLER Hoshi (basis poin) di atas biaya CC — inilah margin keuntungan kita.
+   *  0 (default) = jual di harga biaya CC (impas). 1000 = +10%. Diterapkan HANYA ke harga
+   *  jual (priceIdrx), BUKAN ke expectedValue/ccPriceUsd. Admin tetap bisa override per-kartu
+   *  lewat PUT /admin/listings/:id. Nilai ngawur → default 0 (jangan diam-diam salah harga). */
+  private ccMarginBps(): number {
+    const raw = this.config.get<string>('HOSHI_CC_MARGIN_BPS');
+    if (raw === undefined || raw === '') return 0;
+    const bps = Number(raw);
+    if (!Number.isFinite(bps) || bps < 0 || bps > CC_MARGIN_BPS_MAX) {
+      this.logger.warn(
+        `HOSHI_CC_MARGIN_BPS tidak valid (${raw}); harus 0–${CC_MARGIN_BPS_MAX}. Pakai 0 (tanpa markup).`,
+      );
+      return 0;
+    }
+    return Math.floor(bps);
   }
 }

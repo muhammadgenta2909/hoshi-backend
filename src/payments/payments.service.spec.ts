@@ -8,6 +8,10 @@ import { CcPackStatus, PaymentStatus } from '@prisma/client';
 import type { PaymentOrder } from '@prisma/client';
 import type { AuthUser } from '../auth/jwt.strategy';
 import { GachaService, type CcPackDto } from '../collectorcrypt/gacha.service';
+import {
+  ResellerPostBuyError,
+  ResellerSettlementService,
+} from '../collectorcrypt/reseller-settlement.service';
 import type { CcMachineNormalized } from '../collectorcrypt/cc-gacha.types';
 import { PrismaService } from '../prisma/prisma.service';
 import { IdrxClient } from './idrx.client';
@@ -63,6 +67,7 @@ describe('PaymentsService', () => {
   };
   let config: { get: jest.Mock };
   let configValues: Record<string, string | number | undefined>;
+  let resellerSettlement: { settle: jest.Mock };
 
   const now = new Date('2026-07-14T00:00:00.000Z');
 
@@ -290,6 +295,14 @@ describe('PaymentsService', () => {
       treasuryBalances: jest.fn().mockResolvedValue(null),
     };
     config = { get: jest.fn((key: string) => configValues[key]) };
+    // Default: settlement reseller real sukses (beli + transfer). Tes armed menimpanya.
+    resellerSettlement = {
+      settle: jest.fn().mockResolvedValue({
+        buySignature: 'BUYSIG',
+        transferSignature: 'XFERSIG',
+        priceUsdc: 250,
+      }),
+    };
 
     const moduleRef = await Test.createTestingModule({
       providers: [
@@ -298,6 +311,7 @@ describe('PaymentsService', () => {
         { provide: IdrxClient, useValue: idrx },
         { provide: GachaService, useValue: gacha },
         { provide: ConfigService, useValue: config },
+        { provide: ResellerSettlementService, useValue: resellerSettlement },
       ],
     }).compile();
 
@@ -607,6 +621,141 @@ describe('PaymentsService', () => {
           else process.env[k] = v;
         }
       }
+    });
+
+    it('ARMED real: settle sukses → klaim listing SOLD lalu order FULFILLED (txHash=buySignature)', async () => {
+      configValues.HOSHI_CC_RESELL_ENABLED = 'true'; // armed; CC_MOCK unset → mock=false
+      prisma.paymentOrder.findUnique.mockResolvedValue(resellerOrder);
+      prisma.listing.findUnique.mockResolvedValue(catalogListing);
+
+      const outcome = await service.handleCallback({
+        merchantOrderId: MERCHANT_ORDER_ID,
+      });
+
+      expect(outcome).toBe('FULFILLED');
+      // Klaim listing ACTIVE→SOLD DULU (gerbang konkurensi) baru belanja.
+      expect(prisma.listing.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: catalogListing.id, status: 'ACTIVE' },
+          data: expect.objectContaining({ status: 'SOLD', buyerId: user.id }) as unknown,
+        }),
+      );
+      // Settle dipanggil dgn plafon = priceUsdc snapshot order.
+      expect(resellerSettlement.settle).toHaveBeenCalledWith({
+        nftAddress: catalogListing.ccNftAddress,
+        buyerWallet: user.walletAddress,
+        maxPriceUsdcBaseUnits: resellerOrder.priceUsdc,
+      });
+      expect(prisma.paymentOrder.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { merchantOrderId: MERCHANT_ORDER_ID },
+          data: expect.objectContaining({
+            status: PaymentStatus.FULFILLED,
+            txHash: 'BUYSIG',
+          }) as unknown,
+        }),
+      );
+    });
+
+    it('ARMED real: transfer gagal SESUDAH beli → REFUND_DUE "KIRIM ULANG", listing TIDAK dibalikin', async () => {
+      configValues.HOSHI_CC_RESELL_ENABLED = 'true';
+      prisma.paymentOrder.findUnique.mockResolvedValue(resellerOrder);
+      prisma.listing.findUnique.mockResolvedValue(catalogListing);
+      resellerSettlement.settle.mockRejectedValue(
+        new ResellerPostBuyError('rpc down', 'BUYSIG', catalogListing.ccNftAddress),
+      );
+
+      const outcome = await service.handleCallback({
+        merchantOrderId: MERCHANT_ORDER_ID,
+      });
+
+      expect(outcome).toBe('REFUND_DUE');
+      // Pesan REFUND_DUE menyuruh KIRIM ULANG (bukan refund) + membawa signature beli.
+      const refundCall = (
+        prisma.paymentOrder.updateMany.mock.calls as [
+          { data?: { status?: unknown; error?: unknown } },
+        ][]
+      ).find(([arg]) => arg?.data?.status === PaymentStatus.REFUND_DUE);
+      expect(String(refundCall?.[0]?.data?.error)).toContain('KIRIM ULANG');
+      expect(String(refundCall?.[0]?.data?.error)).toContain('BUYSIG');
+      // Listing TIDAK dibalikin ke ACTIVE (pembeli sudah memilikinya secara ekonomi).
+      expect(prisma.listing.updateMany).not.toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ status: 'ACTIVE' }) as unknown,
+        }),
+      );
+    });
+
+    it('ARMED real: settle gagal SEBELUM beli → listing dibalikin ACTIVE + REFUND_DUE', async () => {
+      configValues.HOSHI_CC_RESELL_ENABLED = 'true';
+      prisma.paymentOrder.findUnique.mockResolvedValue(resellerOrder);
+      prisma.listing.findUnique.mockResolvedValue(catalogListing);
+      resellerSettlement.settle.mockRejectedValue(new Error('CC down'));
+
+      const outcome = await service.handleCallback({
+        merchantOrderId: MERCHANT_ORDER_ID,
+      });
+
+      expect(outcome).toBe('REFUND_DUE');
+      // Belum ada belanja → listing dikembalikan ke ACTIVE agar bisa dijual lagi.
+      expect(prisma.listing.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({
+            id: catalogListing.id,
+            status: 'SOLD',
+            buyerId: user.id,
+          }) as unknown,
+          data: expect.objectContaining({
+            status: 'ACTIVE',
+            buyerId: null,
+          }) as unknown,
+        }),
+      );
+    });
+
+    it('ARMED real: settle SUKSES tapi tulis FULFILLED gagal → tetap FULFILLED, TIDAK refund/rollback', async () => {
+      configValues.HOSHI_CC_RESELL_ENABLED = 'true';
+      prisma.paymentOrder.findUnique.mockResolvedValue(resellerOrder);
+      prisma.listing.findUnique.mockResolvedValue(catalogListing);
+      // settle sukses (default), tapi tulis FULFILLED (paymentOrder.update) MELEDAK — kartu sudah
+      // di pembeli, jadi ini TIDAK boleh berubah jadi refund/rollback (double loss).
+      prisma.paymentOrder.update.mockImplementation(
+        (args: { data?: { status?: unknown } }) =>
+          args?.data?.status === PaymentStatus.FULFILLED
+            ? Promise.reject(new Error('db down'))
+            : Promise.resolve(fulfilledOrder),
+      );
+
+      const outcome = await service.handleCallback({
+        merchantOrderId: MERCHANT_ORDER_ID,
+      });
+
+      expect(outcome).toBe('FULFILLED'); // kartu sudah terkirim → tetap terpenuhi
+      expect(resellerSettlement.settle).toHaveBeenCalledTimes(1);
+      // TIDAK ada REFUND_DUE dan TIDAK ada rollback listing ke ACTIVE.
+      const wroteRefund = (
+        prisma.paymentOrder.updateMany.mock.calls as [{ data?: { status?: unknown } }][]
+      ).some(([a]) => a?.data?.status === PaymentStatus.REFUND_DUE);
+      expect(wroteRefund).toBe(false);
+      expect(prisma.listing.updateMany).not.toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ status: 'ACTIVE' }) as unknown,
+        }),
+      );
+    });
+
+    it('ARMED real: kalah klaim konkurensi (listing sudah SOLD) → REFUND_DUE, settle TAK dipanggil (nol belanja)', async () => {
+      configValues.HOSHI_CC_RESELL_ENABLED = 'true';
+      prisma.paymentOrder.findUnique.mockResolvedValue(resellerOrder);
+      prisma.listing.findUnique.mockResolvedValue(catalogListing);
+      prisma.listing.updateMany.mockResolvedValue({ count: 0 }); // klaim ACTIVE→SOLD kalah
+
+      const outcome = await service.handleCallback({
+        merchantOrderId: MERCHANT_ORDER_ID,
+      });
+
+      expect(outcome).toBe('REFUND_DUE');
+      expect(resellerSettlement.settle).not.toHaveBeenCalled(); // NOL belanja treasury
     });
   });
 
