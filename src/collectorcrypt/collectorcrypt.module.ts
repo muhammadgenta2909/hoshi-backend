@@ -9,6 +9,7 @@ import { GachaController } from './gacha.controller';
 import { GachaService } from './gacha.service';
 import { JupiterClient } from './jupiter.client';
 import { MarketSyncService } from './market-sync.service';
+import { ResellerSettlementService } from './reseller-settlement.service';
 import { TreasurySwapScheduler } from './treasury-swap.scheduler';
 import { TreasurySwapService } from './treasury-swap.service';
 import { TreasuryService } from './treasury.service';
@@ -23,10 +24,14 @@ import { TreasuryService } from './treasury.service';
  *
  * TreasuryService SENGAJA tidak di-`exports`: ia memegang private key yang membayar
  * tiap pack. Yang boleh menyuruhnya menandatangani hanya provider DI MODUL INI, dan
- * saat ini ada TEPAT DUA:
+ * saat ini ada TEPAT TIGA:
  *
- *   - GachaService       → menandatangani pembelian pack (USDC keluar)
- *   - TreasurySwapService → menandatangani swap IDRX→USDC (uang berpindah BENTUK)
+ *   - GachaService             → menandatangani pembelian pack (USDC keluar)
+ *   - TreasurySwapService      → menandatangani swap IDRX→USDC (uang berpindah BENTUK)
+ *   - ResellerSettlementService → beli kartu katalog CC (USDC keluar) + transfer NFT ke pembeli
+ *
+ * Ketiganya di-export (bukan TreasuryService) supaya modul lain menuju penandatangan hanya
+ * lewat pintu yang membawa semua pengaman, tanpa private key bocor lintas modul.
  *
  * TreasurySwapService diletakkan di sini justru KARENA batasan itu: menutup lingkaran
  * modal kerja butuh tanda tangan treasury, dan memindahkannya ke modul lain berarti
@@ -53,6 +58,8 @@ import { TreasuryService } from './treasury.service';
     // karena yang ini memindahkan uang (lihat catatan di cc-buy.client.ts).
     CcBuyClient,
     CcBuyService,
+    // Settlement REAL reseller: treasury beli kartu CC (USDC keluar) + kirim NFT ke pembeli.
+    ResellerSettlementService,
     GachaService,
     MarketSyncService,
     TreasuryService,
@@ -66,6 +73,8 @@ import { TreasuryService } from './treasury.service';
     MarketSyncService,
     TreasurySwapService,
     CcCardFactsService,
+    // PaymentsModule memanggilnya dari fulfilListing (settlement reseller saat di-arm).
+    ResellerSettlementService,
   ],
 })
 export class CollectorCryptModule {}

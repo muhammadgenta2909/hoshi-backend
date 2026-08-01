@@ -16,6 +16,11 @@ import {
   GachaService,
   TREASURY_MAX_PACK_PRICE_USDC,
 } from '../collectorcrypt/gacha.service';
+import {
+  ResellerPostBuyError,
+  ResellerSettlementService,
+  type ResellerSettleResult,
+} from '../collectorcrypt/reseller-settlement.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { CreatePackOrderDto } from './dto/create-pack-order.dto';
 import { IdrxClient } from './idrx.client';
@@ -186,6 +191,7 @@ export class PaymentsService {
     private readonly idrx: IdrxClient,
     private readonly gacha: GachaService,
     private readonly config: ConfigService,
+    private readonly resellerSettlement: ResellerSettlementService,
   ) {}
 
   /* ─────────────────────────── Bikin order ─────────────────────────── */
@@ -716,12 +722,88 @@ export class PaymentsService {
       );
     }
     if (!mock && armed) {
-      // TODO(phase-2-real): treasury cc-buy (wallet=treasury → TreasuryService.sign → broadcast)
-      // + transfer NFT CC ke user.walletAddress; margin (IDRX masuk − USDC keluar) di treasury.
-      return this.failToRefund(
-        order,
-        'Settlement reseller CC real belum diimplement — pembayaran perlu di-refund manual.',
+      // REAL: treasury MEMBELANJAKAN USDC untuk beli kartu di CC + kirim NFT ke pembeli.
+      if (!listing.ccNftAddress) {
+        return this.failToRefund(
+          order,
+          `Listing ${listing.id} tak punya alamat NFT CC — tak bisa disettle, refund manual.`,
+        );
+      }
+      // GERBANG KONKURENSI: klaim listing ACTIVE→SOLD DULU (tepat satu pemenang), BARU belanja —
+      // supaya dua order untuk kartu yang sama tidak dua-duanya membeli NFT di CC. Kalah klaim
+      // (count != 1) → refund TANPA belanja apa pun.
+      const claimed = await this.prisma.listing.updateMany({
+        where: { id: listing.id, status: ListingStatus.ACTIVE },
+        data: { status: ListingStatus.SOLD, buyerId: user.id, soldAt: new Date() },
+      });
+      if (claimed.count !== 1) {
+        return this.failToRefund(
+          order,
+          `Listing ${listing.id} sudah terjual lebih dulu — refund manual (belum belanja).`,
+        );
+      }
+      let result: ResellerSettleResult;
+      try {
+        result = await this.resellerSettlement.settle({
+          nftAddress: listing.ccNftAddress,
+          buyerWallet: user.walletAddress,
+          maxPriceUsdcBaseUnits: order.priceUsdc,
+        });
+      } catch (err) {
+        if (err instanceof ResellerPostBuyError) {
+          // USDC SUDAH/MUNGKIN keluar & NFT (mungkin) sudah dibeli treasury; hanya transfer/
+          // konfirmasi yang belum tuntas. JANGAN refund, JANGAN balikkan listing (pembeli sudah
+          // memilikinya secara ekonomi). Pesan menyuruh CEK ON-CHAIN + KIRIM ULANG, bukan refund.
+          return this.failToRefund(
+            order,
+            `KARTU SUDAH/MUNGKIN DIBELI treasury (buy ${err.buySignature}) tapi belum terkirim ke ` +
+              `pembeli. CEK ON-CHAIN & KIRIM ULANG NFT manual ke ${user.walletAddress} — JANGAN refund. (${err.message})`,
+          );
+        }
+        // Gagal SEBELUM belanja (kutip/build/verify/sign): belum ada USDC keluar → balikkan
+        // listing ke ACTIVE (bisa dijual lagi) lalu refund pembeli.
+        await this.prisma.listing.updateMany({
+          where: {
+            id: listing.id,
+            status: ListingStatus.SOLD,
+            buyerId: user.id,
+          },
+          data: { status: ListingStatus.ACTIVE, buyerId: null, soldAt: null },
+        });
+        return this.failToRefund(
+          order,
+          `Settlement reseller gagal sebelum belanja: ${errorMessage(err)} — refund manual.`,
+        );
+      }
+
+      // SETTLE SUKSES: USDC keluar + NFT terkirim. DARI SINI JANGAN PERNAH refund/rollback —
+      // apa pun yang gagal setelah ini (mis. tulis FULFILLED) TIDAK boleh membatalkan penjualan
+      // (kalau tidak: kartu sudah di pembeli, treasury sudah bayar, tapi kita refund = double loss).
+      try {
+        await this.prisma.paymentOrder.update({
+          where: { merchantOrderId: order.merchantOrderId },
+          data: {
+            status: PaymentStatus.FULFILLED,
+            fulfilledAt: new Date(),
+            txHash: result.buySignature,
+            error: null,
+          },
+        });
+      } catch (dbErr) {
+        // Kartu SUDAH terkirim; hanya gagal menandai FULFILLED. JANGAN refund/rollback — biarkan
+        // order FULFILLING (reconciler menandainya stuck) + log keras untuk di-set FULFILLED manual.
+        this.logger.error(
+          `REAL reseller: listing ${listing.id} SUDAH terkirim (beli ${result.buySignature}, ` +
+            `transfer ${result.transferSignature}) tapi gagal menandai FULFILLED: ${errorMessage(dbErr)}. ` +
+            'Set FULFILLED manual — JANGAN refund.',
+        );
+      }
+      this.logger.warn(
+        `REAL reseller: listing ${listing.id} (${listing.name}) terkirim ke user ${user.id} ` +
+          `— beli ${result.buySignature}, transfer ${result.transferSignature} ` +
+          `(order ${order.merchantOrderId} FULFILLED).`,
       );
+      return 'FULFILLED';
     }
 
     // MOCK: klaim listing ACTIVE→SOLD (dua order untuk satu listing → satu menang) lalu tandai

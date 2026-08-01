@@ -7,18 +7,11 @@ import {
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { ActivityType, ListingSource, ListingStatus } from '@prisma/client';
-import { PublicKey, Transaction } from '@solana/web3.js';
 import { PrismaService } from '../prisma/prisma.service';
 import type { AuthUser } from '../auth/jwt.strategy';
 import { CcBuyClient } from './cc-buy.client';
 import { CcMarketClient } from './cc-market.client';
-
-/** Program marketplace CollectorCrypt V2 (sama untuk prod & devnet). */
-const CC_MARKETPLACE_PROGRAM = 'CcmRKTuZCGJBWQwMHvDYApBRvSZNHqGJXkznqpDTSQUr';
-const COMPUTE_BUDGET_PROGRAM = 'ComputeBudget111111111111111111111111111111';
-
-/** USDC 6 desimal. */
-const USDC_DECIMALS = 1_000_000;
+import { assertCcBuyTxMatchesQuote } from './cc-buy.verify';
 
 export type CcBuyQuote = {
   listingId: string;
@@ -143,8 +136,8 @@ export class CcBuyService {
       );
 
     const serialized = built.transactions[0];
-    this.assertTransactionMatchesQuote(serialized, {
-      buyerWallet: user.walletAddress,
+    assertCcBuyTxMatchesQuote(serialized, {
+      feePayerWallet: user.walletAddress,
       sellerWallet,
       priceUsdc,
     });
@@ -156,80 +149,6 @@ export class CcBuyService {
       sellerWallet,
       serializedTransaction: serialized,
     };
-  }
-
-  /**
-   * Membongkar transaksi bikinan CC dan menolak apa pun yang tidak sesuai kutipan.
-   * FAIL-CLOSED: bentuk yang tidak dikenali = tolak, bukan diloloskan.
-   */
-  private assertTransactionMatchesQuote(
-    base64: string,
-    expect: { buyerWallet: string; sellerWallet: string; priceUsdc: number },
-  ): void {
-    let tx: Transaction;
-    try {
-      tx = Transaction.from(Buffer.from(base64, 'base64'));
-    } catch {
-      throw new BadRequestException(
-        'Transaksi dari CollectorCrypt tidak bisa dibaca — pembelian dibatalkan.',
-      );
-    }
-
-    // Pembeli harus jadi fee payer (dia yang menandatangani).
-    if (!tx.feePayer || tx.feePayer.toBase58() !== expect.buyerWallet)
-      throw new BadRequestException(
-        'Transaksi CollectorCrypt tidak ditujukan ke wallet Anda — dibatalkan.',
-      );
-
-    // Tidak boleh ada program di luar yang kita harapkan.
-    const allowed = new Set([CC_MARKETPLACE_PROGRAM, COMPUTE_BUDGET_PROGRAM]);
-    for (const ix of tx.instructions) {
-      if (!allowed.has(ix.programId.toBase58()))
-        throw new BadRequestException(
-          'Transaksi CollectorCrypt memuat program tak dikenal — dibatalkan.',
-        );
-    }
-
-    const ccIx = tx.instructions.find(
-      (i) => i.programId.toBase58() === CC_MARKETPLACE_PROGRAM,
-    );
-    if (!ccIx)
-      throw new BadRequestException(
-        'Transaksi CollectorCrypt tidak memuat instruksi marketplace — dibatalkan.',
-      );
-
-    // Layout terverifikasi: 8 byte discriminator + u64 LE harga (USDC 6 desimal).
-    // Panjang lain = layout tak dikenal → tolak (jangan menebak nominal).
-    if (ccIx.data.length !== 16)
-      throw new BadRequestException(
-        'Format instruksi CollectorCrypt tidak dikenali — pembelian dibatalkan.',
-      );
-
-    const onChain = ccIx.data.readBigUInt64LE(8);
-    const quoted = BigInt(Math.round(expect.priceUsdc * USDC_DECIMALS));
-    if (onChain !== quoted) {
-      this.logger.warn(
-        `CC buy ditolak: nominal on-chain ${onChain} != kutipan ${quoted}`,
-      );
-      throw new BadRequestException(
-        `Harga di CollectorCrypt berubah (transaksi menagih ` +
-          `${Number(onChain) / USDC_DECIMALS} USDC, bukan ${expect.priceUsdc}). ` +
-          'Muat ulang halaman untuk harga terbaru.',
-      );
-    }
-
-    // Penjual yang dikutip harus benar-benar ada di daftar akun transaksi.
-    let sellerPk: PublicKey;
-    try {
-      sellerPk = new PublicKey(expect.sellerWallet);
-    } catch {
-      throw new BadRequestException('Alamat penjual CollectorCrypt tidak valid.');
-    }
-    const keys = new Set(ccIx.keys.map((k) => k.pubkey.toBase58()));
-    if (!keys.has(sellerPk.toBase58()))
-      throw new BadRequestException(
-        'Penjual pada transaksi berbeda dari listing — dibatalkan.',
-      );
   }
 
   /**

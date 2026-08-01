@@ -6,7 +6,23 @@ import {
   ServiceUnavailableException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { Keypair, Transaction, VersionedTransaction } from '@solana/web3.js';
+import {
+  Keypair,
+  Transaction,
+  VersionedTransaction,
+  clusterApiUrl,
+} from '@solana/web3.js';
+import { createUmi } from '@metaplex-foundation/umi-bundle-defaults';
+import { fetchAsset, mplCore, transferV1 } from '@metaplex-foundation/mpl-core';
+import { keypairIdentity, publicKey, type Umi } from '@metaplex-foundation/umi';
+import { base58 } from '@metaplex-foundation/umi/serializers';
+
+/** Menunggu NFT benar-benar mendarat di treasury setelah broadcast beli CC (broadcast =
+ *  "terkirim", belum tentu final) sebelum meneruskannya ke pembeli. ~30 detik total. */
+const TRANSFER_OWNERSHIP_RETRIES = 10;
+const TRANSFER_POLL_MS = 3_000;
+const sleep = (ms: number): Promise<void> =>
+  new Promise((resolve) => setTimeout(resolve, ms));
 
 /**
  * Dompet TREASURY Hoshi — pemegang USDC yang MEMBAYAR setiap pack.
@@ -29,6 +45,7 @@ import { Keypair, Transaction, VersionedTransaction } from '@solana/web3.js';
 export class TreasuryService {
   private readonly logger = new Logger(TreasuryService.name);
   private keypair: Keypair | null = null;
+  private treasuryUmi: Umi | null = null;
 
   constructor(private readonly config: ConfigService) {}
 
@@ -72,7 +89,83 @@ export class TreasuryService {
       .toString('base64');
   }
 
+  /**
+   * Transfer aset Metaplex Core yang SEDANG dimiliki treasury ke wallet pembeli.
+   *
+   * Dipakai jalur RESELLER: setelah treasury membeli kartu di CC (USDC keluar, NFT mendarat
+   * di treasury), kartu WAJIB diteruskan ke pembeli. Berbeda dari sign() yang mendelegasikan
+   * broadcast ke CC, transfer ini DISIARKAN via RPC Hoshi sendiri (umi.sendAndConfirm) — CC
+   * broadcast punya allow-list program dan akan menolak transfer Core kita (403).
+   *
+   * broadcast CC = "terkirim", belum tentu final: kita POLL sampai NFT benar-benar dimiliki
+   * treasury dulu. Kalau tak kunjung sampai → LEMPAR (jangan transfer aset yang belum ada;
+   * itu hanya akan gagal setengah jalan). Mengembalikan signature transfer (base58).
+   */
+  async transferCoreAssetToBuyer(params: {
+    assetAddress: string;
+    newOwner: string;
+  }): Promise<string> {
+    const umi = this.getTreasuryUmi();
+    const treasuryPk = String(umi.identity.publicKey);
+    const asset = publicKey(params.assetAddress);
+
+    let newOwnerPk: ReturnType<typeof publicKey>;
+    try {
+      newOwnerPk = publicKey(params.newOwner);
+    } catch {
+      throw new BadRequestException('Alamat pembeli tidak valid untuk transfer NFT.');
+    }
+
+    // Tunggu NFT mendarat di treasury (buy CC masih mengonfirmasi) sambil membaca collection-nya
+    // (transferV1 WAJIB menyertakan collection kalau asset bagian dari koleksi).
+    let collection: ReturnType<typeof publicKey> | undefined;
+    let owned = false;
+    for (let i = 0; i < TRANSFER_OWNERSHIP_RETRIES; i++) {
+      try {
+        const fetched = await fetchAsset(umi, asset);
+        if (String(fetched.owner) === treasuryPk) {
+          collection =
+            fetched.updateAuthority.type === 'Collection'
+              ? (fetched.updateAuthority.address ?? undefined)
+              : undefined;
+          owned = true;
+          break;
+        }
+      } catch {
+        /* belum terindeks / belum final — coba lagi */
+      }
+      await sleep(TRANSFER_POLL_MS);
+    }
+    if (!owned) {
+      throw new Error(
+        `NFT ${params.assetAddress} belum dimiliki treasury setelah pembelian — transfer ditunda.`,
+      );
+    }
+
+    const { signature } = await transferV1(umi, {
+      asset,
+      newOwner: newOwnerPk,
+      collection,
+    }).sendAndConfirm(umi);
+    return base58.deserialize(signature)[0];
+  }
+
   /* --- internal --- */
+
+  /** Umi ber-identitas TREASURY (untuk transfer Core asset). Lazy, dimemoisasi. Kunci treasury
+   *  tetap terkurung di service ini — hanya SIGNER-nya yang dipasang ke umi. */
+  private getTreasuryUmi(): Umi {
+    if (this.treasuryUmi) return this.treasuryUmi;
+    const endpoint =
+      this.config.get<string>('SOLANA_RPC_URL') ?? clusterApiUrl('devnet');
+    const umi = createUmi(endpoint).use(mplCore());
+    const umiKeypair = umi.eddsa.createKeypairFromSecretKey(
+      this.getKeypair().secretKey,
+    );
+    umi.use(keypairIdentity(umiKeypair));
+    this.treasuryUmi = umi;
+    return umi;
+  }
 
   /**
    * Key dibaca sekali lalu dimemoisasi. Tanpa key, fitur gacha treasury memang
