@@ -1,5 +1,7 @@
 import { Module } from '@nestjs/common';
 import { CollectorCryptModule } from '../collectorcrypt/collectorcrypt.module';
+import { BalanceModule } from '../balance/balance.module';
+import { EscrowModule } from '../escrow/escrow.module';
 import { IdrxClient } from './idrx.client';
 import { IdrxMockController } from './idrx-mock.controller';
 import { IdrxMockStore } from './idrx-mock.store';
@@ -27,7 +29,7 @@ import { PaymentsService } from './payments.service';
  * penyapu berkala inilah satu-satunya yang menyelamatkan order berbayar yang callbacknya hilang.
  */
 @Module({
-  imports: [CollectorCryptModule],
+  imports: [CollectorCryptModule, BalanceModule, EscrowModule],
   controllers: [PaymentsController, IdrxMockController],
   providers: [
     PaymentsService,

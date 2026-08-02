@@ -12,6 +12,8 @@ import {
   ResellerPostBuyError,
   ResellerSettlementService,
 } from '../collectorcrypt/reseller-settlement.service';
+import { EscrowService } from '../escrow/escrow.service';
+import { BalanceService } from '../balance/balance.service';
 import type { CcMachineNormalized } from '../collectorcrypt/cc-gacha.types';
 import { PrismaService } from '../prisma/prisma.service';
 import { IdrxClient } from './idrx.client';
@@ -68,6 +70,8 @@ describe('PaymentsService', () => {
   let config: { get: jest.Mock };
   let configValues: Record<string, string | number | undefined>;
   let resellerSettlement: { settle: jest.Mock };
+  let escrow: { transferCoreAssetTo: jest.Mock };
+  let balance: { credit: jest.Mock };
 
   const now = new Date('2026-07-14T00:00:00.000Z');
 
@@ -303,6 +307,8 @@ describe('PaymentsService', () => {
         priceUsdc: 250,
       }),
     };
+    escrow = { transferCoreAssetTo: jest.fn().mockResolvedValue('P2PXFERSIG') };
+    balance = { credit: jest.fn().mockResolvedValue({ credited: true }) };
 
     const moduleRef = await Test.createTestingModule({
       providers: [
@@ -312,6 +318,8 @@ describe('PaymentsService', () => {
         { provide: GachaService, useValue: gacha },
         { provide: ConfigService, useValue: config },
         { provide: ResellerSettlementService, useValue: resellerSettlement },
+        { provide: EscrowService, useValue: escrow },
+        { provide: BalanceService, useValue: balance },
       ],
     }).compile();
 
@@ -529,17 +537,36 @@ describe('PaymentsService', () => {
       );
     });
 
-    it('menolak listing non-katalog (sellerId terisi = kartu user) tanpa mintRequest', async () => {
+    it('MENERIMA user listing (sellerId terisi, penjual lain) → order MARKETPLACE, priceUsdc 0', async () => {
       prisma.listing.findUnique.mockResolvedValue({
         ...catalogListing,
-        sellerId: 'user-2',
+        sellerId: 'user-2', // penjual lain, bukan pembeli user-1
+      });
+
+      await service.createListingOrder(catalogListing.id, user);
+
+      expect(idrx.mintRequest).toHaveBeenCalledTimes(1);
+      expect(prisma.paymentOrder.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            packType: 'MARKETPLACE',
+            listingId: catalogListing.id,
+            priceUsdc: 0, // user listing: tak ada leg USDC
+          }) as unknown,
+        }),
+      );
+    });
+
+    it('menolak beli listing SENDIRI (sellerId === pembeli) tanpa mintRequest', async () => {
+      prisma.listing.findUnique.mockResolvedValue({
+        ...catalogListing,
+        sellerId: user.id,
       });
 
       await expect(
         service.createListingOrder(catalogListing.id, user),
       ).rejects.toBeInstanceOf(BadRequestException);
       expect(idrx.mintRequest).not.toHaveBeenCalled();
-      expect(prisma.paymentOrder.create).not.toHaveBeenCalled();
     });
 
     it('plafon per-kartu TETAP membatasi: kartu di atas HOSHI_CC_MAX_CARD_PRICE_USDC ditolak', async () => {
@@ -756,6 +783,120 @@ describe('PaymentsService', () => {
 
       expect(outcome).toBe('REFUND_DUE');
       expect(resellerSettlement.settle).not.toHaveBeenCalled(); // NOL belanja treasury
+    });
+  });
+
+  /**
+   * JALUR P2P (Flow B): jual-beli antar USER. Pembeli bayar Rupiah → escrow kirim kartu penjual
+   * ke pembeli + penjual dikredit saldo (priceIdrx − komisi). Hoshi TIDAK beli apa pun.
+   */
+  describe('fulfilUserListing (jalur P2P antar user)', () => {
+    const userListing = {
+      id: 'listing-user-1',
+      name: 'Pikachu PSA 9',
+      source: 'HOSHI',
+      sellerId: 'seller-9',
+      ccNftAddress: 'UserNftAddrBase58',
+      ccPriceUsd: null as number | null,
+      priceIdrx: 1_000_000, // Rp 1.000.000
+      status: 'ACTIVE',
+    };
+    const userOrder: PaymentOrder = {
+      ...baseOrder,
+      packType: 'MARKETPLACE',
+      listingId: userListing.id,
+      priceUsdc: 0,
+    };
+    // Komisi default 5% (HOSHI_MARKETPLACE_FEE_BPS=500) → payout 950.000.
+    const PAYOUT = 950_000;
+
+    it('MOCK: klaim SOLD + kredit saldo penjual (DB) TANPA on-chain (escrow tak dipanggil)', async () => {
+      const saved = {
+        SOLANA_CLUSTER: process.env.SOLANA_CLUSTER,
+        SOLANA_RPC_URL: process.env.SOLANA_RPC_URL,
+        COLLECTORCRYPT_GACHA_BASE_URL: process.env.COLLECTORCRYPT_GACHA_BASE_URL,
+      };
+      delete process.env.SOLANA_CLUSTER;
+      delete process.env.SOLANA_RPC_URL;
+      delete process.env.COLLECTORCRYPT_GACHA_BASE_URL;
+      configValues.CC_MOCK = '1';
+      prisma.paymentOrder.findUnique.mockResolvedValue(userOrder);
+      prisma.listing.findUnique.mockResolvedValue(userListing);
+
+      try {
+        const outcome = await service.handleCallback({
+          merchantOrderId: MERCHANT_ORDER_ID,
+        });
+
+        expect(outcome).toBe('FULFILLED');
+        expect(prisma.listing.updateMany).toHaveBeenCalledWith(
+          expect.objectContaining({
+            where: { id: userListing.id, status: 'ACTIVE' },
+            data: expect.objectContaining({ status: 'SOLD', buyerId: user.id }) as unknown,
+          }),
+        );
+        // Penjual dikredit payout (idempoten per merchantOrderId).
+        expect(balance.credit).toHaveBeenCalledWith({
+          userId: 'seller-9',
+          amountIdrx: PAYOUT,
+          reason: 'P2P_SALE',
+          refId: MERCHANT_ORDER_ID,
+        });
+        // MOCK = nol on-chain: escrow TIDAK dipanggil.
+        expect(escrow.transferCoreAssetTo).not.toHaveBeenCalled();
+      } finally {
+        for (const [k, v] of Object.entries(saved)) {
+          if (v === undefined) delete process.env[k];
+          else process.env[k] = v;
+        }
+      }
+    });
+
+    it('gerbang MATI (CC_MOCK off, HOSHI_P2P_ENABLED off) → REFUND_DUE, nol kredit & transfer', async () => {
+      prisma.paymentOrder.findUnique.mockResolvedValue(userOrder);
+      prisma.listing.findUnique.mockResolvedValue(userListing);
+
+      const outcome = await service.handleCallback({
+        merchantOrderId: MERCHANT_ORDER_ID,
+      });
+
+      expect(outcome).toBe('REFUND_DUE');
+      expect(balance.credit).not.toHaveBeenCalled();
+      expect(escrow.transferCoreAssetTo).not.toHaveBeenCalled();
+    });
+
+    it('ARMED real: escrow transfer kartu ke pembeli + kredit penjual → FULFILLED', async () => {
+      configValues.HOSHI_P2P_ENABLED = 'true'; // armed; CC_MOCK unset → mock=false
+      prisma.paymentOrder.findUnique.mockResolvedValue(userOrder);
+      prisma.listing.findUnique.mockResolvedValue(userListing);
+
+      const outcome = await service.handleCallback({
+        merchantOrderId: MERCHANT_ORDER_ID,
+      });
+
+      expect(outcome).toBe('FULFILLED');
+      expect(escrow.transferCoreAssetTo).toHaveBeenCalledWith({
+        assetAddress: userListing.ccNftAddress,
+        newOwner: user.walletAddress,
+      });
+      expect(balance.credit).toHaveBeenCalledWith(
+        expect.objectContaining({ userId: 'seller-9', amountIdrx: PAYOUT }),
+      );
+    });
+
+    it('ARMED real: kalah klaim konkurensi → REFUND_DUE, escrow & kredit tak dipanggil', async () => {
+      configValues.HOSHI_P2P_ENABLED = 'true';
+      prisma.paymentOrder.findUnique.mockResolvedValue(userOrder);
+      prisma.listing.findUnique.mockResolvedValue(userListing);
+      prisma.listing.updateMany.mockResolvedValue({ count: 0 });
+
+      const outcome = await service.handleCallback({
+        merchantOrderId: MERCHANT_ORDER_ID,
+      });
+
+      expect(outcome).toBe('REFUND_DUE');
+      expect(escrow.transferCoreAssetTo).not.toHaveBeenCalled();
+      expect(balance.credit).not.toHaveBeenCalled();
     });
   });
 

@@ -60,6 +60,12 @@ model User {
   email         String?
   passwordHash  String?
 
+  /// Saldo in-app (Rupiah, base unit = rupiah utuh) hasil penjualan P2P — dikreditkan saat
+  /// kartu user terjual (Flow B). BigInt untuk menghindari overflow uang. Kebenarannya dijaga
+  /// bareng ledger `BalanceEntry` (increment field + insert entry dalam satu transaksi).
+  /// Penarikan (withdraw) = fitur terpisah, belum ada di fase ini.
+  balanceIdrx   BigInt  @default(0)
+
   // Profil publik opsional (halaman profil). Semua nullable: null = belum diisi.
   bio              String?
   twitter          String? // handle tanpa "@" — di-strip di DTO
@@ -91,6 +97,9 @@ model User {
   // Order pembayaran rupiah lewat IDRX (buku besar on-ramp).
   paymentOrders PaymentOrder[]
 
+  // Mutasi saldo in-app (ledger append-only; audit tiap kredit/debit).
+  balanceEntries BalanceEntry[]
+
   // Alamat pengiriman kartu fisik (redeem). Maks 5 per user (ditegakkan di service).
   shippingAddresses ShippingAddress[]
 
@@ -102,6 +111,33 @@ model User {
   marketThreadsAsSeller MarketThread[] @relation("MarketThreadSeller")
 
   @@map("users")
+}
+
+/// Ledger mutasi saldo in-app (append-only, tidak pernah di-update/hapus). Tiap kredit/debit
+/// `User.balanceIdrx` menulis satu baris di sini DALAM transaksi yang sama → saldo & riwayat
+/// tidak mungkin menyimpang. `refId` = kunci idempotensi (mis. merchantOrderId penjualan) supaya
+/// callback/reconciler yang diulang tidak menggandakan kredit; `@@unique([reason, refId])`.
+model BalanceEntry {
+  id String @id @default(cuid())
+
+  userId String
+  // Restrict: baris ledger uang tidak boleh yatim gara-gara user dihapus.
+  user   User   @relation(fields: [userId], references: [id], onDelete: Restrict)
+
+  /// Delta saldo (rupiah utuh). Positif = kredit (mis. hasil jual), negatif = debit.
+  deltaIdrx BigInt
+
+  /// Kenapa saldo berubah (mis. "P2P_SALE"). Bebas, tapi konsisten per sumber.
+  reason String
+
+  /// Kunci idempotensi opsional (mis. merchantOrderId). Kombinasi (reason, refId) unik.
+  refId String?
+
+  createdAt DateTime @default(now())
+
+  @@unique([reason, refId])
+  @@index([userId])
+  @@map("balance_entries")
 }
 
 /// Alamat pengiriman kartu fisik milik user (untuk redeem). Cascade: alamat tidak

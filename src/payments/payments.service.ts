@@ -8,7 +8,7 @@ import {
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { ListingStatus, PaymentStatus } from '@prisma/client';
-import type { PaymentOrder } from '@prisma/client';
+import type { Listing, PaymentOrder } from '@prisma/client';
 import { detectProductionSignal } from '../common/demo-mode';
 import { PublicKey } from '@solana/web3.js';
 import type { AuthUser } from '../auth/jwt.strategy';
@@ -21,6 +21,8 @@ import {
   ResellerSettlementService,
   type ResellerSettleResult,
 } from '../collectorcrypt/reseller-settlement.service';
+import { EscrowService } from '../escrow/escrow.service';
+import { BalanceService } from '../balance/balance.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { CreatePackOrderDto } from './dto/create-pack-order.dto';
 import { IdrxClient } from './idrx.client';
@@ -196,6 +198,8 @@ export class PaymentsService {
     private readonly gacha: GachaService,
     private readonly config: ConfigService,
     private readonly resellerSettlement: ResellerSettlementService,
+    private readonly escrow: EscrowService,
+    private readonly balance: BalanceService,
   ) {}
 
   /* ─────────────────────────── Bikin order ─────────────────────────── */
@@ -335,8 +339,11 @@ export class PaymentsService {
     const treasuryAddress = this.treasuryAddressOrRefuse();
     await this.assertOrderQuota(user.id);
 
-    // 0. Listing WAJIB kartu katalog CC yang masih dijual: source=COLLECTORCRYPT, TANPA penjual
-    //    user (sellerId null = mirror katalog, bukan kartu user), ACTIVE, punya alamat on-chain.
+    // 0. Listing harus ACTIVE. DUA jenis yang boleh dibeli lewat rail Rupiah ini:
+    //    • KATALOG CC (reseller): source COLLECTORCRYPT, TANPA penjual user, ada alamat CC +
+    //      harga USD → treasury yang beli di CC, butuh snapshot biaya + plafon.
+    //    • listing USER (P2P Flow B): sellerId ter-set (kartu milik user lain) → Hoshi TIDAK
+    //      beli apa-apa (escrow yang kirim + penjual dikredit saldo), tak ada leg/plafon USDC.
     const listing = await this.prisma.listing.findUnique({
       where: { id: listingId },
     });
@@ -345,51 +352,52 @@ export class PaymentsService {
         'Listing tidak ditemukan atau sudah tidak dijual.',
       );
     }
-    if (
-      listing.source !== 'COLLECTORCRYPT' ||
-      listing.sellerId != null ||
-      !listing.ccNftAddress ||
-      listing.ccPriceUsd == null
-    ) {
+    const isUserListing = listing.sellerId != null;
+    if (isUserListing && listing.sellerId === user.id) {
       throw new BadRequestException(
-        'Kartu ini bukan produk katalog CollectorCrypt — belum bisa dibeli lewat jalur ini.',
+        'Tidak bisa membeli kartu yang Anda jual sendiri.',
+      );
+    }
+    const isCcCatalog =
+      listing.source === 'COLLECTORCRYPT' &&
+      listing.sellerId == null &&
+      !!listing.ccNftAddress &&
+      listing.ccPriceUsd != null;
+    if (!isUserListing && !isCcCatalog) {
+      throw new BadRequestException(
+        'Kartu ini belum bisa dibeli lewat jalur ini.',
       );
     }
 
-    // 1. Biaya CC (USDC base unit) di-snapshot dari harga dolar terakhir yang tersimpan. Ini
-    //    PLAFON saat treasury menebus: kalau harga live CC naik melewati ini, fulfilment tolak
-    //    (refund) alih-alih diam-diam menggerus treasury — persis semantik snapshot pack gacha.
-    const priceUsdc = Math.round(listing.ccPriceUsd * 1_000_000);
-    if (!Number.isSafeInteger(priceUsdc) || priceUsdc <= 0) {
-      this.logger.error(
-        `Harga CC listing ${listingId} tidak masuk akal: ccPriceUsd=${listing.ccPriceUsd}. Order ditolak.`,
-      );
-      throw new ServiceUnavailableException(
-        'Harga kartu dari CollectorCrypt sedang tidak wajar. Coba lagi nanti.',
+    // Jalur RESELLER: snapshot biaya CC sbg plafon tebus + tolak jual-rugi + cek plafon treasury.
+    // Jalur USER: priceUsdc = 0 (tak ada USDC bergerak; field non-null jadi tetap 0).
+    let priceUsdc = 0;
+    if (isCcCatalog) {
+      const ccPriceUsd = listing.ccPriceUsd as number;
+      priceUsdc = Math.round(ccPriceUsd * 1_000_000);
+      if (!Number.isSafeInteger(priceUsdc) || priceUsdc <= 0) {
+        this.logger.error(
+          `Harga CC listing ${listingId} tidak masuk akal: ccPriceUsd=${ccPriceUsd}. Order ditolak.`,
+        );
+        throw new ServiceUnavailableException(
+          'Harga kartu dari CollectorCrypt sedang tidak wajar. Coba lagi nanti.',
+        );
+      }
+      const usdIdrRate = this.intConfig('HOSHI_USD_IDR_RATE', 16_000, 1);
+      const ccCostIdr = Math.ceil(ccPriceUsd * usdIdrRate);
+      if (listing.priceIdrx < ccCostIdr) {
+        this.logger.error(
+          `Listing ${listingId} priceIdrx ${listing.priceIdrx} < biaya CC ${ccCostIdr} IDR — jual rugi, order ditolak.`,
+        );
+        throw new ServiceUnavailableException(
+          'Harga kartu ini sedang tidak wajar. Coba lagi nanti.',
+        );
+      }
+      await this.assertTreasuryCapacity(
+        priceUsdc,
+        this.intConfig('HOSHI_CC_MAX_CARD_PRICE_USDC', 5_000_000_000, 1),
       );
     }
-
-    // 2. Harga KITA (priceIdrx = yang harus DITERIMA treasury, sudah termasuk margin) wajib
-    //    menutup biaya CC dalam rupiah. Kalau admin menyetel di bawah modal → tolak, jangan
-    //    jual rugi. Kurs pembanding sama dengan yang dipakai market-sync (HOSHI_USD_IDR_RATE).
-    const usdIdrRate = this.intConfig('HOSHI_USD_IDR_RATE', 16_000, 1);
-    const ccCostIdr = Math.ceil(listing.ccPriceUsd * usdIdrRate);
-    if (listing.priceIdrx < ccCostIdr) {
-      this.logger.error(
-        `Listing ${listingId} priceIdrx ${listing.priceIdrx} < biaya CC ${ccCostIdr} IDR — jual rugi, order ditolak.`,
-      );
-      throw new ServiceUnavailableException(
-        'Harga kartu ini sedang tidak wajar. Coba lagi nanti.',
-      );
-    }
-
-    // 3. Treasury akan membelanjakan ~priceUsdc → plafon HARIAN + preflight saldo SAMA dengan
-    //    gacha, tapi plafon PER-ITEM pakai batas per-kartu tersendiri (bukan plafon pack $100
-    //    gacha, yang akan menolak hampir semua kartu graded CC di depan).
-    await this.assertTreasuryCapacity(
-      priceUsdc,
-      this.intConfig('HOSHI_CC_MAX_CARD_PRICE_USDC', 5_000_000_000, 1),
-    );
 
     // 4. Pembeli bayar HARGA KITA + fee QRIS di atasnya (treasury tetap menerima priceIdrx).
     const priceIdr = applyBps(listing.priceIdrx, BPS_DENOMINATOR + QRIS_FEE_BPS);
@@ -718,6 +726,12 @@ export class PaymentsService {
       );
     }
 
+    // Order untuk listing USER (P2P Flow B) → settlement BEDA: escrow kirim kartu ke pembeli +
+    // kredit saldo penjual. BUKAN beli-di-CC. Dicek SEBELUM gerbang reseller CC.
+    if (listing.sellerId != null) {
+      return this.fulfilUserListing(order, listing, user);
+    }
+
     const mock = this.ccMockEnabled();
     const armed =
       (this.config.get<string>('HOSHI_CC_RESELL_ENABLED') ?? '')
@@ -847,6 +861,141 @@ export class PaymentsService {
     this.logger.warn(
       `MOCK reseller: listing ${listing.id} (${listing.name}) "terkirim" ke user ${user.id} ` +
         `TANPA belanja treasury (order ${order.merchantOrderId} FULFILLED).`,
+    );
+    return 'FULFILLED';
+  }
+
+  /**
+   * Settlement jual-beli antar USER (P2P Flow B). Pembeli sudah bayar Rupiah (priceIdrx + fee
+   * QRIS) → treasury terima. Di sini: kirim kartu penjual (dari escrow) ke pembeli + kredit
+   * saldo penjual (priceIdrx − komisi). Hoshi TIDAK membeli apa pun (nol USDC/treasury).
+   *
+   * GANDA-GERBANG seperti reseller:
+   *   • MOCK (staging/devnet, CC_MOCK): simulasi — kredit saldo penjual (DB) + tandai SOLD, TANPA
+   *     on-chain (kartu tak benar-benar pindah). Cukup untuk menguji UX + payout.
+   *   • REAL tapi HOSHI_P2P_ENABLED MATI (default): TIDAK settle; refund manual.
+   *   • REAL + flag NYALA: escrow benar-benar transfer kartu ke pembeli, lalu kredit penjual.
+   */
+  private async fulfilUserListing(
+    order: PaymentOrder,
+    listing: Listing,
+    user: { id: string; walletAddress: string },
+  ): Promise<FulfilOutcome> {
+    const sellerId = listing.sellerId;
+    if (!sellerId) {
+      return this.failToRefund(
+        order,
+        `Listing ${listing.id} tak punya penjual — order tidak bisa diselesaikan.`,
+      );
+    }
+
+    const mock = this.ccMockEnabled();
+    const armed =
+      (this.config.get<string>('HOSHI_P2P_ENABLED') ?? '')
+        .trim()
+        .toLowerCase() === 'true';
+    if (!mock && !armed) {
+      return this.failToRefund(
+        order,
+        'Jual-beli antar user belum diaktifkan (HOSHI_P2P_ENABLED=false) — pembayaran perlu di-refund manual.',
+      );
+    }
+
+    // Komisi Hoshi diambil dari sisi PENJUAL (pembeli sudah bayar priceIdrx + fee QRIS).
+    const feeBps = this.intConfig('HOSHI_MARKETPLACE_FEE_BPS', 500, 0);
+    const commission = Math.floor((listing.priceIdrx * feeBps) / BPS_DENOMINATOR);
+    const payout = listing.priceIdrx - commission;
+
+    // GERBANG KONKURENSI: klaim ACTIVE→SOLD DULU (dua order satu kartu → satu menang).
+    const claimed = await this.prisma.listing.updateMany({
+      where: { id: listing.id, status: ListingStatus.ACTIVE },
+      data: { status: ListingStatus.SOLD, buyerId: user.id, soldAt: new Date() },
+    });
+    if (claimed.count !== 1) {
+      return this.failToRefund(
+        order,
+        `Listing ${listing.id} sudah terjual lebih dulu — refund manual (belum settle).`,
+      );
+    }
+
+    if (mock) {
+      // MOCK: nol on-chain. Kredit saldo penjual (DB — nyata, biar payout kelihatan di staging) +
+      // order FULFILLED. Kartu TIDAK benar-benar pindah (disimulasi).
+      if (payout > 0) {
+        await this.balance.credit({
+          userId: sellerId,
+          amountIdrx: payout,
+          reason: 'P2P_SALE',
+          refId: order.merchantOrderId,
+        });
+      }
+      await this.prisma.paymentOrder.update({
+        where: { merchantOrderId: order.merchantOrderId },
+        data: { status: PaymentStatus.FULFILLED, fulfilledAt: new Date(), error: null },
+      });
+      this.logger.warn(
+        `MOCK P2P: listing ${listing.id} (${listing.name}) "terjual" ke ${user.id}; penjual ` +
+          `${sellerId} dikredit Rp ${payout} (komisi Rp ${commission}) TANPA on-chain ` +
+          `(order ${order.merchantOrderId} FULFILLED).`,
+      );
+      return 'FULFILLED';
+    }
+
+    // REAL (armed): escrow benar-benar kirim kartu ke pembeli.
+    if (!listing.ccNftAddress) {
+      return this.failToRefund(
+        order,
+        `Listing ${listing.id} tak punya alamat NFT (escrow) — refund manual.`,
+      );
+    }
+    let transferSig: string;
+    try {
+      transferSig = await this.escrow.transferCoreAssetTo({
+        assetAddress: listing.ccNftAddress,
+        newOwner: user.walletAddress,
+      });
+    } catch (err) {
+      // Belum ada yang berpindah → balikin listing ke ACTIVE + refund pembeli.
+      await this.prisma.listing.updateMany({
+        where: { id: listing.id, status: ListingStatus.SOLD, buyerId: user.id },
+        data: { status: ListingStatus.ACTIVE, buyerId: null, soldAt: null },
+      });
+      return this.failToRefund(
+        order,
+        `Transfer kartu P2P gagal sebelum tuntas: ${errorMessage(err)} — refund manual.`,
+      );
+    }
+
+    // Kartu SUDAH terkirim ke pembeli. DARI SINI JANGAN refund/rollback. Kredit penjual (idempoten)
+    // + order FULFILLED; kalau gagal, log keras untuk diselesaikan manual (JANGAN refund).
+    try {
+      if (payout > 0) {
+        await this.balance.credit({
+          userId: sellerId,
+          amountIdrx: payout,
+          reason: 'P2P_SALE',
+          refId: order.merchantOrderId,
+        });
+      }
+      await this.prisma.paymentOrder.update({
+        where: { merchantOrderId: order.merchantOrderId },
+        data: {
+          status: PaymentStatus.FULFILLED,
+          fulfilledAt: new Date(),
+          txHash: transferSig,
+          error: null,
+        },
+      });
+    } catch (dbErr) {
+      this.logger.error(
+        `P2P: kartu ${listing.ccNftAddress} SUDAH terkirim ke pembeli (sig ${transferSig}) tapi ` +
+          `kredit/FULFILLED gagal: ${errorMessage(dbErr)}. Kredit penjual ${sellerId} Rp ${payout} ` +
+          'manual + set FULFILLED — JANGAN refund.',
+      );
+    }
+    this.logger.warn(
+      `REAL P2P: listing ${listing.id} (${listing.name}) terjual ke ${user.id}; penjual ${sellerId} ` +
+        `dikredit Rp ${payout} (komisi Rp ${commission}), transfer ${transferSig}.`,
     );
     return 'FULFILLED';
   }

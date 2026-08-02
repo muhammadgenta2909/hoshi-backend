@@ -19,6 +19,7 @@ import { AdminModule } from './admin/admin.module';
 import { CollectorCryptModule } from './collectorcrypt/collectorcrypt.module';
 import { PaymentsModule } from './payments/payments.module';
 import { SupportModule } from './support/support.module';
+import { BalanceModule } from './balance/balance.module';
 
 @Module({
   imports: [
@@ -39,6 +40,7 @@ import { SupportModule } from './support/support.module';
     CollectorCryptModule,
     PaymentsModule,
     SupportModule,
+    BalanceModule,
   ],
   controllers: [AppController],
   providers: [
