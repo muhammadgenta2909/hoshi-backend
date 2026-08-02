@@ -12,7 +12,10 @@ import {
   ResellerPostBuyError,
   ResellerSettlementService,
 } from '../collectorcrypt/reseller-settlement.service';
-import { EscrowService } from '../escrow/escrow.service';
+import {
+  EscrowService,
+  EscrowTransferIndeterminateError,
+} from '../escrow/escrow.service';
 import { BalanceService } from '../balance/balance.service';
 import type { CcMachineNormalized } from '../collectorcrypt/cc-gacha.types';
 import { PrismaService } from '../prisma/prisma.service';
@@ -881,6 +884,32 @@ describe('PaymentsService', () => {
       });
       expect(balance.credit).toHaveBeenCalledWith(
         expect.objectContaining({ userId: 'seller-9', amountIdrx: PAYOUT }),
+      );
+    });
+
+    it('ARMED real: transfer INDETERMINATE → REFUND_DUE "cek on-chain", listing TIDAK dibalikin, tak dikredit', async () => {
+      configValues.HOSHI_P2P_ENABLED = 'true';
+      prisma.paymentOrder.findUnique.mockResolvedValue(userOrder);
+      prisma.listing.findUnique.mockResolvedValue(userListing);
+      escrow.transferCoreAssetTo.mockRejectedValue(
+        new EscrowTransferIndeterminateError(
+          'confirm timeout',
+          userListing.ccNftAddress,
+          user.walletAddress,
+        ),
+      );
+
+      const outcome = await service.handleCallback({
+        merchantOrderId: MERCHANT_ORDER_ID,
+      });
+
+      expect(outcome).toBe('REFUND_DUE');
+      // Kartu mungkin sudah pindah → JANGAN kredit, JANGAN balikin listing ke ACTIVE.
+      expect(balance.credit).not.toHaveBeenCalled();
+      expect(prisma.listing.updateMany).not.toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ status: 'ACTIVE' }) as unknown,
+        }),
       );
     });
 

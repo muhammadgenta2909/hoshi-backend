@@ -24,6 +24,23 @@ const sleep = (ms: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, ms));
 
 /**
+ * Transfer SUDAH disiarkan (lolos cek kepemilikan) tapi konfirmasi gagal/timeout → kartu
+ * MUNGKIN sudah berpindah on-chain. Pemanggil WAJIB memperlakukan ini sebagai "mungkin
+ * terkirim": JANGAN refund/rollback, cek on-chain dulu. Beda dari Error biasa (pra-kirim,
+ * mis. escrow belum memiliki kartunya) yang aman untuk di-refund.
+ */
+export class EscrowTransferIndeterminateError extends Error {
+  constructor(
+    message: string,
+    readonly assetAddress: string,
+    readonly newOwner: string,
+  ) {
+    super(message);
+    this.name = 'EscrowTransferIndeterminateError';
+  }
+}
+
+/**
  * Wallet ESCROW Hoshi — pemegang sementara kartu USER yang sedang dijual (Flow B P2P).
  *
  * SENGAJA terpisah dari TreasuryService (yang megang USDC): kalau satu key bocor, yang lain
@@ -169,12 +186,27 @@ export class EscrowService {
       );
     }
 
-    const { signature } = await transferV1(umi, {
-      asset,
-      newOwner: newOwnerPk,
-      collection,
-    }).sendAndConfirm(umi);
-    return base58.deserialize(signature)[0];
+    // Sudah lolos cek kepemilikan → mulai KIRIM. Kegagalan di sini INDETERMINATE (tx bisa saja
+    // sudah landing) → sinyalkan supaya pemanggil TIDAK refund/rollback.
+    try {
+      const { signature } = await transferV1(umi, {
+        asset,
+        newOwner: newOwnerPk,
+        collection,
+      }).sendAndConfirm(umi);
+      return base58.deserialize(signature)[0];
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.logger.error(
+        `Escrow KRITIS: transfer ${params.assetAddress} → ${params.newOwner} GAGAL/INDETERMINATE: ` +
+          `${msg}. Kartu MUNGKIN sudah pindah — CEK ON-CHAIN sebelum refund/kredit ulang.`,
+      );
+      throw new EscrowTransferIndeterminateError(
+        msg,
+        params.assetAddress,
+        params.newOwner,
+      );
+    }
   }
 
   /* --- internal --- */

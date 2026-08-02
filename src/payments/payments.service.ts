@@ -21,7 +21,10 @@ import {
   ResellerSettlementService,
   type ResellerSettleResult,
 } from '../collectorcrypt/reseller-settlement.service';
-import { EscrowService } from '../escrow/escrow.service';
+import {
+  EscrowService,
+  EscrowTransferIndeterminateError,
+} from '../escrow/escrow.service';
 import { BalanceService } from '../balance/balance.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { CreatePackOrderDto } from './dto/create-pack-order.dto';
@@ -901,8 +904,12 @@ export class PaymentsService {
       );
     }
 
-    // Komisi Hoshi diambil dari sisi PENJUAL (pembeli sudah bayar priceIdrx + fee QRIS).
-    const feeBps = this.intConfig('HOSHI_MARKETPLACE_FEE_BPS', 500, 0);
+    // Komisi Hoshi diambil dari sisi PENJUAL (pembeli sudah bayar priceIdrx + fee QRIS). Clamp
+    // 0..100% supaya salah setting env tidak bikin payout NEGATIF (penjual malah "berutang").
+    const feeBps = Math.min(
+      this.intConfig('HOSHI_MARKETPLACE_FEE_BPS', 500, 0),
+      BPS_DENOMINATOR,
+    );
     const commission = Math.floor((listing.priceIdrx * feeBps) / BPS_DENOMINATOR);
     const payout = listing.priceIdrx - commission;
 
@@ -955,14 +962,24 @@ export class PaymentsService {
         newOwner: user.walletAddress,
       });
     } catch (err) {
-      // Belum ada yang berpindah → balikin listing ke ACTIVE + refund pembeli.
+      if (err instanceof EscrowTransferIndeterminateError) {
+        // Kartu MUNGKIN sudah pindah ke pembeli (kirim lolos, confirm gagal). JANGAN refund,
+        // JANGAN balikin listing → cek on-chain + kredit penjual manual bila kartu sudah pindah.
+        return this.failToRefund(
+          order,
+          `Kartu P2P ${listing.ccNftAddress} MUNGKIN sudah terkirim ke pembeli tapi konfirmasi ` +
+            `gagal. CEK ON-CHAIN (owner kartu) — JANGAN refund; kredit penjual ${sellerId} manual ` +
+            `bila kartu sudah pindah. (${err.message})`,
+        );
+      }
+      // Pra-kirim (mis. escrow belum memiliki kartunya) → belum ada yang pindah → rollback + refund.
       await this.prisma.listing.updateMany({
         where: { id: listing.id, status: ListingStatus.SOLD, buyerId: user.id },
         data: { status: ListingStatus.ACTIVE, buyerId: null, soldAt: null },
       });
       return this.failToRefund(
         order,
-        `Transfer kartu P2P gagal sebelum tuntas: ${errorMessage(err)} — refund manual.`,
+        `Transfer kartu P2P gagal sebelum terkirim: ${errorMessage(err)} — refund manual.`,
       );
     }
 
