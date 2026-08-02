@@ -49,6 +49,7 @@ describe('PaymentsService', () => {
     paymentOrder: {
       create: jest.Mock;
       findUnique: jest.Mock;
+      findFirst: jest.Mock;
       findMany: jest.Mock;
       updateMany: jest.Mock;
       update: jest.Mock;
@@ -267,6 +268,8 @@ describe('PaymentsService', () => {
       paymentOrder: {
         create: jest.fn().mockResolvedValue(baseOrder),
         findUnique: jest.fn().mockResolvedValue(baseOrder),
+        // Default: belum ada order PENDING untuk (user, listing) → createListingOrder bikin baru.
+        findFirst: jest.fn().mockResolvedValue(null),
         findMany: jest.fn().mockResolvedValue([]),
         // Default: request ini MEMENANGKAN klaim atomik PENDING/PAID → FULFILLING.
         updateMany: jest.fn().mockResolvedValue({ count: 1 }),
@@ -558,6 +561,21 @@ describe('PaymentsService', () => {
           }) as unknown,
         }),
       );
+    });
+
+    it('IDEMPOTEN: spam beli → order PENDING yang sama dikembalikan, tak bikin order/mint baru', async () => {
+      prisma.listing.findUnique.mockResolvedValue(catalogListing);
+      prisma.paymentOrder.findFirst.mockResolvedValue({
+        ...baseOrder,
+        listingId: catalogListing.id,
+        status: PaymentStatus.PENDING,
+      });
+
+      await service.createListingOrder(catalogListing.id, user);
+
+      // Order lama dipakai ulang: tidak ada mint IDRX baru, tidak ada baris order baru.
+      expect(idrx.mintRequest).not.toHaveBeenCalled();
+      expect(prisma.paymentOrder.create).not.toHaveBeenCalled();
     });
 
     it('menolak beli listing SENDIRI (sellerId === pembeli) tanpa mintRequest', async () => {

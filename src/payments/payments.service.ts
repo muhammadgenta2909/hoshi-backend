@@ -340,7 +340,6 @@ export class PaymentsService {
     user: AuthUser,
   ): Promise<PaymentOrderDto> {
     const treasuryAddress = this.treasuryAddressOrRefuse();
-    await this.assertOrderQuota(user.id);
 
     // 0. Listing harus ACTIVE. DUA jenis yang boleh dibeli lewat rail Rupiah ini:
     //    • KATALOG CC (reseller): source COLLECTORCRYPT, TANPA penjual user, ada alamat CC +
@@ -371,6 +370,26 @@ export class PaymentsService {
         'Kartu ini belum bisa dibeli lewat jalur ini.',
       );
     }
+
+    // IDEMPOTEN per (user, listing): kalau user sudah punya order PENDING belum kedaluwarsa untuk
+    // listing INI, kembalikan yang itu — spam klik "Beli via Rupiah" jadi TIDAK menumpuk order
+    // yatim, tidak boros mint-request IDRX, dan tidak kena kuota gara-gara kartu yang sama.
+    const existingPending = await this.prisma.paymentOrder.findFirst({
+      where: {
+        userId: user.id,
+        listingId: listing.id,
+        status: PaymentStatus.PENDING,
+        expiresAt: { gt: new Date() },
+      },
+      orderBy: { createdAt: 'desc' },
+    });
+    if (existingPending) {
+      return toPaymentOrderDto(existingPending);
+    }
+
+    // Kuota order per-user (PENDING) — hanya ditegakkan saat benar-benar MEMBUAT order baru.
+    // Ini plafon anti-spam/DDoS di sisi identitas (throttle per-IP jadi lapis kedua).
+    await this.assertOrderQuota(user.id);
 
     // Jalur RESELLER: snapshot biaya CC sbg plafon tebus + tolak jual-rugi + cek plafon treasury.
     // Jalur USER: priceUsdc = 0 (tak ada USDC bergerak; field non-null jadi tetap 0).
