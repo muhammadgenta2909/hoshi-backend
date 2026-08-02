@@ -913,7 +913,51 @@ export class PaymentsService {
     const commission = Math.floor((listing.priceIdrx * feeBps) / BPS_DENOMINATOR);
     const payout = listing.priceIdrx - commission;
 
-    // GERBANG KONKURENSI: klaim ACTIVE→SOLD DULU (dua order satu kartu → satu menang).
+    if (mock) {
+      // MOCK: klaim ACTIVE→SOLD + kredit penjual (DB, nyata biar payout kelihatan) + order
+      // FULFILLED — ALL-OR-NOTHING dalam SATU transaksi (parity dgn reseller MOCK): crash di
+      // tengah rollback bersih, order tetap bisa maju via klaim ulang, bukan half-state. NOL
+      // on-chain (kartu tak benar-benar pindah).
+      let claimedMock = false;
+      await this.prisma.$transaction(async (tx) => {
+        const c = await tx.listing.updateMany({
+          where: { id: listing.id, status: ListingStatus.ACTIVE },
+          data: { status: ListingStatus.SOLD, buyerId: user.id, soldAt: new Date() },
+        });
+        if (c.count !== 1) return; // kalah klaim → claimedMock tetap false → tak kredit/FULFILLED
+        if (payout > 0) {
+          await this.balance.credit(
+            {
+              userId: sellerId,
+              amountIdrx: payout,
+              reason: 'P2P_SALE',
+              refId: order.merchantOrderId,
+            },
+            tx,
+          );
+        }
+        await tx.paymentOrder.update({
+          where: { merchantOrderId: order.merchantOrderId },
+          data: { status: PaymentStatus.FULFILLED, fulfilledAt: new Date(), error: null },
+        });
+        claimedMock = true;
+      });
+      if (!claimedMock) {
+        return this.failToRefund(
+          order,
+          `Listing ${listing.id} sudah terjual lebih dulu — refund manual (belum settle).`,
+        );
+      }
+      this.logger.warn(
+        `MOCK P2P: listing ${listing.id} (${listing.name}) "terjual" ke ${user.id}; penjual ` +
+          `${sellerId} dikredit Rp ${payout} (komisi Rp ${commission}) TANPA on-chain ` +
+          `(order ${order.merchantOrderId} FULFILLED).`,
+      );
+      return 'FULFILLED';
+    }
+
+    // REAL (armed): klaim ACTIVE→SOLD DULU (gerbang konkurensi) SEBELUM transfer on-chain — dua
+    // order satu kartu → satu menang; kalah klaim → refund tanpa transfer.
     const claimed = await this.prisma.listing.updateMany({
       where: { id: listing.id, status: ListingStatus.ACTIVE },
       data: { status: ListingStatus.SOLD, buyerId: user.id, soldAt: new Date() },
@@ -924,30 +968,6 @@ export class PaymentsService {
         `Listing ${listing.id} sudah terjual lebih dulu — refund manual (belum settle).`,
       );
     }
-
-    if (mock) {
-      // MOCK: nol on-chain. Kredit saldo penjual (DB — nyata, biar payout kelihatan di staging) +
-      // order FULFILLED. Kartu TIDAK benar-benar pindah (disimulasi).
-      if (payout > 0) {
-        await this.balance.credit({
-          userId: sellerId,
-          amountIdrx: payout,
-          reason: 'P2P_SALE',
-          refId: order.merchantOrderId,
-        });
-      }
-      await this.prisma.paymentOrder.update({
-        where: { merchantOrderId: order.merchantOrderId },
-        data: { status: PaymentStatus.FULFILLED, fulfilledAt: new Date(), error: null },
-      });
-      this.logger.warn(
-        `MOCK P2P: listing ${listing.id} (${listing.name}) "terjual" ke ${user.id}; penjual ` +
-          `${sellerId} dikredit Rp ${payout} (komisi Rp ${commission}) TANPA on-chain ` +
-          `(order ${order.merchantOrderId} FULFILLED).`,
-      );
-      return 'FULFILLED';
-    }
-
     // REAL (armed): escrow benar-benar kirim kartu ke pembeli.
     if (!listing.ccNftAddress) {
       return this.failToRefund(

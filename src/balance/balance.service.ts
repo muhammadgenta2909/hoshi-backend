@@ -37,35 +37,47 @@ export class BalanceService {
    *
    * @param amountIdrx rupiah utuh, HARUS > 0.
    */
-  async credit(params: {
-    userId: string;
-    amountIdrx: number;
-    reason: string;
-    refId?: string | null;
-  }): Promise<{ credited: boolean }> {
+  async credit(
+    params: {
+      userId: string;
+      amountIdrx: number;
+      reason: string;
+      refId?: string | null;
+    },
+    tx?: Prisma.TransactionClient,
+  ): Promise<{ credited: boolean }> {
     if (!Number.isInteger(params.amountIdrx) || params.amountIdrx <= 0) {
       throw new Error(
         `Jumlah kredit saldo tidak sah: ${params.amountIdrx} (harus integer > 0).`,
       );
     }
     const delta = BigInt(params.amountIdrx);
-    try {
-      await this.prisma.$transaction(async (tx) => {
-        // Ledger DULU: unique (reason, refId) = gerbang idempotensi. Kalau baris kembar,
-        // create ini melempar P2002 → seluruh transaksi rollback → saldo TIDAK di-increment.
-        await tx.balanceEntry.create({
-          data: {
-            userId: params.userId,
-            deltaIdrx: delta,
-            reason: params.reason,
-            refId: params.refId ?? null,
-          },
-        });
-        await tx.user.update({
-          where: { id: params.userId },
-          data: { balanceIdrx: { increment: delta } },
-        });
+    // Ledger DULU: unique (reason, refId) = gerbang idempotensi. Baris kembar → P2002 →
+    // transaksi rollback → saldo TIDAK di-increment.
+    const writes = async (client: Prisma.TransactionClient) => {
+      await client.balanceEntry.create({
+        data: {
+          userId: params.userId,
+          deltaIdrx: delta,
+          reason: params.reason,
+          refId: params.refId ?? null,
+        },
       });
+      await client.user.update({
+        where: { id: params.userId },
+        data: { balanceIdrx: { increment: delta } },
+      });
+    };
+
+    // Dipanggil DALAM transaksi pemanggil (mis. settlement atomik) → jalankan di tx itu; P2002
+    // akan meng-abort transaksi LUAR (rollback aman, tak dobel-kredit), jadi tidak ditelan di sini.
+    if (tx) {
+      await writes(tx);
+      return { credited: true };
+    }
+
+    try {
+      await this.prisma.$transaction(writes);
       return { credited: true };
     } catch (err) {
       if (

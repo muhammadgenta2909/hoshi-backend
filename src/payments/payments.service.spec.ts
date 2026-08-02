@@ -838,13 +838,16 @@ describe('PaymentsService', () => {
             data: expect.objectContaining({ status: 'SOLD', buyerId: user.id }) as unknown,
           }),
         );
-        // Penjual dikredit payout (idempoten per merchantOrderId).
-        expect(balance.credit).toHaveBeenCalledWith({
-          userId: 'seller-9',
-          amountIdrx: PAYOUT,
-          reason: 'P2P_SALE',
-          refId: MERCHANT_ORDER_ID,
-        });
+        // Penjual dikredit payout (idempoten per merchantOrderId), DALAM transaksi atomik (arg tx).
+        expect(balance.credit).toHaveBeenCalledWith(
+          expect.objectContaining({
+            userId: 'seller-9',
+            amountIdrx: PAYOUT,
+            reason: 'P2P_SALE',
+            refId: MERCHANT_ORDER_ID,
+          }),
+          expect.anything(),
+        );
         // MOCK = nol on-chain: escrow TIDAK dipanggil.
         expect(escrow.transferCoreAssetTo).not.toHaveBeenCalled();
       } finally {
