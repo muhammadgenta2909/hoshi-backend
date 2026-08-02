@@ -405,11 +405,18 @@ export class PaymentsService {
       DEFAULT_EXPIRY_MINUTES,
       1,
     );
+    // Order MARKETPLACE balik ke VAULT (bukan /open-packs) — konteksnya BELI KARTU, bukan buka
+    // pack: nav "Vault" aktif + kartu langsung tampak di koleksi. Origin diambil dari
+    // HOSHI_PAYMENT_RETURN_URL (yang untuk pack menunjuk /open-packs).
+    const listingReturnUrl = new URL(
+      '/vault',
+      this.requiredConfig('HOSHI_PAYMENT_RETURN_URL'),
+    ).toString();
     const mint = await this.idrx.mintRequest({
       toBeMinted: String(priceIdr),
       destinationWalletAddress: treasuryAddress,
       networkChainId: this.requiredConfig('IDRX_NETWORK_CHAIN_ID'),
-      returnUrl: this.requiredConfig('HOSHI_PAYMENT_RETURN_URL'),
+      returnUrl: listingReturnUrl,
       expiryPeriod: expiryMinutes,
       productDetails: `Hoshi CC ${listing.name}`.slice(0, 255),
       // HOSTED (paymentMethod/channelId dikosongkan) → halaman Duitku penuh (QRIS+e-wallet+VA).
