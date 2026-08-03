@@ -36,6 +36,10 @@ enum NftStatus {
 
 // Status sebuah listing di marketplace sekunder.
 enum ListingStatus {
+  // Real P2P (Flow B armed): listing sudah dibuat tapi kartu penjual BELUM masuk escrow
+  // → belum bisa dibeli. Flip ke ACTIVE setelah transfer→escrow dikonfirmasi. Di jalur
+  // mock/unarmed, listing langsung ACTIVE (status ini tak pernah dipakai).
+  PENDING_ESCROW
   ACTIVE // dipajang & bisa dibeli
   SOLD // sudah terjual (buyer ter-set)
   CANCELLED // ditarik penjual
@@ -354,6 +358,13 @@ model Listing {
   soldAt    DateTime?
   createdAt DateTime  @default(now())
   updatedAt DateTime  @updatedAt
+
+  // Real P2P (Flow B): di-set saat submitEscrow memastikan kartu benar-benar dititip di wallet
+  // escrow (PENDING_ESCROW → ACTIVE). FAKTA yang tak berubah oleh flag: menandakan escrow MEMANG
+  // memegang kartu ini, apa pun nilai HOSHI_P2P_ENABLED/CC_MOCK saat cancel/beli terjadi. Null =
+  // kartu tak pernah masuk escrow (listing mock/unarmed, atau PENDING_ESCROW yang belum ditandatangani).
+  // Cancel mengembalikan kartu HANYA jika ini ter-set; buy/acceptOffer demo menolak listing ber-escrow.
+  escrowedAt DateTime?
 
   @@index([status])
   @@index([sellerId])

@@ -7,6 +7,7 @@ import {
   NotFoundException,
   UnprocessableEntityException,
 } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import {
   ActivityType,
   CcPackStatus,
@@ -27,7 +28,9 @@ import { QueryActivityDto } from './dto/query-activity.dto';
 import { QueryListingDto, SortKey } from './dto/query-listing.dto';
 import { RelistListingDto } from './dto/relist-listing.dto';
 import { UpdateListingDto } from './dto/update-listing.dto';
-import { assertDemoOnly } from '../common/demo-mode';
+import { SubmitEscrowDto } from './dto/submit-escrow.dto';
+import { assertDemoOnly, detectProductionSignal } from '../common/demo-mode';
+import { EscrowService } from '../escrow/escrow.service';
 import {
   ActivityDto,
   displayLabel,
@@ -117,7 +120,43 @@ export class MarketplaceService {
     private readonly prisma: PrismaService,
     private readonly nft: NftService,
     private readonly ccFacts: CcCardFactsService,
+    private readonly config: ConfigService,
+    private readonly escrow: EscrowService,
   ) {}
+
+  /**
+   * MOCK CC aktif: staging/devnet + CC_MOCK=1 + bukan sinyal produksi. HARUS identik dengan
+   * PaymentsService.ccMockEnabled agar listing & settlement sepakat soal mock vs real.
+   */
+  private ccMockEnabled(): boolean {
+    return (
+      this.config.get<string>('CC_MOCK') === '1' &&
+      detectProductionSignal() === null
+    );
+  }
+
+  /**
+   * P2P real menyala: bukan mock DAN HOSHI_P2P_ENABLED=true. HARUS identik dengan cabang REAL
+   * di PaymentsService.fulfilUserListing — kalau settlement akan benar-benar men-transfer kartu
+   * dari escrow (real+armed), maka listing WAJIB menaruh kartu di escrow dulu; selain itu langsung
+   * ACTIVE (mock men-simulasi, unarmed di-refund manual → tak ada transfer nyata yang perlu escrow).
+   */
+  private p2pRealArmed(): boolean {
+    const armed =
+      (this.config.get<string>('HOSHI_P2P_ENABLED') ?? '')
+        .trim()
+        .toLowerCase() === 'true';
+    return !this.ccMockEnabled() && armed;
+  }
+
+  /**
+   * Apakah listing INI perlu langkah escrow saat dipajang. Hanya untuk kartu USER yang mewakili
+   * aset on-chain nyata (ccNftAddress ada) DAN saat P2P real armed. Kartu HOSHI ketikan biasa
+   * (tanpa ccNftAddress) atau mode mock/unarmed → tidak perlu escrow (langsung ACTIVE).
+   */
+  private listingNeedsEscrow(ccNftAddress: string | null | undefined): boolean {
+    return !!ccNftAddress && this.p2pRealArmed();
+  }
 
   /** Listing ACTIVE + filter + sort. Bentuk cocok dgn lib/market.ts frontend. */
   async list(query: QueryListingDto): Promise<ListingDto[]> {
@@ -379,6 +418,13 @@ export class MarketplaceService {
       where: { id: listingId },
     });
     if (!existing) throw new NotFoundException('Listing tidak ditemukan.');
+    // Escrow-backed (real P2P) → jangan settle lewat demo instant-mint (mint duplikat + kartu escrow
+    // tertelantar + penjual tak dibayar). Sama seperti buy(): pakai FAKTA escrowedAt, bukan flag.
+    if (existing.escrowedAt) {
+      throw new BadRequestException(
+        'Kartu ini dijual lewat pembayaran Rupiah — tidak bisa lewat offer/accept jalur demo ini.',
+      );
+    }
 
     // Snapshot pra-jual untuk kompensasi kalau mint gagal (lihat buy()).
     const prev = {
@@ -634,15 +680,22 @@ export class MarketplaceService {
         // ke CC. Sekaligus memperbaiki baris lama yang dulu tersimpan dengan
         // grade default form ("PSA 10").
         ccAttrs = await this.ccListingAttrs(pack);
+        // Real P2P armed → kartu harus masuk escrow dulu; listing menunggu (PENDING_ESCROW)
+        // sampai penjual menandatangani transfer→escrow. Mock/unarmed → langsung ACTIVE.
+        const pendingEscrow = this.listingNeedsEscrow(pack.nftAddress);
         const relisted = await this.prisma.listing.update({
           where: { id: existing.id },
           data: {
-            status: ListingStatus.ACTIVE,
+            status: pendingEscrow
+              ? ListingStatus.PENDING_ESCROW
+              : ListingStatus.ACTIVE,
             priceIdrx: dto.price,
             expectedValueIdrx: dto.expectedValue,
             buybackIdrx: dto.buyback ?? 0,
             buyerId: null,
             soldAt: null,
+            // Kartu ada di wallet penjual saat re-list (bukan escrow) → reset penanda escrow lama.
+            escrowedAt: null,
             // Relist = kesempatan memperbaiki baris lama. Kalau listing ini dulu
             // dibuat dengan grade default form ("PSA 10"), pajang ulang menimpanya
             // dengan grade yang benar-benar dikatakan CC.
@@ -650,15 +703,20 @@ export class MarketplaceService {
           },
           include: { nft: true },
         });
-        await this.recordActivity({
-          type: ActivityType.LISTED_CARD,
-          listing: relisted,
-          amount: relisted.priceIdrx,
-          fromId: user.id,
-          fromLabel: displayLabel(user, shortWallet(user.walletAddress)),
-          toId: null,
-          toLabel: null,
-        });
+        // Feed "LISTED_CARD" hanya saat benar-benar terpajang (ACTIVE). Untuk PENDING_ESCROW,
+        // aktivitas dicatat nanti di submitEscrow — hindari mengumumkan listing yang bisa saja
+        // batal karena penjual tak jadi menandatangani.
+        if (!pendingEscrow) {
+          await this.recordActivity({
+            type: ActivityType.LISTED_CARD,
+            listing: relisted,
+            amount: relisted.priceIdrx,
+            fromId: user.id,
+            fromLabel: displayLabel(user, shortWallet(user.walletAddress)),
+            toId: null,
+            toLabel: null,
+          });
+        }
         return toListingDto(relisted);
       }
 
@@ -682,8 +740,14 @@ export class MarketplaceService {
       );
     }
 
+    // Real P2P armed & kartu punya aset on-chain → PENDING_ESCROW (menunggu transfer→escrow).
+    // Selain itu (mock/unarmed, atau listing HOSHI tanpa ccNftAddress) → langsung ACTIVE.
+    const pendingEscrow = this.listingNeedsEscrow(ccNftAddress);
     const row = await this.prisma.listing.create({
       data: {
+        status: pendingEscrow
+          ? ListingStatus.PENDING_ESCROW
+          : ListingStatus.ACTIVE,
         name: dto.name,
         set: dto.set ?? '',
         rarity: dto.rarity ?? '',
@@ -722,15 +786,18 @@ export class MarketplaceService {
       include: { nft: true },
     });
 
-    await this.recordActivity({
-      type: ActivityType.LISTED_CARD,
-      listing: row,
-      amount: row.priceIdrx,
-      fromId: user.id,
-      fromLabel: displayLabel(user, shortWallet(user.walletAddress)),
-      toId: null,
-      toLabel: null,
-    });
+    // PENDING_ESCROW: tunda pengumuman "listed" sampai kartu benar-benar di escrow (submitEscrow).
+    if (!pendingEscrow) {
+      await this.recordActivity({
+        type: ActivityType.LISTED_CARD,
+        listing: row,
+        amount: row.priceIdrx,
+        fromId: user.id,
+        fromLabel: displayLabel(user, shortWallet(user.walletAddress)),
+        toId: null,
+        toLabel: null,
+      });
+    }
 
     return toListingDto(row);
   }
@@ -810,6 +877,16 @@ export class MarketplaceService {
     }
     if (existing.sellerId && existing.sellerId === user.id) {
       throw new BadRequestException('Cannot buy your own listing.');
+    }
+    // Listing ber-escrow (kartu penjual dititip di escrow, real P2P) TIDAK boleh diselesaikan lewat
+    // jalur demo instant-mint ini: ia akan me-mint NFT BARU ke pembeli + menandai SOLD TANPA memindah
+    // kartu asli dari escrow (kartu penjual tertelantar) & tanpa mengkredit penjual. Escrow-backed
+    // listing hanya settle via rail Rupiah (createListingOrder → fulfilUserListing). Gate ini pakai
+    // FAKTA escrowedAt, bukan flag — jadi benar juga di devnet-armed (assertDemoOnly tak menutupnya).
+    if (existing.escrowedAt) {
+      throw new BadRequestException(
+        'Kartu ini dijual lewat pembayaran Rupiah — gunakan "Beli via Rupiah", bukan jalur ini.',
+      );
     }
 
     // Snapshot state pra-beli. Kartu yang di-relist sudah punya buyerId (owner
@@ -929,12 +1006,50 @@ export class MarketplaceService {
     if (existing.sellerId !== user.id) {
       throw new ForbiddenException('Only the seller can cancel this listing.');
     }
+    // Gate atomik ACTIVE|PENDING_ESCROW → CANCELLED. Ini MENUTUP jendela beli SEBELUM menyentuh
+    // escrow: settlement REAL meng-klaim ACTIVE→SOLD lebih dulu, jadi kalau ada buy yang menang
+    // duluan, updateMany ini cocok 0 baris → cancel kalah & tak mengembalikan kartu (kartu sah
+    // jadi milik pembeli). Sebaliknya kalau cancel menang, tak ada buy yang bisa memindah kartu.
     const cancelled = await this.prisma.listing.updateMany({
-      where: { id, status: ListingStatus.ACTIVE },
+      where: {
+        id,
+        status: { in: [ListingStatus.ACTIVE, ListingStatus.PENDING_ESCROW] },
+      },
       data: { status: ListingStatus.CANCELLED },
     });
     if (cancelled.count !== 1) {
       throw new BadRequestException('Listing is no longer active.');
+    }
+
+    // Kembalikan kartu dari escrow ke penjual — HANYA bila kartu ini BENAR-BENAR pernah dititip
+    // (escrowedAt ter-set oleh submitEscrow). Memakai FAKTA escrowedAt, bukan p2pRealArmed() saat ini:
+    //   • Listing mock/unarmed & PENDING_ESCROW-belum-ditandatangani → escrowedAt null → dilewati
+    //     (kartu masih di wallet penjual; nol panggilan escrow → staging tak terganggu).
+    //   • Jika P2P di-disarm SETELAH kartu masuk escrow, escrowedAt tetap ter-set → kartu tetap
+    //     dikembalikan (tak menelantarkan aset penjual hanya karena flag berubah).
+    // transferCoreAssetTo dipanggil LANGSUNG (bukan digerbang ownsAsset yang menelan error baca):
+    // loop retry-nya menyerap RPC yang sekejap gagal; kegagalan sejati MELEMPAR → tertangkap &
+    // di-LOG KERAS untuk pengembalian manual (indeterminate = kartu mungkin sudah balik). Kegagalan
+    // di sini TIDAK menggagalkan cancel (listing sudah aman CANCELLED, tak ada uang untuk di-refund).
+    if (existing.escrowedAt && existing.ccNftAddress) {
+      try {
+        await this.escrow.transferCoreAssetTo({
+          assetAddress: existing.ccNftAddress,
+          newOwner: user.walletAddress,
+        });
+        // Kartu sudah balik ke penjual → bersihkan penanda supaya cancel/relist berikutnya tak
+        // salah mengira kartu masih di escrow.
+        await this.prisma.listing.updateMany({
+          where: { id },
+          data: { escrowedAt: null },
+        });
+      } catch (err) {
+        this.logger.error(
+          `cancel: gagal mengembalikan kartu ${existing.ccNftAddress} dari escrow ke penjual ` +
+            `${user.id}: ${err instanceof Error ? err.message : String(err)}. Listing sudah ` +
+            'CANCELLED; CEK ON-CHAIN & kembalikan kartu manual bila masih di escrow. JANGAN refund.',
+        );
+      }
     }
 
     await this.prisma.offer.updateMany({
@@ -978,31 +1093,173 @@ export class MarketplaceService {
     if (existing.status === ListingStatus.ACTIVE) {
       throw new BadRequestException('Listing is already active.');
     }
-
+    // PENDING_ESCROW BOLEH di-relist ulang: kalau penjual menolak/gagal tanda tangan transfer→escrow,
+    // listing tersangkut PENDING_ESCROW; relist ulang (dari modal yang sama) menerbitkannya kembali &
+    // memicu prompt tanda tangan lagi — tanpa ini kartu hasil-beli jadi tak bisa dijual selamanya.
+    // Kartu ada di wallet pemilik (setelah beli/cancel/reject). Real P2P armed → harus masuk escrow
+    // lagi sebelum bisa dibeli → PENDING_ESCROW. Mock/unarmed → langsung ACTIVE.
+    const pendingEscrow = this.listingNeedsEscrow(existing.ccNftAddress);
     const relisted = await this.prisma.listing.updateMany({
       where: {
         id,
         buyerId: user.id,
-        status: { in: [ListingStatus.SOLD, ListingStatus.CANCELLED] },
+        status: {
+          in: [
+            ListingStatus.SOLD,
+            ListingStatus.CANCELLED,
+            ListingStatus.PENDING_ESCROW,
+          ],
+        },
       },
       data: {
-        status: ListingStatus.ACTIVE,
+        status: pendingEscrow
+          ? ListingStatus.PENDING_ESCROW
+          : ListingStatus.ACTIVE,
         sellerId: user.id,
         sellerAddress: shortWallet(user.walletAddress),
         priceIdrx: dto.price,
         expectedValueIdrx: dto.expectedValue ?? existing.expectedValueIdrx,
         buybackIdrx: dto.buyback ?? existing.buybackIdrx,
         listedAt: new Date(),
+        // Kartu ADA DI WALLET PEMILIK saat relist (bukan escrow) → hapus penanda escrow lama supaya
+        // cancel berikutnya tak salah mencoba mengembalikan kartu yang tak ada di escrow. Kalau
+        // butuh escrow lagi (PENDING_ESCROW), submitEscrow yang men-set ulang setelah terkonfirmasi.
+        escrowedAt: null,
       },
     });
     if (relisted.count !== 1) {
       throw new BadRequestException('Listing is no longer relistable.');
     }
 
+    // Feed "listed" ditunda sampai ACTIVE (submitEscrow) untuk jalur PENDING_ESCROW.
+    if (!pendingEscrow) {
+      await this.recordActivity({
+        type: ActivityType.LISTED_CARD,
+        listing: existing,
+        amount: dto.price,
+        fromId: user.id,
+        fromLabel: displayLabel(user, shortWallet(user.walletAddress)),
+        toId: null,
+        toLabel: null,
+      });
+    }
+
+    return toListingDto(
+      await this.prisma.listing.findUniqueOrThrow({
+        where: { id },
+        include: { nft: true },
+      }),
+    );
+  }
+
+  /* ----------------------- escrow-saat-listing (real P2P) ----------------------- */
+
+  /**
+   * Langkah 1 escrow: bangun transaksi transfer kartu PENJUAL → wallet escrow (BELUM
+   * ditandatangani). Frontend menyuruh penjual menandatangani, lalu memanggil submitEscrow.
+   * Hanya untuk listing PENDING_ESCROW milik penjual. buildTransferToEscrowTx sudah memverifikasi
+   * on-chain bahwa kartu memang milik penjual (menolak kalau bukan).
+   */
+  async prepareEscrow(
+    id: string,
+    user: AuthUser,
+  ): Promise<{ serializedTransaction: string }> {
+    const listing = await this.prisma.listing.findUnique({ where: { id } });
+    if (!listing) throw new NotFoundException('Listing tidak ditemukan.');
+    if (listing.sellerId !== user.id) {
+      throw new ForbiddenException(
+        'Hanya penjual yang bisa menaruh kartu ini ke escrow.',
+      );
+    }
+    if (listing.status !== ListingStatus.PENDING_ESCROW) {
+      throw new BadRequestException(
+        'Listing ini tidak sedang menunggu escrow.',
+      );
+    }
+    if (!listing.ccNftAddress) {
+      throw new BadRequestException(
+        'Listing tidak punya aset on-chain untuk di-escrow.',
+      );
+    }
+    const serializedTransaction = await this.escrow.buildTransferToEscrowTx({
+      assetAddress: listing.ccNftAddress,
+      ownerWallet: user.walletAddress,
+    });
+    return { serializedTransaction };
+  }
+
+  /**
+   * Langkah 2 escrow: siarkan transfer→escrow yang sudah ditandatangani penjual, lalu aktifkan
+   * listing (PENDING_ESCROW→ACTIVE). IDEMPOTEN: kalau kartu sudah di escrow (broadcast sebelumnya
+   * sukses tapi flip DB gagal, lalu penjual retry), lewati broadcast dan langsung aktifkan.
+   */
+  async submitEscrow(
+    id: string,
+    dto: SubmitEscrowDto,
+    user: AuthUser,
+  ): Promise<ListingDto> {
+    const listing = await this.prisma.listing.findUnique({ where: { id } });
+    if (!listing) throw new NotFoundException('Listing tidak ditemukan.');
+    if (listing.sellerId !== user.id) {
+      throw new ForbiddenException(
+        'Hanya penjual yang bisa menyelesaikan escrow listing ini.',
+      );
+    }
+    if (listing.status !== ListingStatus.PENDING_ESCROW) {
+      throw new BadRequestException(
+        'Listing ini tidak sedang menunggu escrow.',
+      );
+    }
+    if (!listing.ccNftAddress) {
+      throw new BadRequestException(
+        'Listing tidak punya aset on-chain untuk di-escrow.',
+      );
+    }
+
+    // Idempoten: kalau kartu SUDAH di escrow, jangan siarkan ulang (blockhash pasti kedaluwarsa /
+    // "already processed") — cukup aktifkan. Kalau belum, siarkan tx bertanda tangan penjual.
+    const alreadyEscrowed = await this.escrow.ownsAsset(listing.ccNftAddress);
+    if (!alreadyEscrowed) {
+      await this.escrow.broadcastSignedToEscrow(dto.signedTransaction);
+
+      // WAJIB: verifikasi escrow BENAR-BENAR memegang kartunya sebelum meng-ACTIVE-kan. dto adalah
+      // input klien — penjual bisa saja menyiarkan transaksi LAIN yang confirm tapi tak memindah
+      // kartu; tanpa cek ini listing jadi ACTIVE padahal kartu masih di penjual → pembeli bayar,
+      // settlement gagal, REFUND_DUE berulang (griefing). Poll menyerap lag indeks RPC.
+      const nowOwned = await this.escrow.ownsAssetWithRetry(listing.ccNftAddress);
+      if (!nowOwned) {
+        throw new UnprocessableEntityException(
+          'Transfer kartu ke escrow belum terkonfirmasi. Coba lagi — pastikan menandatangani ' +
+            'transaksi transfer yang benar (bukan transaksi lain).',
+        );
+      }
+    }
+
+    // Escrow terbukti memegang kartu → aktifkan listing + tandai escrowedAt (FAKTA "kartu di escrow"),
+    // atomik & hanya jika masih PENDING_ESCROW. escrowedAt inilah yang dibaca cancel & buy nanti.
+    const activated = await this.prisma.listing.updateMany({
+      where: { id, sellerId: user.id, status: ListingStatus.PENDING_ESCROW },
+      data: {
+        status: ListingStatus.ACTIVE,
+        listedAt: new Date(),
+        escrowedAt: new Date(),
+      },
+    });
+    if (activated.count !== 1) {
+      // Balapan langka (mis. cancel duluan). Kartu MUNGKIN sudah di escrow → jangan diamkan senyap.
+      this.logger.warn(
+        `submitEscrow: listing ${id} tak lagi PENDING_ESCROW saat aktivasi (mungkin dibatalkan). ` +
+          `Kartu ${listing.ccNftAddress} bisa jadi ADA di escrow — cek manual bila perlu dikembalikan.`,
+      );
+      throw new ConflictException(
+        'Listing tidak lagi menunggu escrow (mungkin sudah dibatalkan).',
+      );
+    }
+
     await this.recordActivity({
       type: ActivityType.LISTED_CARD,
-      listing: existing,
-      amount: dto.price,
+      listing,
+      amount: listing.priceIdrx,
       fromId: user.id,
       fromLabel: displayLabel(user, shortWallet(user.walletAddress)),
       toId: null,

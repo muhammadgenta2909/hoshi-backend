@@ -143,6 +143,47 @@ export class EscrowService {
   }
 
   /**
+   * Cek SEKALI (tanpa polling) apakah escrow sudah memiliki kartu ini on-chain. Dipakai untuk:
+   *  • submit idempoten — kalau broadcast sudah sukses tapi flip DB gagal, retry cukup flip;
+   *  • cancel cepat — hanya menarik kartu balik kalau escrow memang memegangnya (hindari poll 30s
+   *    pada listing PENDING_ESCROW yang kartunya tak pernah dikirim).
+   * Mengembalikan false (bukan throw) kalau kartu belum terindeks / gagal dibaca.
+   */
+  async ownsAsset(assetAddress: string): Promise<boolean> {
+    const umi = this.getEscrowUmi();
+    const escrowPk = String(umi.identity.publicKey);
+    try {
+      const fetched = await fetchAsset(umi, publicKey(assetAddress));
+      return String(fetched.owner) === escrowPk;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Seperti ownsAsset tapi MENUNGGU (poll) sampai escrow terlihat memiliki kartu, menyerap lag
+   * indeks RPC setelah broadcast transfer→escrow. Dipakai submitEscrow untuk MEMVERIFIKASI kartu
+   * benar-benar masuk escrow SEBELUM listing di-ACTIVE-kan — mencegah penjual mengaktifkan listing
+   * dengan menyiarkan transaksi lain yang bukan transfer kartunya. Mengembalikan false kalau setelah
+   * semua percobaan escrow tetap bukan pemilik.
+   */
+  async ownsAssetWithRetry(assetAddress: string): Promise<boolean> {
+    const umi = this.getEscrowUmi();
+    const escrowPk = String(umi.identity.publicKey);
+    const asset = publicKey(assetAddress);
+    for (let i = 0; i < OWNERSHIP_RETRIES; i++) {
+      try {
+        const fetched = await fetchAsset(umi, asset);
+        if (String(fetched.owner) === escrowPk) return true;
+      } catch {
+        /* belum terindeks / gagal baca — coba lagi */
+      }
+      await sleep(POLL_MS);
+    }
+    return false;
+  }
+
+  /**
    * Transfer kartu yang SEDANG dimiliki escrow ke pemilik baru (pembeli saat terjual, atau
    * balik ke penjual saat cancel). Escrow yang menandatangani. Broadcast via RPC Hoshi sendiri.
    * Tunggu kartu benar-benar di escrow dulu (jaga-jaga belum final). Kembalikan signature base58.

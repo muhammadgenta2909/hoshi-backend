@@ -209,6 +209,32 @@ class EnvironmentVariables {
   @IsOptional()
   @IsString()
   CC_MOCK?: string;
+
+  // ── Flow B: jual-beli antar USER (P2P + escrow) ──────────────────────────
+  // Opsional (WAJIB kalau P2P REAL dipakai) — secret key wallet ESCROW Hoshi sebagai JSON byte
+  // array (format sama PLATFORM_SECRET_KEY / HOSHI_TREASURY_SECRET_KEY). Wallet ini memegang
+  // SEMENTARA kartu USER yang sedang dijual. SENGAJA terpisah dari treasury: kalau satu key bocor,
+  // yang lain aman. @IsOptional supaya boot tak mati tanpanya — EscrowService memberi error jelas
+  // saat pertama dipakai. Rahasia: siapa pun yang membacanya bisa memindah kartu titipan penjual.
+  @IsOptional()
+  @IsString()
+  HOSHI_ESCROW_SECRET_KEY?: string;
+
+  // Opsional — "true" MENGAKTIFKAN settlement P2P REAL: listing menaruh kartu penjual ke escrow,
+  // dan saat terjual escrow memindah kartu ke pembeli + saldo penjual dikredit. Default MATI:
+  // listing user tetap langsung ACTIVE (tanpa escrow) & order P2P di-refund manual. Nyalakan HANYA
+  // setelah wallet escrow didanai SOL gas dan alur diuji. String (bukan boolean) mengikuti pola
+  // flag lain supaya salah ketik tidak diam-diam jadi truthy.
+  @IsOptional()
+  @IsString()
+  HOSHI_P2P_ENABLED?: string;
+
+  // Opsional — komisi Hoshi untuk penjualan P2P dalam basis point ("500" = 5%), diambil dari sisi
+  // PENJUAL (pembeli tetap bayar harga + fee QRIS). Default 500. PaymentsService meng-clamp 0..100%.
+  // String (bukan @IsInt), sama seperti HOSHI_PACK_MARGIN_BPS, agar salah ketik tak jadi angka diam2.
+  @IsOptional()
+  @IsString()
+  HOSHI_MARKETPLACE_FEE_BPS?: string;
 }
 
 /**

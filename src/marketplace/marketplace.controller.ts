@@ -16,6 +16,7 @@ import { CreateListingDto } from './dto/create-listing.dto';
 import { QueryActivityDto } from './dto/query-activity.dto';
 import { QueryListingDto } from './dto/query-listing.dto';
 import { RelistListingDto } from './dto/relist-listing.dto';
+import { SubmitEscrowDto } from './dto/submit-escrow.dto';
 import { SubmitOfferDto } from './dto/submit-offer.dto';
 import { UpdateListingDto } from './dto/update-listing.dto';
 import { MarketplaceService } from './marketplace.service';
@@ -192,5 +193,31 @@ export class MarketplaceController {
     @CurrentUser() user: AuthUser,
   ) {
     return this.marketplace.relist(id, dto, user);
+  }
+
+  @Post(':id/escrow/prepare')
+  @ApiBearerAuth()
+  @UseGuards(JwtAuthGuard)
+  @ApiOperation({
+    summary:
+      'Escrow langkah 1: bangun tx transfer kartu penjual → escrow (real P2P, PENDING_ESCROW)',
+  })
+  prepareEscrow(@Param('id') id: string, @CurrentUser() user: AuthUser) {
+    return this.marketplace.prepareEscrow(id, user);
+  }
+
+  @Post(':id/escrow/submit')
+  @ApiBearerAuth()
+  @UseGuards(JwtAuthGuard)
+  @ApiOperation({
+    summary:
+      'Escrow langkah 2: siarkan transfer bertanda tangan lalu aktifkan listing (→ ACTIVE)',
+  })
+  submitEscrow(
+    @Param('id') id: string,
+    @Body() dto: SubmitEscrowDto,
+    @CurrentUser() user: AuthUser,
+  ) {
+    return this.marketplace.submitEscrow(id, dto, user);
   }
 }

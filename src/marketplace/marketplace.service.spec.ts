@@ -11,13 +11,28 @@ import {
   ListingSource,
   ListingStatus,
 } from '@prisma/client';
+import { ConfigService } from '@nestjs/config';
 import { CcCardFactsService } from '../collectorcrypt/cc-card-facts.service';
 import { NftService } from '../nft/nft.service';
 import { PrismaService } from '../prisma/prisma.service';
+import { EscrowService } from '../escrow/escrow.service';
 import { MarketplaceService } from './marketplace.service';
 
 // Prevent the Metaplex/Solana ESM chain from loading through NftService.
 jest.mock('../solana/umi.service', () => ({ UmiService: class UmiService {} }));
+
+// MarketplaceService kini meng-import EscrowService, yang menarik rantai ESM Solana v1
+// (umi-bundle-defaults → web3.js → rpc-websockets→uuid) yang bikin jest gagal parse. Sama
+// seperti payments.service.spec, kita mock @solana/web3.js dengan kelas no-op. EscrowService
+// sendiri selalu di-override dengan mock di test, jadi tak ada key dibaca / tx ditandatangani.
+jest.mock('@solana/web3.js', () => ({
+  Keypair: class Keypair {},
+  Transaction: class Transaction {},
+  VersionedTransaction: class VersionedTransaction {},
+  PublicKey: class PublicKey {
+    constructor(readonly value: string) {}
+  },
+}));
 
 describe('MarketplaceService', () => {
   let service: MarketplaceService;
@@ -38,6 +53,14 @@ describe('MarketplaceService', () => {
   };
   let nft: { mintForUser: jest.Mock };
   let ccFacts: { ensureFacts: jest.Mock };
+  let config: { get: jest.Mock };
+  let escrow: {
+    buildTransferToEscrowTx: jest.Mock;
+    broadcastSignedToEscrow: jest.Mock;
+    transferCoreAssetTo: jest.Mock;
+    ownsAsset: jest.Mock;
+    ownsAssetWithRetry: jest.Mock;
+  };
 
   const now = new Date('2026-07-05T00:00:00.000Z');
   const user = {
@@ -116,17 +139,37 @@ describe('MarketplaceService', () => {
       }),
     };
 
+    // Default: mock/unarmed → p2pRealArmed()=false → listing langsung ACTIVE (perilaku lama).
+    // Test escrow di bawah meng-override HOSHI_P2P_ENABLED='true' untuk menyalakan jalur real.
+    config = { get: jest.fn().mockReturnValue(undefined) };
+    escrow = {
+      buildTransferToEscrowTx: jest.fn(),
+      broadcastSignedToEscrow: jest.fn(),
+      transferCoreAssetTo: jest.fn(),
+      ownsAsset: jest.fn(),
+      ownsAssetWithRetry: jest.fn(),
+    };
+
     const moduleRef = await Test.createTestingModule({
       providers: [
         MarketplaceService,
         { provide: PrismaService, useValue: prisma },
         { provide: NftService, useValue: nft },
         { provide: CcCardFactsService, useValue: ccFacts },
+        { provide: ConfigService, useValue: config },
+        { provide: EscrowService, useValue: escrow },
       ],
     }).compile();
 
     service = moduleRef.get(MarketplaceService);
   });
+
+  /** Nyalakan jalur P2P real (armed): CC_MOCK unset + HOSHI_P2P_ENABLED='true'. */
+  function armP2p() {
+    config.get.mockImplementation((k: string) =>
+      k === 'HOSHI_P2P_ENABLED' ? 'true' : undefined,
+    );
+  }
 
   describe('buy', () => {
     it('locks ACTIVE listing, creates a card snapshot, mints NFT, then links nftId', async () => {
@@ -324,7 +367,11 @@ describe('MarketplaceService', () => {
           id: 'listing-1',
           buyerId: user.id,
           status: {
-            in: [ListingStatus.SOLD, ListingStatus.CANCELLED],
+            in: [
+              ListingStatus.SOLD,
+              ListingStatus.CANCELLED,
+              ListingStatus.PENDING_ESCROW,
+            ],
           },
         },
         data: {
@@ -335,6 +382,7 @@ describe('MarketplaceService', () => {
           expectedValueIdrx: 33_000_000,
           buybackIdrx: 20_000_000,
           listedAt: expect.any(Date),
+          escrowedAt: null,
         },
       });
     });
@@ -604,6 +652,387 @@ describe('MarketplaceService', () => {
         where: { buyerId: 'buyer-1' },
         include: { nft: true },
         orderBy: { soldAt: 'desc' },
+      });
+    });
+  });
+
+  // ── F3: escrow-saat-listing (real P2P armed) ──────────────────────────────
+  describe('escrow-at-listing (F3, real P2P armed)', () => {
+    const seller = {
+      id: 'seller-1',
+      walletAddress: 'SellerWalletBase58',
+      displayName: null,
+      role: 'USER',
+    };
+    const fromPackDto = {
+      name: 'Zubat',
+      set: 'Neo Destiny',
+      rarity: 'Rare',
+      image: 'https://cc/zubat.png',
+      price: 2_000_000,
+      expectedValue: 2_200_000,
+      grade: 'PSA 9',
+      grader: Grader.PSA,
+      gradeScore: 9,
+      language: 'English',
+      era: 'Classic',
+      element: 'Poison',
+      category: 'Full Art',
+      fromPackMemo: 'hoshi-slug-abc',
+    };
+    const pendingListing = {
+      ...listing,
+      status: ListingStatus.PENDING_ESCROW,
+      sellerId: seller.id,
+      ccNftAddress: 'CCAsset123',
+    };
+
+    describe('create/relist gating', () => {
+      it('fresh pull listing is created PENDING_ESCROW when armed (no "listed" activity yet)', async () => {
+        armP2p();
+        prisma.ccPackPurchase.findFirst.mockResolvedValue({
+          nftAddress: 'CCAsset123',
+          status: CcPackStatus.OPENED,
+        });
+        prisma.listing.findUnique.mockResolvedValue(null);
+        prisma.listing.create.mockResolvedValue({
+          ...pendingListing,
+          nft: null,
+        });
+
+        await service.create(fromPackDto, seller);
+
+        expect(prisma.listing.create).toHaveBeenCalledWith(
+          expect.objectContaining({
+            data: expect.objectContaining({
+              status: ListingStatus.PENDING_ESCROW,
+              ccNftAddress: 'CCAsset123',
+            }),
+          }),
+        );
+        // Umumkan "listed" hanya setelah kartu di escrow (submitEscrow), bukan sekarang.
+        expect(prisma.activity.create).not.toHaveBeenCalled();
+      });
+
+      it('mock/unarmed keeps the classic ACTIVE path (no PENDING_ESCROW)', async () => {
+        // config default → p2pRealArmed()=false
+        prisma.ccPackPurchase.findFirst.mockResolvedValue({
+          nftAddress: 'CCAsset123',
+          status: CcPackStatus.OPENED,
+        });
+        prisma.listing.findUnique.mockResolvedValue(null);
+        prisma.listing.create.mockResolvedValue({ ...listing, nft: null });
+
+        await service.create(fromPackDto, seller);
+
+        expect(prisma.listing.create).toHaveBeenCalledWith(
+          expect.objectContaining({
+            data: expect.objectContaining({ status: ListingStatus.ACTIVE }),
+          }),
+        );
+        expect(prisma.activity.create).toHaveBeenCalled();
+      });
+
+      it('relist of an owned card goes PENDING_ESCROW when armed', async () => {
+        armP2p();
+        const owned = {
+          ...listing,
+          status: ListingStatus.SOLD,
+          sellerId: 'prev-seller',
+          buyerId: user.id,
+          ccNftAddress: 'CCAsset123',
+        };
+        prisma.listing.findUnique.mockResolvedValue(owned);
+        prisma.listing.updateMany.mockResolvedValueOnce({ count: 1 });
+        prisma.listing.findUniqueOrThrow.mockResolvedValue({
+          ...owned,
+          status: ListingStatus.PENDING_ESCROW,
+          sellerId: user.id,
+          nft: null,
+        });
+
+        await service.relist('listing-1', { price: 30_000_000 }, user);
+
+        expect(prisma.listing.updateMany).toHaveBeenCalledWith(
+          expect.objectContaining({
+            data: expect.objectContaining({
+              status: ListingStatus.PENDING_ESCROW,
+            }),
+          }),
+        );
+        expect(prisma.activity.create).not.toHaveBeenCalled();
+      });
+    });
+
+    describe('prepareEscrow', () => {
+      it('builds the transfer-to-escrow tx for the owner of a PENDING_ESCROW listing', async () => {
+        prisma.listing.findUnique.mockResolvedValue(pendingListing);
+        escrow.buildTransferToEscrowTx.mockResolvedValue('BASE64_UNSIGNED');
+
+        const res = await service.prepareEscrow('listing-1', seller);
+
+        expect(res).toEqual({ serializedTransaction: 'BASE64_UNSIGNED' });
+        expect(escrow.buildTransferToEscrowTx).toHaveBeenCalledWith({
+          assetAddress: 'CCAsset123',
+          ownerWallet: seller.walletAddress,
+        });
+      });
+
+      it('rejects a non-owner', async () => {
+        prisma.listing.findUnique.mockResolvedValue(pendingListing);
+        await expect(service.prepareEscrow('listing-1', user)).rejects.toThrow(
+          ForbiddenException,
+        );
+        expect(escrow.buildTransferToEscrowTx).not.toHaveBeenCalled();
+      });
+
+      it('rejects a listing that is not PENDING_ESCROW', async () => {
+        prisma.listing.findUnique.mockResolvedValue({
+          ...pendingListing,
+          status: ListingStatus.ACTIVE,
+        });
+        await expect(
+          service.prepareEscrow('listing-1', seller),
+        ).rejects.toThrow(BadRequestException);
+        expect(escrow.buildTransferToEscrowTx).not.toHaveBeenCalled();
+      });
+    });
+
+    describe('submitEscrow', () => {
+      it('broadcasts, VERIFIES escrow ownership, then activates + marks escrowedAt + records LISTED_CARD', async () => {
+        prisma.listing.findUnique.mockResolvedValue(pendingListing);
+        escrow.ownsAsset.mockResolvedValue(false);
+        escrow.broadcastSignedToEscrow.mockResolvedValue('sig-1');
+        escrow.ownsAssetWithRetry.mockResolvedValue(true); // escrow really got the card
+        prisma.listing.updateMany.mockResolvedValueOnce({ count: 1 });
+        prisma.listing.findUniqueOrThrow.mockResolvedValue({
+          ...pendingListing,
+          status: ListingStatus.ACTIVE,
+          nft: null,
+        });
+
+        await service.submitEscrow(
+          'listing-1',
+          { signedTransaction: 'SIGNED64' },
+          seller,
+        );
+
+        expect(escrow.broadcastSignedToEscrow).toHaveBeenCalledWith('SIGNED64');
+        expect(escrow.ownsAssetWithRetry).toHaveBeenCalledWith('CCAsset123');
+        expect(prisma.listing.updateMany).toHaveBeenCalledWith({
+          where: {
+            id: 'listing-1',
+            sellerId: seller.id,
+            status: ListingStatus.PENDING_ESCROW,
+          },
+          data: {
+            status: ListingStatus.ACTIVE,
+            listedAt: expect.any(Date),
+            escrowedAt: expect.any(Date),
+          },
+        });
+        expect(prisma.activity.create).toHaveBeenCalled();
+      });
+
+      it('REFUSES to activate if escrow did not actually receive the card after broadcast (arbitrary tx)', async () => {
+        prisma.listing.findUnique.mockResolvedValue(pendingListing);
+        escrow.ownsAsset.mockResolvedValue(false);
+        escrow.broadcastSignedToEscrow.mockResolvedValue('sig-bogus');
+        escrow.ownsAssetWithRetry.mockResolvedValue(false); // card never landed in escrow
+
+        await expect(
+          service.submitEscrow(
+            'listing-1',
+            { signedTransaction: 'SOME_OTHER_TX' },
+            seller,
+          ),
+        ).rejects.toThrow(UnprocessableEntityException);
+        // Never flips to ACTIVE — listing stays PENDING_ESCROW, buyer can't pay for a non-escrowed card.
+        expect(prisma.listing.updateMany).not.toHaveBeenCalled();
+      });
+
+      it('is idempotent: if escrow already owns the card, skip broadcast but still activate', async () => {
+        prisma.listing.findUnique.mockResolvedValue(pendingListing);
+        escrow.ownsAsset.mockResolvedValue(true);
+        prisma.listing.updateMany.mockResolvedValueOnce({ count: 1 });
+        prisma.listing.findUniqueOrThrow.mockResolvedValue({
+          ...pendingListing,
+          status: ListingStatus.ACTIVE,
+          nft: null,
+        });
+
+        await service.submitEscrow(
+          'listing-1',
+          { signedTransaction: 'SIGNED64' },
+          seller,
+        );
+
+        expect(escrow.broadcastSignedToEscrow).not.toHaveBeenCalled();
+        expect(prisma.listing.updateMany).toHaveBeenCalled();
+      });
+
+      it('throws ConflictException when the listing is no longer PENDING_ESCROW at activation (e.g. cancelled)', async () => {
+        prisma.listing.findUnique.mockResolvedValue(pendingListing);
+        escrow.ownsAsset.mockResolvedValue(false);
+        escrow.broadcastSignedToEscrow.mockResolvedValue('sig-1');
+        escrow.ownsAssetWithRetry.mockResolvedValue(true); // ownership verified; race is on the DB flip
+        prisma.listing.updateMany.mockResolvedValueOnce({ count: 0 });
+
+        await expect(
+          service.submitEscrow(
+            'listing-1',
+            { signedTransaction: 'SIGNED64' },
+            seller,
+          ),
+        ).rejects.toThrow(ConflictException);
+        expect(prisma.activity.create).not.toHaveBeenCalled();
+      });
+    });
+
+    describe('cancel — escrow return', () => {
+      // Card genuinely deposited in escrow (submitEscrow set escrowedAt).
+      const escrowed = {
+        ...listing,
+        status: ListingStatus.ACTIVE,
+        sellerId: seller.id,
+        ccNftAddress: 'CCAsset123',
+        escrowedAt: now,
+      };
+      // Never escrowed (mock/unarmed ACTIVE, or PENDING_ESCROW unsigned): escrowedAt null.
+      const notEscrowed = {
+        ...listing,
+        status: ListingStatus.ACTIVE,
+        sellerId: seller.id,
+        ccNftAddress: 'CCAsset123',
+        escrowedAt: null,
+      };
+
+      it('returns the card DIRECTLY (no ownsAsset gate) when escrowedAt is set, then clears the marker', async () => {
+        prisma.listing.findUnique.mockResolvedValue(escrowed);
+        prisma.listing.updateMany.mockResolvedValue({ count: 1 }); // CANCELLED flip + escrowedAt clear
+        escrow.transferCoreAssetTo.mockResolvedValue('sig-return');
+        prisma.listing.findUniqueOrThrow.mockResolvedValue({
+          ...escrowed,
+          status: ListingStatus.CANCELLED,
+          escrowedAt: null,
+          nft: null,
+        });
+
+        await service.cancel('listing-1', seller);
+
+        // Called directly — no ownsAsset short-circuit that could swallow a transient RPC read.
+        expect(escrow.ownsAsset).not.toHaveBeenCalled();
+        expect(escrow.transferCoreAssetTo).toHaveBeenCalledWith({
+          assetAddress: 'CCAsset123',
+          newOwner: seller.walletAddress,
+        });
+        // Marker cleared after successful return.
+        expect(prisma.listing.updateMany).toHaveBeenCalledWith({
+          where: { id: 'listing-1' },
+          data: { escrowedAt: null },
+        });
+      });
+
+      it('does NOT touch escrow when escrowedAt is null (card never deposited — mock/unarmed or unsigned)', async () => {
+        prisma.listing.findUnique.mockResolvedValue(notEscrowed);
+        prisma.listing.updateMany.mockResolvedValueOnce({ count: 1 });
+        prisma.listing.findUniqueOrThrow.mockResolvedValue({
+          ...notEscrowed,
+          status: ListingStatus.CANCELLED,
+          nft: null,
+        });
+
+        await service.cancel('listing-1', seller);
+
+        expect(escrow.transferCoreAssetTo).not.toHaveBeenCalled();
+      });
+
+      it('returns the card even if P2P was DISARMED after escrow (gate is escrowedAt, not the live flag)', async () => {
+        // config default → p2pRealArmed()=false, but escrowedAt proves the card is in escrow.
+        prisma.listing.findUnique.mockResolvedValue(escrowed);
+        prisma.listing.updateMany.mockResolvedValue({ count: 1 });
+        escrow.transferCoreAssetTo.mockResolvedValue('sig-return');
+        prisma.listing.findUniqueOrThrow.mockResolvedValue({
+          ...escrowed,
+          status: ListingStatus.CANCELLED,
+          nft: null,
+        });
+
+        await service.cancel('listing-1', seller);
+
+        expect(escrow.transferCoreAssetTo).toHaveBeenCalled();
+      });
+
+      it('still CANCELS even if the escrow return fails (logged for manual return, no refund)', async () => {
+        prisma.listing.findUnique.mockResolvedValue(escrowed);
+        prisma.listing.updateMany.mockResolvedValue({ count: 1 });
+        escrow.transferCoreAssetTo.mockRejectedValue(new Error('rpc down'));
+        prisma.listing.findUniqueOrThrow.mockResolvedValue({
+          ...escrowed,
+          status: ListingStatus.CANCELLED,
+          nft: null,
+        });
+
+        await expect(
+          service.cancel('listing-1', seller),
+        ).resolves.toBeDefined();
+      });
+    });
+
+    describe('escrow-backed listings block the demo instant-sale paths', () => {
+      const escrowedActive = {
+        ...listing,
+        status: ListingStatus.ACTIVE,
+        sellerId: 'seller-9',
+        ccNftAddress: 'CCAsset123',
+        escrowedAt: now,
+      };
+
+      it('buy() refuses an escrow-backed listing (must settle via Rupiah rail)', async () => {
+        prisma.listing.findUnique.mockResolvedValue(escrowedActive);
+
+        await expect(service.buy('listing-1', user)).rejects.toThrow(
+          BadRequestException,
+        );
+        // Never reserves / mints.
+        expect(prisma.listing.updateMany).not.toHaveBeenCalled();
+        expect(nft.mintForUser).not.toHaveBeenCalled();
+      });
+    });
+
+    describe('relist tolerates PENDING_ESCROW (recovery from a rejected escrow signature)', () => {
+      it('re-emits a stuck PENDING_ESCROW bought card and resets escrowedAt', async () => {
+        armP2p();
+        const stuck = {
+          ...listing,
+          status: ListingStatus.PENDING_ESCROW,
+          sellerId: user.id,
+          buyerId: user.id,
+          ccNftAddress: 'CCAsset123',
+          escrowedAt: null,
+        };
+        prisma.listing.findUnique.mockResolvedValue(stuck);
+        prisma.listing.updateMany.mockResolvedValueOnce({ count: 1 });
+        prisma.listing.findUniqueOrThrow.mockResolvedValue({
+          ...stuck,
+          nft: null,
+        });
+
+        await service.relist('listing-1', { price: 30_000_000 }, user);
+
+        expect(prisma.listing.updateMany).toHaveBeenCalledWith(
+          expect.objectContaining({
+            where: expect.objectContaining({
+              status: expect.objectContaining({
+                in: expect.arrayContaining([ListingStatus.PENDING_ESCROW]),
+              }),
+            }),
+            data: expect.objectContaining({
+              status: ListingStatus.PENDING_ESCROW,
+              escrowedAt: null,
+            }),
+          }),
+        );
       });
     });
   });
