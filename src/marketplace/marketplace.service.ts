@@ -1031,7 +1031,21 @@ export class MarketplaceService {
     // loop retry-nya menyerap RPC yang sekejap gagal; kegagalan sejati MELEMPAR → tertangkap &
     // di-LOG KERAS untuk pengembalian manual (indeterminate = kartu mungkin sudah balik). Kegagalan
     // di sini TIDAK menggagalkan cancel (listing sudah aman CANCELLED, tak ada uang untuk di-refund).
-    if (existing.escrowedAt && existing.ccNftAddress) {
+    let returnFromEscrow = !!(existing.escrowedAt && existing.ccNftAddress);
+    // Fallback self-race: listing PENDING_ESCROW yang kartunya mungkin SEDANG tiba di escrow
+    // (submitEscrow in-flight) sebelum escrowedAt sempat persist. Cek SEKALI apakah escrow sudah
+    // memegangnya — kalau ya, kembalikan juga. (Jendela sisa "broadcast belum confirm saat cancel"
+    // disorot warn-log submitEscrow untuk pemulihan manual.) Di staging PENDING_ESCROW tak pernah
+    // terjadi → cabang ini mati; nol dampak.
+    if (
+      !returnFromEscrow &&
+      existing.status === ListingStatus.PENDING_ESCROW &&
+      existing.ccNftAddress &&
+      this.escrow.isConfigured()
+    ) {
+      returnFromEscrow = await this.escrow.ownsAsset(existing.ccNftAddress);
+    }
+    if (returnFromEscrow && existing.ccNftAddress) {
       try {
         await this.escrow.transferCoreAssetTo({
           assetAddress: existing.ccNftAddress,

@@ -60,6 +60,7 @@ describe('MarketplaceService', () => {
     transferCoreAssetTo: jest.Mock;
     ownsAsset: jest.Mock;
     ownsAssetWithRetry: jest.Mock;
+    isConfigured: jest.Mock;
   };
 
   const now = new Date('2026-07-05T00:00:00.000Z');
@@ -148,6 +149,7 @@ describe('MarketplaceService', () => {
       transferCoreAssetTo: jest.fn(),
       ownsAsset: jest.fn(),
       ownsAssetWithRetry: jest.fn(),
+      isConfigured: jest.fn().mockReturnValue(true),
     };
 
     const moduleRef = await Test.createTestingModule({
@@ -945,6 +947,28 @@ describe('MarketplaceService', () => {
         await service.cancel('listing-1', seller);
 
         expect(escrow.transferCoreAssetTo).not.toHaveBeenCalled();
+      });
+
+      it('self-race fallback: PENDING_ESCROW with escrowedAt still null but escrow already holds the card → returns it', async () => {
+        // submitEscrow in-flight deposited the card but hadn't persisted escrowedAt when cancel won.
+        prisma.listing.findUnique.mockResolvedValue({
+          ...notEscrowed,
+          status: ListingStatus.PENDING_ESCROW,
+          escrowedAt: null,
+        });
+        prisma.listing.updateMany.mockResolvedValue({ count: 1 });
+        escrow.ownsAsset.mockResolvedValue(true); // deposit already landed
+        escrow.transferCoreAssetTo.mockResolvedValue('sig-return');
+        prisma.listing.findUniqueOrThrow.mockResolvedValue({
+          ...notEscrowed,
+          status: ListingStatus.CANCELLED,
+          nft: null,
+        });
+
+        await service.cancel('listing-1', seller);
+
+        expect(escrow.ownsAsset).toHaveBeenCalledWith('CCAsset123');
+        expect(escrow.transferCoreAssetTo).toHaveBeenCalled();
       });
 
       it('returns the card even if P2P was DISARMED after escrow (gate is escrowedAt, not the live flag)', async () => {
