@@ -97,6 +97,45 @@ export class AdminController {
     return this.admin.stats();
   }
 
+  @Get('transactions')
+  @ApiBearerAuth()
+  @UseGuards(AdminGuard)
+  @ApiOperation({
+    summary: 'Ledger transaksi (PACK / RESELLER / P2P) dari PaymentOrder',
+  })
+  transactions(
+    @Query('page') page?: string,
+    @Query('limit') limit?: string,
+    @Query('status') status?: string,
+  ) {
+    return this.admin.listTransactions({
+      page: page ? Number(page) : undefined,
+      limit: limit ? Number(limit) : undefined,
+      status,
+    });
+  }
+
+  @Get('finance')
+  @ApiBearerAuth()
+  @UseGuards(AdminGuard)
+  @ApiOperation({
+    summary:
+      'Ringkasan keuangan: revenue reseller/P2P, kewajiban saldo penjual, treasury, profit aman ditarik',
+  })
+  async finance() {
+    const summary = await this.admin.financeSummary();
+    // Treasury IDRX on-chain (dari gacha) — dipakai menghitung profit yang AMAN ditarik:
+    // profit = saldo IDRX treasury − total kewajiban ke penjual. Jangan tarik di bawah kewajiban.
+    const bal = await this.gacha.treasuryBalances();
+    const treasuryIdr =
+      bal && bal.idrxBaseUnits != null ? bal.idrxBaseUnits / 100 : null;
+    const distributableProfitIdr =
+      treasuryIdr != null
+        ? Math.max(0, treasuryIdr - summary.liabilitiesIdr)
+        : null;
+    return { ...summary, treasuryIdr, distributableProfitIdr };
+  }
+
   @Get('listings')
   @ApiBearerAuth()
   @UseGuards(AdminGuard)

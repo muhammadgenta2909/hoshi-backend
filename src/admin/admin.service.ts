@@ -15,6 +15,7 @@ import {
   ListingSource,
   ListingStatus,
   OfferStatus,
+  PaymentStatus,
   Prisma,
   StorageProvider,
   VaultStatus,
@@ -33,6 +34,11 @@ import {
 import * as crypto from 'node:crypto';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+
+/** Label wallet ringkas: 5 depan + ".." + 4 belakang (cermin shortWallet marketplace). */
+function shortWalletLabel(w: string): string {
+  return w.length <= 11 ? w : `${w.slice(0, 5)}..${w.slice(-4)}`;
+}
 
 export interface AdminStatsResponse {
   totalListings: number;
@@ -96,6 +102,159 @@ export class AdminService {
       totalUsers,
       totalCards,
       totalRevenue: revenueAgg._sum.priceIdrx ?? 0,
+    };
+  }
+
+  /**
+   * Ledger transaksi pembayaran (PaymentOrder) untuk admin — dipisah per jenis:
+   *   • PACK     : order buka-pack gacha (listingId null)
+   *   • RESELLER : beli kartu katalog CC yang dijual Hoshi (listing.sellerId null)
+   *   • P2P      : beli kartu antar user (listing.sellerId ada)
+   * PaymentOrder tak punya relasi Prisma ke Listing (listingId cuma string), jadi kita join manual.
+   */
+  async listTransactions(query: {
+    page?: number;
+    limit?: number;
+    status?: string;
+  }) {
+    const page = Math.max(1, query.page ?? 1);
+    const limit = Math.min(Math.max(1, query.limit ?? 30), 100);
+    const where: Prisma.PaymentOrderWhereInput = {};
+    if (query.status && query.status in PaymentStatus) {
+      where.status = query.status as PaymentStatus;
+    }
+    const [orders, total] = await Promise.all([
+      this.prisma.paymentOrder.findMany({
+        where,
+        orderBy: { createdAt: 'desc' },
+        skip: (page - 1) * limit,
+        take: limit,
+      }),
+      this.prisma.paymentOrder.count({ where }),
+    ]);
+
+    const listingIds = [
+      ...new Set(
+        orders.map((o) => o.listingId).filter((x): x is string => !!x),
+      ),
+    ];
+    const buyerIds = [...new Set(orders.map((o) => o.userId))];
+    const [listings, buyers] = await Promise.all([
+      listingIds.length
+        ? this.prisma.listing.findMany({
+            where: { id: { in: listingIds } },
+            select: {
+              id: true,
+              name: true,
+              sellerId: true,
+              sellerAddress: true,
+            },
+          })
+        : Promise.resolve([]),
+      this.prisma.user.findMany({
+        where: { id: { in: buyerIds } },
+        select: { id: true, walletAddress: true, displayName: true },
+      }),
+    ]);
+    const sellerIds = [
+      ...new Set(
+        listings.map((l) => l.sellerId).filter((x): x is string => !!x),
+      ),
+    ];
+    const sellers = sellerIds.length
+      ? await this.prisma.user.findMany({
+          where: { id: { in: sellerIds } },
+          select: { id: true, walletAddress: true, displayName: true },
+        })
+      : [];
+    const listingMap = new Map(listings.map((l) => [l.id, l]));
+    const buyerMap = new Map(buyers.map((u) => [u.id, u]));
+    const sellerMap = new Map(sellers.map((u) => [u.id, u]));
+    const label = (u?: {
+      walletAddress: string;
+      displayName: string | null;
+    }): string | null =>
+      u ? (u.displayName ?? shortWalletLabel(u.walletAddress)) : null;
+
+    const data = orders.map((o) => {
+      const listing = o.listingId ? listingMap.get(o.listingId) : null;
+      const type: 'PACK' | 'RESELLER' | 'P2P' = !o.listingId
+        ? 'PACK'
+        : listing && listing.sellerId == null
+          ? 'RESELLER'
+          : 'P2P';
+      const seller = listing?.sellerId
+        ? sellerMap.get(listing.sellerId)
+        : null;
+      return {
+        id: o.id,
+        merchantOrderId: o.merchantOrderId,
+        type,
+        status: o.status,
+        priceIdr: o.priceIdr,
+        item: listing?.name ?? (type === 'PACK' ? o.packType : null),
+        buyer: label(buyerMap.get(o.userId)) ?? o.userId,
+        seller:
+          type === 'RESELLER'
+            ? 'Hoshi'
+            : type === 'P2P'
+              ? (label(seller) ?? listing?.sellerAddress ?? null)
+              : null,
+        createdAt: o.createdAt,
+        paidAt: o.paidAt,
+        fulfilledAt: o.fulfilledAt,
+      };
+    });
+    return { data, total, page, limit };
+  }
+
+  /**
+   * Ringkasan keuangan untuk admin: pemasukan dipisah reseller vs P2P, TOTAL KEWAJIBAN (saldo
+   * penjual yang belum ditarik = utang Hoshi), + daftar saldo tiap penjual. Treasury on-chain &
+   * "profit yang aman ditarik" (treasury − kewajiban) dihitung di controller (yang punya akses gacha).
+   */
+  async financeSummary() {
+    const [resellerAgg, p2pAgg, sellers] = await Promise.all([
+      this.prisma.listing.aggregate({
+        where: { status: ListingStatus.SOLD, sellerId: null },
+        _sum: { priceIdrx: true },
+        _count: true,
+      }),
+      this.prisma.listing.aggregate({
+        where: { status: ListingStatus.SOLD, sellerId: { not: null } },
+        _sum: { priceIdrx: true },
+        _count: true,
+      }),
+      this.prisma.user.findMany({
+        where: { balanceIdrx: { gt: 0 } },
+        select: {
+          id: true,
+          walletAddress: true,
+          displayName: true,
+          balanceIdrx: true,
+        },
+        orderBy: { balanceIdrx: 'desc' },
+      }),
+    ]);
+    const sellerBalances = sellers.map((u) => ({
+      id: u.id,
+      wallet: u.walletAddress,
+      label: u.displayName ?? shortWalletLabel(u.walletAddress),
+      balanceIdr: Number(u.balanceIdrx),
+    }));
+    const liabilitiesIdr = sellerBalances.reduce(
+      (s, u) => s + u.balanceIdr,
+      0,
+    );
+    return {
+      reseller: {
+        count: resellerAgg._count,
+        grossIdr: resellerAgg._sum.priceIdrx ?? 0,
+      },
+      p2p: { count: p2pAgg._count, grossIdr: p2pAgg._sum.priceIdrx ?? 0 },
+      liabilitiesIdr,
+      sellerCount: sellerBalances.length,
+      sellerBalances,
     };
   }
 
