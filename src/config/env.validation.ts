@@ -104,6 +104,14 @@ class EnvironmentVariables {
   @IsString()
   HOSHI_USD_IDR_RATE?: string;
 
+  // Opsional — markup reseller Hoshi di atas harga CollectorCrypt, basis point ("1000" = 10%).
+  // KEBIJAKAN PM: CC = STANDARD tanpa markup → default & yang dianjurkan = 0 (harga jual = harga CC
+  // × kurs). String (bukan @IsInt) mengikuti pola BPS lain agar salah ketik tak jadi angka diam-diam;
+  // MarketSyncService memvalidasi rentang 0..CC_MARGIN_BPS_MAX & pakai 0 kalau ngawur.
+  @IsOptional()
+  @IsString()
+  HOSHI_CC_MARGIN_BPS?: string;
+
   // Opsional (WAJIB kalau fitur gacha CollectorCrypt dipakai) — kredensial API gacha.
   // SENGAJA terpisah dari COLLECTORCRYPT_API_* di atas: var lama itu milik inventory
   // provider lama; mengisinya akan "mempersenjatai" provider tsb ke endpoint yang belum
