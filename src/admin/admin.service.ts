@@ -150,7 +150,14 @@ export class AdminService {
               sellerAddress: true,
             },
           })
-        : Promise.resolve([]),
+        : Promise.resolve(
+            [] as {
+              id: string;
+              name: string;
+              sellerId: string | null;
+              sellerAddress: string;
+            }[],
+          ),
       this.prisma.user.findMany({
         where: { id: { in: buyerIds } },
         select: { id: true, walletAddress: true, displayName: true },
@@ -170,10 +177,9 @@ export class AdminService {
     const listingMap = new Map(listings.map((l) => [l.id, l]));
     const buyerMap = new Map(buyers.map((u) => [u.id, u]));
     const sellerMap = new Map(sellers.map((u) => [u.id, u]));
-    const label = (u?: {
-      walletAddress: string;
-      displayName: string | null;
-    }): string | null =>
+    const label = (
+      u?: { walletAddress: string; displayName: string | null } | null,
+    ): string | null =>
       u ? (u.displayName ?? shortWalletLabel(u.walletAddress)) : null;
 
     const data = orders.map((o) => {
