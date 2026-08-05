@@ -114,17 +114,22 @@ describe('NftService', () => {
     expect(umi.mintCoreAsset).not.toHaveBeenCalled();
   });
 
-  it('tanpa metadataUri & tanpa DEFAULT_METADATA_URI → NotFound (tak mint)', async () => {
+  it('tanpa metadataUri & tanpa DEFAULT_METADATA_URI → pakai FALLBACK_METADATA_URI (tetap mint)', async () => {
     prisma.card.findUnique.mockResolvedValue({
       id: 'c1',
       name: 'X',
       metadataUri: null,
     });
     config.get.mockReturnValue(undefined);
+    umi.mintCoreAsset.mockResolvedValue({ assetAddress: 'A', signature: 'S' });
+    prisma.nft.create.mockResolvedValue({ id: 'n', assetAddress: 'A', mintTx: 'S' });
 
-    await expect(service.mintForUser(params)).rejects.toThrow(
-      NotFoundException,
+    await service.mintForUser(params);
+
+    // Jaring terakhir: mint TETAP jalan dengan URI fallback (gateway.irys.xyz/…), tak melempar —
+    // supaya beli/terima-offer demo tidak gagal hanya karena env metadata belum di-set.
+    expect(umi.mintCoreAsset).toHaveBeenCalledWith(
+      expect.objectContaining({ uri: expect.stringContaining('gateway.irys.xyz') }),
     );
-    expect(umi.mintCoreAsset).not.toHaveBeenCalled();
   });
 });
