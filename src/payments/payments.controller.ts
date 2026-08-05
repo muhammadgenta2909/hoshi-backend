@@ -21,6 +21,7 @@ import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import type { AuthUser } from '../auth/jwt.strategy';
 import { CreateListingOrderDto } from './dto/create-listing-order.dto';
 import { CreatePackOrderDto } from './dto/create-pack-order.dto';
+import { CreateTopupOrderDto } from './dto/create-topup-order.dto';
 import { PaymentsService } from './payments.service';
 
 /**
@@ -85,6 +86,25 @@ export class PaymentsController {
     @CurrentUser() user: AuthUser,
   ) {
     return this.payments.createListingOrder(dto.listingId, user);
+  }
+
+  @Post('topup')
+  @ApiBearerAuth()
+  @UseGuards(JwtAuthGuard)
+  @Throttle({ default: { ttl: 60000, limit: 10 } })
+  @ApiOperation({
+    summary:
+      'Terbitkan tagihan rupiah untuk MENGISI SALDO in-app (top-up) → QR / VA / paymentUrl IDRX',
+    description:
+      'User bayar rupiah lewat QRIS/e-wallet/VA; saat IDRX PAID+MINTED, saldo in-app (BalanceEntry) ' +
+      'dikreditkan sebesar nominal — TIDAK ADA USDC treasury yang dibelanjakan. Nominal dari body ' +
+      'divalidasi ulang ke batas IDRX di service; penerima IDRX selalu treasury Hoshi.',
+  })
+  createTopupOrder(
+    @Body() dto: CreateTopupOrderDto,
+    @CurrentUser() user: AuthUser,
+  ) {
+    return this.payments.createTopupOrder(dto.amountIdr, user);
   }
 
   @Get('me/orders')

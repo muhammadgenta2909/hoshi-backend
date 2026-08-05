@@ -20,6 +20,7 @@ import { CollectorCryptModule } from './collectorcrypt/collectorcrypt.module';
 import { PaymentsModule } from './payments/payments.module';
 import { SupportModule } from './support/support.module';
 import { BalanceModule } from './balance/balance.module';
+import { RedemptionModule } from './redemption/redemption.module';
 
 @Module({
   imports: [
@@ -41,6 +42,7 @@ import { BalanceModule } from './balance/balance.module';
     PaymentsModule,
     SupportModule,
     BalanceModule,
+    RedemptionModule,
   ],
   controllers: [AppController],
   providers: [

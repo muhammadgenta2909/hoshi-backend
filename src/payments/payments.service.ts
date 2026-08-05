@@ -490,6 +490,99 @@ export class PaymentsService {
     return toPaymentOrderDto(order);
   }
 
+  /**
+   * Terbitkan tagihan rupiah untuk MENGISI SALDO in-app user (top-up).
+   *
+   * Jalur PALING AMAN di seluruh rail: fulfilment-nya TIDAK PERNAH membelanjakan treasury —
+   * ia hanya menulis satu baris `BalanceEntry` + menaikkan `User.balanceIdrx`. Satu-satunya uang
+   * adalah rupiah user MASUK (di staging IDRX_MOCK, itupun disimulasi).
+   *
+   * Beda dari createPackOrder: nominal DARI USER (top-up menambah saldo mereka sendiri), bukan
+   * di-snapshot dari mesin. Tetap divalidasi ulang ke batas IDRX. Sentinel `packType='TOPUP'`
+   * mengarahkan fulfilment ke fulfilTopup (kredit saldo) — BUKAN gacha.purchase(). `listingId`
+   * NULL, `priceUsdc` 0 (tak ada USDC bergerak; field non-null jadi tetap 0).
+   */
+  async createTopupOrder(
+    amountIdr: number,
+    user: AuthUser,
+  ): Promise<PaymentOrderDto> {
+    const treasuryAddress = this.treasuryAddressOrRefuse();
+
+    // Nominal dari klien → divalidasi ULANG di sini (DTO gerbang bentuk, ini gerbang kebenaran).
+    // Batas = batas mint-request IDRX; di luar itu IDRX pasti menolak dan order jadi yatim.
+    if (!Number.isInteger(amountIdr)) {
+      throw new BadRequestException(
+        'Nominal isi saldo harus bilangan bulat rupiah.',
+      );
+    }
+    if (amountIdr < IDRX_MIN_MINT_IDR || amountIdr > IDRX_MAX_MINT_IDR) {
+      throw new BadRequestException(
+        `Nominal isi saldo (Rp ${amountIdr}) di luar batas (Rp ${IDRX_MIN_MINT_IDR}–Rp ${IDRX_MAX_MINT_IDR}).`,
+      );
+    }
+
+    // Kuota order PENDING per-user (anti-spam) — sama seperti pack/listing.
+    await this.assertOrderQuota(user.id);
+
+    const expiryMinutes = this.intConfig(
+      'HOSHI_ORDER_EXPIRY_MINUTES',
+      DEFAULT_EXPIRY_MINUTES,
+      1,
+    );
+    // Sesudah bayar, balik ke /deposit (halaman itu me-resume & poll order lalu tampilkan saldo baru).
+    const topupReturnUrl = new URL(
+      '/deposit',
+      this.requiredConfig('HOSHI_PAYMENT_RETURN_URL'),
+    ).toString();
+    const mint = await this.idrx.mintRequest({
+      // Rupiah utuh: nominal yang user bayar = yang dikreditkan ke saldo (1:1, tanpa fee tambahan).
+      toBeMinted: String(amountIdr),
+      // WAJIB treasury (bukan wallet user): treasury memegang IDRX-nya, saldo in-app jadi klaim
+      // user atasnya — persis pola P2P. Kalau ini pernah wallet user, kita mint ke mereka DAN
+      // menambah saldo → dobel.
+      destinationWalletAddress: treasuryAddress,
+      networkChainId: this.requiredConfig('IDRX_NETWORK_CHAIN_ID'),
+      returnUrl: topupReturnUrl,
+      expiryPeriod: expiryMinutes,
+      productDetails: `Hoshi isi saldo Rp ${amountIdr}`.slice(0, 255),
+      // HOSTED (paymentMethod/channelId dikosongkan) → halaman Duitku penuh (QRIS+e-wallet+VA).
+    });
+    const data = mint.data;
+    if (
+      !data ||
+      typeof data.merchantOrderId !== 'string' ||
+      !data.merchantOrderId
+    ) {
+      throw new ServiceUnavailableException(
+        'IDRX tidak mengembalikan merchantOrderId. Order tidak dibuat — coba lagi.',
+      );
+    }
+
+    // `packType='TOPUP'` = SENTINEL. fulfilClaimed bercabang ke fulfilTopup DI ATAS cek listingId
+    // dan DI ATAS jalur pack — jadi top-up tak akan pernah menyentuh gacha.purchase (belanja USDC).
+    const order = await this.prisma.paymentOrder.create({
+      data: {
+        merchantOrderId: data.merchantOrderId,
+        idrxRequestId: data.id != null ? String(data.id) : null,
+        reference: data.reference ?? null,
+        userId: user.id,
+        packType: 'TOPUP',
+        priceIdr: amountIdr,
+        priceUsdc: 0,
+        paymentMethod: 'HOSTED',
+        qrContent: data.qrContent ?? null,
+        virtualAccountNo: data.virtualAccountNo ?? null,
+        paymentUrl: data.paymentUrl ?? null,
+        expiresAt: new Date(Date.now() + expiryMinutes * 60_000),
+        status: PaymentStatus.PENDING,
+      },
+    });
+    this.logger.log(
+      `Order top-up ${order.merchantOrderId} dibuat: +Rp ${amountIdr} saldo (user ${user.id}).`,
+    );
+    return toPaymentOrderDto(order);
+  }
+
   /* ─────────────────────────── Callback IDRX ─────────────────────────── */
 
   /**
@@ -655,6 +748,14 @@ export class PaymentsService {
       );
     }
 
+    // TOP-UP SALDO: gerbang PALING ATAS, sebelum listing DAN sebelum pack. Sebuah top-up TIDAK
+    // punya listingId; tanpa cabang ini ia jatuh ke gacha.purchase() dan membelanjakan ~$50 USDC
+    // treasury untuk sebuah pack alih-alih menambah saldo. Sentinel packType='TOPUP' di-set server
+    // saat createTopupOrder (bukan dari klien) — jadi tidak bisa dipalsukan lewat body.
+    if (order.packType === 'TOPUP') {
+      return this.fulfilTopup(order);
+    }
+
     // Order MARKETPLACE (reseller kartu CC): jalur settlement TERSENDIRI — cek harga & delivery
     // spesifik-listing, BUKAN gacha.purchase() + assertPriceStillHonourable (yang untuk pack).
     if (order.listingId) {
@@ -722,6 +823,48 @@ export class PaymentsService {
       // manusia yang membaca ledger CcPackPurchase (lewat packMemo/userId) untuk memutuskan
       // "kirim pack-nya" atau "kembalikan uangnya".
       return this.failToRefund(order, errorMessage(err));
+    }
+  }
+
+  /**
+   * Fulfilment TOP-UP saldo untuk order yang sudah diklaim (FULFILLING).
+   *
+   * TIDAK ADA belanja treasury di sini — hanya kredit saldo in-app. Karena itu penanganan gagalnya
+   * BERBEDA dari jalur pack/reseller: TIDAK PERNAH REFUND_DUE. `balance.credit` idempoten per
+   * (reason, refId=merchantOrderId) dan tak menyentuh treasury, jadi setiap kegagalan (transien DB
+   * saat credit, ATAU saat mark FULFILLED sesudah credit) → LEPAS klaim ke PAID supaya reconciler
+   * mengulang dan KONVERGEN: credit kedua di-skip idempoten (credited:false), mark menyusul. Kalau
+   * kita menandai REFUND_DUE malah salah — tidak ada utang; saldo memang harus jadi terkredit.
+   */
+  private async fulfilTopup(order: PaymentOrder): Promise<FulfilOutcome> {
+    try {
+      // priceIdr = rupiah utuh yang user bayar = yang dikreditkan (1:1). userId dari BARIS order,
+      // bukan callback. refId=merchantOrderId → gerbang idempotensi anti dobel-kredit.
+      const { credited } = await this.balance.credit({
+        userId: order.userId,
+        amountIdrx: order.priceIdr,
+        reason: 'TOPUP',
+        refId: order.merchantOrderId,
+      });
+      const done = await this.prisma.paymentOrder.update({
+        where: { merchantOrderId: order.merchantOrderId },
+        data: {
+          status: PaymentStatus.FULFILLED,
+          fulfilledAt: new Date(),
+          error: null,
+        },
+      });
+      this.logger.log(
+        `Top-up ${done.merchantOrderId} FULFILLED → +Rp ${order.priceIdr} saldo ` +
+          `(user ${order.userId}, credited=${credited}).`,
+      );
+      return 'FULFILLED';
+    } catch (err) {
+      // Aman diulang: credit idempoten + nol treasury. Bukan utang → jangan REFUND_DUE.
+      return this.releaseClaimForRetry(
+        order,
+        `Top-up credit/mark gagal: ${errorMessage(err)}`,
+      );
     }
   }
 

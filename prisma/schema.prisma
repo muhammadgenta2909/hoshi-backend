@@ -110,6 +110,9 @@ model User {
   // Alamat pengiriman kartu fisik (redeem). Maks 5 per user (ditegakkan di service).
   shippingAddresses ShippingAddress[]
 
+  // Permintaan kirim kartu fisik ke rumah (redeem). Record-only: TIDAK burn/transfer NFT.
+  cardRedemptions CardRedemption[]
+
   // Thread support (user ↔ admin).
   supportThreads SupportThread[]
 
@@ -204,6 +207,62 @@ model ShippingAddress {
 
   @@index([userId])
   @@map("shipping_addresses")
+}
+
+/// Status permintaan kirim kartu fisik ke rumah. REQUESTED = baru masuk; PACKING/SHIPPED =
+/// diproses admin (manual); CANCELED = dibatalkan. TIDAK ada "REDEEMED"/"BURNED" di sini —
+/// MVP record-only: NFT tetap di tempat, tak ada burn/transfer on-chain.
+enum RedemptionStatus {
+  REQUESTED
+  PACKING
+  SHIPPED
+  CANCELED
+}
+
+/// Permintaan menukar kartu vault (hasil pack) jadi kartu fisik yang dikirim ke rumah.
+///
+/// RECORD-ONLY (MVP): baris ini HANYA mencatat niat + tujuan kirim. Ia TIDAK burn NFT, TIDAK
+/// transfer aset, TIDAK menyentuh treasury/on-chain apa pun — pemenuhan fisik ditangani manual
+/// oleh admin di luar sistem. Alamat di-SNAPSHOT (bukan sekadar FK) supaya perubahan/hapus
+/// alamat tak mengubah pesanan yang sudah dibuat. Sengaja tabel TERPISAH dari `Withdrawal`
+/// (itu penarikan SALDO/uang — semantik beda; jangan dicampur).
+model CardRedemption {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  /// Kartu yang mau dikirim — nftAddress = kunci kepemilikan ke CcPackPurchase (diverifikasi
+  /// di service, bukan dipercaya dari klien).
+  nftAddress String
+  /// Snapshot tampilan supaya riwayat tetap terbaca walau katalog CC berubah.
+  cardName  String
+  cardImage String?
+  cardSet   String?
+
+  /// Alamat tujuan — FK opsional (jejak) + snapshot penuh (sumber kebenaran pesanan).
+  shippingAddressId String?
+  recipientName     String
+  country           String
+  street            String
+  apt               String?
+  city              String
+  state             String?
+  zip               String
+  phoneCountryCode  String?
+  phoneNumber       String?
+
+  status      RedemptionStatus @default(REQUESTED)
+  note        String?
+  createdAt   DateTime         @default(now())
+  updatedAt   DateTime         @updatedAt
+  processedAt DateTime?
+
+  @@index([userId, createdAt])
+  @@index([nftAddress])
+  // CATATAN: ada juga PARTIAL UNIQUE INDEX "card_redemptions_active_nft_uniq" pada (nftAddress)
+  // WHERE status IN (REQUESTED,PACKING,SHIPPED) — anti dobel-kirim fisik. Prisma tak bisa
+  // memodelkan partial unique di schema, jadi ia hidup di migration SQL (di-apply migrate deploy).
+  @@map("card_redemptions")
 }
 
 // Katalog/template kartu (metadata kartu fisik yang di-vault Hoshi).

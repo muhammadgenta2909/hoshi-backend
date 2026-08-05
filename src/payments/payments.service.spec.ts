@@ -1120,4 +1120,100 @@ describe('PaymentsService', () => {
       expect(summary.fulfilled).toBe(1);
     });
   });
+
+  /**
+   * TOP-UP SALDO. Jalur PALING AMAN: fulfilment-nya HANYA mengkredit saldo in-app, TIDAK PERNAH
+   * membelanjakan treasury. Tes di sini mengunci dua jaminan uang:
+   *   1. sebuah order TOPUP TIDAK PERNAH memanggil gacha.purchase (tak beli pack ~$50), dan
+   *   2. kegagalan credit → LEPAS klaim untuk diulang (bukan REFUND_DUE, bukan dobel-kredit).
+   */
+  describe('top-up saldo (createTopupOrder / fulfilTopup)', () => {
+    // Order top-up: packType sentinel 'TOPUP', TANPA listingId, priceUsdc 0. priceIdr = PRICE_IDR
+    // supaya record IDRX default (toBeMinted PRICE_IDR ke treasury) lolos pin nominal & tujuan.
+    const topupOrder: PaymentOrder = {
+      ...baseOrder,
+      packType: 'TOPUP',
+      listingId: null,
+      priceUsdc: 0,
+    };
+
+    it('membuat order TOPUP: packType="TOPUP", priceUsdc 0, listingId null, mint ke treasury sebesar amount', async () => {
+      await service.createTopupOrder(100_000, user);
+
+      expect(idrx.mintRequest).toHaveBeenCalledWith(
+        expect.objectContaining({
+          toBeMinted: '100000',
+          destinationWalletAddress: TREASURY_ADDRESS,
+        }),
+      );
+      expect(prisma.paymentOrder.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            packType: 'TOPUP',
+            priceIdr: 100_000,
+            priceUsdc: 0,
+            status: PaymentStatus.PENDING,
+          }) as unknown,
+        }),
+      );
+      // listingId TIDAK di-set (undefined) — top-up bukan pembelian listing.
+      const [createArg] = prisma.paymentOrder.create.mock.calls[0] as [
+        { data: { listingId?: unknown } },
+      ];
+      expect(createArg.data.listingId).toBeUndefined();
+    });
+
+    it('menolak (BadRequest) nominal di bawah minimum mint IDRX 20.000 — tanpa mint & tanpa create', async () => {
+      await expect(service.createTopupOrder(10_000, user)).rejects.toThrow(
+        BadRequestException,
+      );
+      expect(idrx.mintRequest).not.toHaveBeenCalled();
+      expect(prisma.paymentOrder.create).not.toHaveBeenCalled();
+    });
+
+    it('fulfil TOPUP: KREDIT saldo (idempoten per merchantOrderId) + FULFILLED — gacha.purchase TAK PERNAH dipanggil', async () => {
+      prisma.paymentOrder.findUnique.mockResolvedValue(topupOrder);
+
+      const outcome = await service.handleCallback({
+        merchantOrderId: MERCHANT_ORDER_ID,
+      });
+
+      expect(outcome).toBe('FULFILLED');
+      // Jaminan #1: NOL belanja treasury — top-up tak pernah beli pack.
+      expect(gacha.purchase).not.toHaveBeenCalled();
+      // Saldo dikredit sebesar priceIdr, reason TOPUP, refId=merchantOrderId (gerbang idempotensi).
+      expect(balance.credit).toHaveBeenCalledWith({
+        userId: user.id,
+        amountIdrx: topupOrder.priceIdr,
+        reason: 'TOPUP',
+        refId: MERCHANT_ORDER_ID,
+      });
+      expect(prisma.paymentOrder.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { merchantOrderId: MERCHANT_ORDER_ID },
+          data: expect.objectContaining({
+            status: PaymentStatus.FULFILLED,
+          }) as unknown,
+        }),
+      );
+    });
+
+    it('credit gagal → LEPAS klaim ke PAID untuk diulang (VERIFY_FAILED), BUKAN REFUND_DUE, tanpa belanja', async () => {
+      prisma.paymentOrder.findUnique.mockResolvedValue(topupOrder);
+      balance.credit.mockRejectedValue(new Error('db down'));
+
+      const outcome = await service.handleCallback({
+        merchantOrderId: MERCHANT_ORDER_ID,
+      });
+
+      // Aman diulang (credit idempoten + nol treasury) → klaim dilepas, bukan utang.
+      expect(outcome).toBe('VERIFY_FAILED');
+      expect(gacha.purchase).not.toHaveBeenCalled();
+      const statuses = allStatusesWritten();
+      // Klaim melepas FULFILLING→PAID; TIDAK boleh menulis REFUND_DUE maupun FULFILLED.
+      expect(statuses).toContain(PaymentStatus.PAID);
+      expect(statuses).not.toContain(PaymentStatus.REFUND_DUE);
+      expect(statuses).not.toContain(PaymentStatus.FULFILLED);
+    });
+  });
 });
