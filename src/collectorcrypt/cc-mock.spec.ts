@@ -46,6 +46,10 @@ describe('GachaService — pagar CC_MOCK (staging-only)', () => {
     );
     const prisma = {
       ccPackPurchase: { create },
+      // treasuryBalances() (mock) menjumlah order FULFILLED untuk IDRX display — sediakan aggregate.
+      paymentOrder: {
+        aggregate: jest.fn().mockResolvedValue({ _sum: { priceIdr: 0 } }),
+      },
     } as unknown as PrismaService;
     const machines = jest.fn().mockResolvedValue([]);
     const client = { machines } as unknown as CcGachaClient;

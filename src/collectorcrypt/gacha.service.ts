@@ -11,7 +11,7 @@ import {
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { Connection, PublicKey } from '@solana/web3.js';
-import { CcPackStatus } from '@prisma/client';
+import { CcPackStatus, PaymentStatus } from '@prisma/client';
 import type { CcPackPurchase } from '@prisma/client';
 import type { AuthUser } from '../auth/jwt.strategy';
 import { PrismaService } from '../prisma/prisma.service';
@@ -387,10 +387,18 @@ export class GachaService {
   } | null> {
     if (this.ccMockEnabled()) {
       // Preflight lolos tanpa treasury ber-USDC: mock tak pernah membelanjakan apa pun.
+      // IDRX: DISPLAY-only untuk rekonsiliasi kas admin (nol on-chain). Nilainya = total rupiah dari
+      // SEMUA order FULFILLED (= "bayaran user masuk"), supaya "Profit aman ditarik" (treasury −
+      // kewajiban) bisa dihitung di staging. idrxBaseUnits = rupiah × 100 (controller /100 balik).
+      const paid = await this.prisma.paymentOrder.aggregate({
+        where: { status: PaymentStatus.FULFILLED },
+        _sum: { priceIdr: true },
+      });
+      const idrxRupiah = Number(paid._sum.priceIdr ?? 0);
       return {
         usdcBaseUnits: 1_000_000_000_000,
         solLamports: 1_000_000_000,
-        idrxBaseUnits: null,
+        idrxBaseUnits: idrxRupiah * 100,
       };
     }
     const cached = this.balanceCache;
