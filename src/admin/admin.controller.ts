@@ -15,6 +15,7 @@ import {
   UseInterceptors,
 } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
+import { ConfigService } from '@nestjs/config';
 import {
   ApiBearerAuth,
   ApiBody,
@@ -54,6 +55,7 @@ export class AdminController {
     private readonly ccSync: MarketSyncService,
     private readonly gacha: GachaService,
     private readonly withdrawal: WithdrawalService,
+    private readonly config: ConfigService,
   ) {}
 
   @Get('treasury')
@@ -143,7 +145,28 @@ export class AdminController {
               summary.pendingWithdrawalsIdr,
           )
         : null;
-    return { ...summary, treasuryIdr, distributableProfitIdr };
+
+    // Breakdown komisi P2P untuk tampilan admin. Fee marketplace Hoshi = HOSHI_MARKETPLACE_FEE_BPS
+    // (default 500 = 5%), diambil PER TRANSAKSI saat settlement (payments.service). Angka di sini
+    // memakai bruto AGREGAT (5% dari total) — identik dgn jumlah 5% per-transaksi kecuali selisih
+    // pembulatan receh; cukup untuk display "berapa komisi Hoshi vs berapa ke penjual".
+    const marketplaceFeeBps = Math.min(
+      Math.max(Number(this.config.get('HOSHI_MARKETPLACE_FEE_BPS')) || 500, 0),
+      10_000,
+    );
+    const p2pCommissionIdr = Math.floor(
+      (summary.p2p.grossIdr * marketplaceFeeBps) / 10_000,
+    );
+    const p2pNetToSellersIdr = summary.p2p.grossIdr - p2pCommissionIdr;
+
+    return {
+      ...summary,
+      treasuryIdr,
+      distributableProfitIdr,
+      marketplaceFeeBps,
+      p2pCommissionIdr,
+      p2pNetToSellersIdr,
+    };
   }
 
   @Get('withdrawals')
