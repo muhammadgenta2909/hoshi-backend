@@ -19,6 +19,7 @@ import {
   Prisma,
   StorageProvider,
   VaultStatus,
+  WithdrawalStatus,
 } from '@prisma/client';
 import { MarketplaceService } from '../marketplace/marketplace.service';
 import { PrismaService } from '../prisma/prisma.service';
@@ -220,7 +221,7 @@ export class AdminService {
    * "profit yang aman ditarik" (treasury − kewajiban) dihitung di controller (yang punya akses gacha).
    */
   async financeSummary() {
-    const [resellerAgg, p2pAgg, sellers] = await Promise.all([
+    const [resellerAgg, p2pAgg, sellers, pendingWdAgg] = await Promise.all([
       this.prisma.listing.aggregate({
         where: { status: ListingStatus.SOLD, sellerId: null },
         _sum: { priceIdrx: true },
@@ -241,6 +242,14 @@ export class AdminService {
         },
         orderBy: { balanceIdrx: 'desc' },
       }),
+      // Penarikan REQUESTED = saldo SUDAH di-debit (keluar dari balanceIdrx) tapi payout BELUM
+      // keluar treasury → kewajiban yang tak tercermin di balanceIdrx maupun treasury. WAJIB dihitung,
+      // kalau tidak "profit aman ditarik" over-stated & treasury bisa kurang saat payout dicairkan.
+      this.prisma.withdrawal.aggregate({
+        where: { status: WithdrawalStatus.REQUESTED },
+        _sum: { amountIdr: true },
+        _count: true,
+      }),
     ]);
     const sellerBalances = sellers.map((u) => ({
       id: u.id,
@@ -252,6 +261,7 @@ export class AdminService {
       (s, u) => s + u.balanceIdr,
       0,
     );
+    const pendingWithdrawalsIdr = Number(pendingWdAgg._sum.amountIdr ?? 0n);
     return {
       reseller: {
         count: resellerAgg._count,
@@ -259,6 +269,8 @@ export class AdminService {
       },
       p2p: { count: p2pAgg._count, grossIdr: p2pAgg._sum.priceIdrx ?? 0 },
       liabilitiesIdr,
+      pendingWithdrawalsIdr,
+      pendingWithdrawalsCount: pendingWdAgg._count,
       sellerCount: sellerBalances.length,
       sellerBalances,
     };

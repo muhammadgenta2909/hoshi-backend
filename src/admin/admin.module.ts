@@ -5,6 +5,7 @@ import { ConfigService } from '@nestjs/config';
 import { AdminJwtStrategy } from '../auth/admin-jwt.strategy';
 import { CollectorCryptModule } from '../collectorcrypt/collectorcrypt.module';
 import { MarketplaceModule } from '../marketplace/marketplace.module';
+import { BalanceModule } from '../balance/balance.module';
 import { AdminController } from './admin.controller';
 import { AdminService } from './admin.service';
 
@@ -15,6 +16,8 @@ import { AdminService } from './admin.service';
     // Sync katalog CollectorCrypt (POST /admin/cc-sync) — logika & klien API CC
     // tetap tinggal di CollectorCryptModule, admin hanya memicunya.
     CollectorCryptModule,
+    // Proses penarikan saldo penjual (approve/reject) lewat WithdrawalService.
+    BalanceModule,
     PassportModule,
     JwtModule.registerAsync({
       inject: [ConfigService],

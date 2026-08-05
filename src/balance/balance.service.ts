@@ -1,4 +1,4 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { BadRequestException, Injectable, Logger } from '@nestjs/common';
 import { Prisma } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 
@@ -92,6 +92,53 @@ export class BalanceService {
       }
       throw err;
     }
+  }
+
+  /**
+   * DEBIT saldo user (mis. penarikan). Aman-konkurensi & anti-overdraw:
+   *   • Ledger deltaIdrx NEGATIF ditulis DULU → unique (reason, refId) = gerbang idempotensi
+   *     (debit kembar dengan refId sama → P2002 → rollback → saldo TIDAK turun dua kali).
+   *   • Penurunan saldo via updateMany BERSYARAT `balanceIdrx >= jumlah` (row-lock Postgres) →
+   *     dua debit paralel tak bisa membuat saldo negatif; count != 1 = saldo kurang → rollback.
+   * Melempar BadRequest kalau saldo tak cukup. @param amountIdrx rupiah utuh, HARUS > 0.
+   */
+  async debit(
+    params: {
+      userId: string;
+      amountIdrx: number;
+      reason: string;
+      refId?: string | null;
+    },
+    tx?: Prisma.TransactionClient,
+  ): Promise<void> {
+    if (!Number.isInteger(params.amountIdrx) || params.amountIdrx <= 0) {
+      throw new Error(
+        `Jumlah debit saldo tidak sah: ${params.amountIdrx} (harus integer > 0).`,
+      );
+    }
+    const delta = BigInt(params.amountIdrx);
+    const writes = async (client: Prisma.TransactionClient) => {
+      await client.balanceEntry.create({
+        data: {
+          userId: params.userId,
+          deltaIdrx: -delta,
+          reason: params.reason,
+          refId: params.refId ?? null,
+        },
+      });
+      const res = await client.user.updateMany({
+        where: { id: params.userId, balanceIdrx: { gte: delta } },
+        data: { balanceIdrx: { decrement: delta } },
+      });
+      if (res.count !== 1) {
+        throw new BadRequestException('Saldo tidak cukup untuk penarikan ini.');
+      }
+    };
+    if (tx) {
+      await writes(tx);
+      return;
+    }
+    await this.prisma.$transaction(writes);
   }
 
   /** Saldo + 50 mutasi terakhir. BigInt → Number (rupiah aman di 2^53). */

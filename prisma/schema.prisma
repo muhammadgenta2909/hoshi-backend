@@ -104,6 +104,9 @@ model User {
   // Mutasi saldo in-app (ledger append-only; audit tiap kredit/debit).
   balanceEntries BalanceEntry[]
 
+  // Permintaan tarik saldo ke bank/e-wallet (payout manual).
+  withdrawals Withdrawal[]
+
   // Alamat pengiriman kartu fisik (redeem). Maks 5 per user (ditegakkan di service).
   shippingAddresses ShippingAddress[]
 
@@ -142,6 +145,42 @@ model BalanceEntry {
   @@unique([reason, refId])
   @@index([userId])
   @@map("balance_entries")
+}
+
+enum WithdrawalStatus {
+  REQUESTED // user minta tarik; saldo sudah di-hold (debit). Menunggu admin transfer manual.
+  PAID // admin sudah transfer manual → selesai.
+  REJECTED // admin tolak → saldo dikembalikan (credit refund).
+}
+
+/// Permintaan tarik saldo in-app penjual ke rekening bank / e-wallet. Payout MANUAL: saat request
+/// dibuat, saldo langsung di-DEBIT (di-hold) supaya tak bisa dobel-tarik; admin transfer manual lalu
+/// menandai PAID; kalau ditolak, saldo dikembalikan (credit refund via reason WITHDRAW_REFUND).
+model Withdrawal {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Restrict)
+
+  /// Jumlah ditarik (rupiah utuh). BigInt: konsisten dengan balanceIdrx.
+  amountIdr BigInt
+
+  /// Tujuan transfer — snapshot saat request (bank / e-wallet).
+  method      String // "BANK" | "EWALLET"
+  destBank    String // nama bank / e-wallet (mis. "BCA", "GoPay")
+  destAccount String // no rekening / no telepon e-wallet
+  destName    String // nama pemilik rekening
+
+  status WithdrawalStatus @default(REQUESTED)
+
+  /// Catatan admin: no. referensi transfer (saat PAID) atau alasan tolak (saat REJECTED).
+  note String?
+
+  createdAt   DateTime  @default(now())
+  processedAt DateTime?
+
+  @@index([userId])
+  @@index([status])
+  @@map("withdrawals")
 }
 
 /// Alamat pengiriman kartu fisik milik user (untuk redeem). Cascade: alamat tidak

@@ -25,6 +25,8 @@ import {
 import { AdminGuard } from '../auth/admin.guard';
 import { MarketSyncService } from '../collectorcrypt/market-sync.service';
 import { GachaService } from '../collectorcrypt/gacha.service';
+import { WithdrawalService } from '../balance/withdrawal.service';
+import { ProcessWithdrawalDto } from '../balance/dto/process-withdrawal.dto';
 import { AdminService } from './admin.service';
 import { AdminCreateListingDto } from './dto/admin-create-listing.dto';
 import { CcSyncDto } from './dto/cc-sync.dto';
@@ -51,6 +53,7 @@ export class AdminController {
     private readonly admin: AdminService,
     private readonly ccSync: MarketSyncService,
     private readonly gacha: GachaService,
+    private readonly withdrawal: WithdrawalService,
   ) {}
 
   @Get('treasury')
@@ -129,11 +132,49 @@ export class AdminController {
     const bal = await this.gacha.treasuryBalances();
     const treasuryIdr =
       bal && bal.idrxBaseUnits != null ? bal.idrxBaseUnits / 100 : null;
+    // Kewajiban = saldo penjual hidup + penarikan REQUESTED (sudah di-debit tapi belum dibayar dari
+    // treasury). Profit aman = treasury − keduanya. JANGAN lupakan pending withdrawal → over-state.
     const distributableProfitIdr =
       treasuryIdr != null
-        ? Math.max(0, treasuryIdr - summary.liabilitiesIdr)
+        ? Math.max(
+            0,
+            treasuryIdr -
+              summary.liabilitiesIdr -
+              summary.pendingWithdrawalsIdr,
+          )
         : null;
     return { ...summary, treasuryIdr, distributableProfitIdr };
+  }
+
+  @Get('withdrawals')
+  @ApiBearerAuth()
+  @UseGuards(AdminGuard)
+  @ApiOperation({ summary: 'Daftar penarikan saldo penjual (payout manual)' })
+  withdrawals(@Query('status') status?: string) {
+    return this.withdrawal.adminList(status);
+  }
+
+  @Post('withdrawals/:id/approve')
+  @ApiBearerAuth()
+  @UseGuards(AdminGuard)
+  @ApiOperation({
+    summary: 'Tandai penarikan PAID (setelah admin transfer manual)',
+  })
+  approveWithdrawal(
+    @Param('id') id: string,
+    @Body() dto: ProcessWithdrawalDto,
+  ) {
+    return this.withdrawal.adminApprove(id, dto.note);
+  }
+
+  @Post('withdrawals/:id/reject')
+  @ApiBearerAuth()
+  @UseGuards(AdminGuard)
+  @ApiOperation({
+    summary: 'Tolak penarikan → kembalikan saldo ke penjual (credit refund)',
+  })
+  rejectWithdrawal(@Param('id') id: string, @Body() dto: ProcessWithdrawalDto) {
+    return this.withdrawal.adminReject(id, dto.note);
   }
 
   @Get('listings')
