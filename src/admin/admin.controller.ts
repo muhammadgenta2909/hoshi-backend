@@ -69,6 +69,9 @@ export class AdminController {
     // Read-only. gacha.treasuryBalances() reads the treasury's on-chain balances
     // (cached ~15s) and returns null when it cannot (RPC/treasury not configured).
     const bal = await this.gacha.treasuryBalances();
+    // simulated = USDC/SOL yang dikembalikan itu MOCK (staging) — UI wajib menandainya & TIDAK
+    // menampilkan angka $ palsu sbg saldo asli. IDRX tetap nilai asli.
+    const simulated = this.gacha.treasuryIsSimulated();
     if (!bal) {
       return {
         configured: false,
@@ -76,6 +79,7 @@ export class AdminController {
         sol: null,
         idrx: null,
         status: 'unknown' as const,
+        simulated,
       };
     }
     const usdc = bal.usdcBaseUnits / 1_000_000; // 6 desimal
@@ -85,7 +89,7 @@ export class AdminController {
     // yang sebenarnya; ini cuma isyarat "kapan isi ulang".
     const status: 'healthy' | 'low' | 'critical' =
       usdc < 25 || sol < 0.01 ? 'critical' : usdc < 75 ? 'low' : 'healthy';
-    return { configured: true, usdc, sol, idrx, status };
+    return { configured: true, usdc, sol, idrx, status, simulated };
   }
 
   @Post('login')

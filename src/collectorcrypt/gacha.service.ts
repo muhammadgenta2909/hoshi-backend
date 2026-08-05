@@ -503,6 +503,12 @@ export class GachaService {
     );
   }
 
+  /** Apakah saldo treasury yang dikembalikan treasuryBalances() adalah SIMULASI (mock staging,
+   *  USDC/SOL palsu) — supaya admin UI menandainya & tidak menampilkannya sebagai saldo asli. */
+  treasuryIsSimulated(): boolean {
+    return this.ccMockEnabled();
+  }
+
   /** Tulis satu baris pack OPENED palsu (kartu di-undi lokal) dan kembalikan DTO-nya. */
   private async mockPurchase(
     packType: string,
