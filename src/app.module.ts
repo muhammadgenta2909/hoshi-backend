@@ -21,6 +21,7 @@ import { PaymentsModule } from './payments/payments.module';
 import { SupportModule } from './support/support.module';
 import { BalanceModule } from './balance/balance.module';
 import { RedemptionModule } from './redemption/redemption.module';
+import { SwapModule } from './swap/swap.module';
 
 @Module({
   imports: [
@@ -43,6 +44,7 @@ import { RedemptionModule } from './redemption/redemption.module';
     SupportModule,
     BalanceModule,
     RedemptionModule,
+    SwapModule,
   ],
   controllers: [AppController],
   providers: [

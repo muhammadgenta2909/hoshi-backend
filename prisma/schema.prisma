@@ -113,6 +113,9 @@ model User {
   // Permintaan kirim kartu fisik ke rumah (redeem). Record-only: TIDAK burn/transfer NFT.
   cardRedemptions CardRedemption[]
 
+  // Ajakan tukar kartu (swap) yang DIBUAT user ini. Record-only: TIDAK transfer kartu.
+  swapRequests SwapRequest[]
+
   // Thread support (user ↔ admin).
   supportThreads SupportThread[]
 
@@ -263,6 +266,40 @@ model CardRedemption {
   // WHERE status IN (REQUESTED,PACKING,SHIPPED) — anti dobel-kirim fisik. Prisma tak bisa
   // memodelkan partial unique di schema, jadi ia hidup di migration SQL (di-apply migrate deploy).
   @@map("card_redemptions")
+}
+
+/// Status ajakan tukar kartu. REQUESTED = terkirim/menunggu; CANCELED = dibatalkan pembuat.
+enum SwapStatus {
+  REQUESTED
+  CANCELED
+}
+
+/// Ajakan TUKAR KARTU (barter) antar kolektor — "aku tawarkan kartu X ke wallet/email/SNS kamu".
+///
+/// RECORD-ONLY (MVP): mencatat AJAKAN + kartu yang ditawarkan + tujuan kontak. TIDAK transfer/
+/// burn kartu, TIDAK menyentuh treasury/on-chain — akseptasi & perpindahan kartu belum ada di
+/// fase ini. Kartu yang ditawarkan di-SNAPSHOT (nama/gambar) supaya riwayat tetap terbaca.
+model SwapRequest {
+  id         String @id @default(cuid())
+  proposerId String
+  proposer   User   @relation(fields: [proposerId], references: [id], onDelete: Cascade)
+
+  /// Kartu yang DITAWARKAN proposer — nftAddress = kunci kepemilikan (diverifikasi di service).
+  offeredNftAddress String
+  offeredCardName   String
+  offeredCardImage  String?
+
+  /// Cara & tujuan menghubungi kolektor lawan.
+  recipientMethod String // 'wallet' | 'email' | 'sns'
+  recipientValue  String
+
+  status    SwapStatus @default(REQUESTED)
+  note      String?
+  createdAt DateTime   @default(now())
+  updatedAt DateTime   @updatedAt
+
+  @@index([proposerId, createdAt])
+  @@map("swap_requests")
 }
 
 // Katalog/template kartu (metadata kartu fisik yang di-vault Hoshi).
