@@ -1,8 +1,22 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
+import { Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { Nft } from '@prisma/client';
+import { detectProductionSignal } from '../common/demo-mode';
 import { PrismaService } from '../prisma/prisma.service';
 import { UmiService } from '../solana/umi.service';
+
+const BASE58 =
+  '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+
+/** Alamat asset TIRUAN (mock) berbentuk base58 44-char — cukup mirip alamat Solana asli supaya
+ *  link explorer well-formed, tapi jelas bukan on-chain. Dipakai jalur mock (staging/CC_MOCK). */
+function mockAssetAddress(): string {
+  let s = '';
+  for (let i = 0; i < 44; i++) {
+    s += BASE58[Math.floor(Math.random() * BASE58.length)];
+  }
+  return s;
+}
 
 // Metadata JSON default (sama dengan yang didokumentasikan di .env.example) — dipakai HANYA sebagai
 // jaring terakhir bila kartu tak punya metadataUri DAN env DEFAULT_METADATA_URI tak di-set, supaya
@@ -40,11 +54,28 @@ function buildCardMetadataUri(card: {
 
 @Injectable()
 export class NftService {
+  private readonly logger = new Logger(NftService.name);
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly umi: UmiService,
     private readonly config: ConfigService,
   ) {}
+
+  /** MOCK vs REAL mint. Di lingkungan NON-produksi, mensimulasi mint (nol on-chain, tak butuh
+   *  PLATFORM_SECRET_KEY / SOL devnet) bila EITHER:
+   *    • CC_MOCK=1 (staging — konsisten dgn settlement reseller/P2P yang juga di-mock), ATAU
+   *    • PLATFORM_SECRET_KEY belum di-set (tanpa key mint on-chain memang mustahil → mending
+   *      degrade ke mock daripada melempar "PLATFORM_SECRET_KEY not set" saat beli/terima-offer).
+   *  Prod (detectProductionSignal ≠ null) TIDAK pernah mock (lagipula buy/acceptOffer sudah
+   *  di-assertDemoOnly di hulu). */
+  private mintMockEnabled(): boolean {
+    if (detectProductionSignal() !== null) return false;
+    return (
+      this.config.get<string>('CC_MOCK') === '1' ||
+      !this.config.get<string>('PLATFORM_SECRET_KEY')
+    );
+  }
 
   /** Mint card jadi NFT (owner = wallet user, platform bayar) lalu catat ke DB. */
   async mintForUser(params: {
@@ -68,17 +99,33 @@ export class NftService {
       this.config.get<string>('DEFAULT_METADATA_URI') ||
       FALLBACK_METADATA_URI;
 
-    const { assetAddress, signature } = await this.umi.mintCoreAsset({
-      ownerAddress: params.ownerAddress,
-      name: card.name,
-      uri,
-    });
+    // MOCK (staging/CC_MOCK): jangan mint on-chain — accept-offer/buy demo harus jalan tanpa
+    // PLATFORM_SECRET_KEY & SOL devnet. NFT jadi baris DB (owner = pembeli) → kartu tampil di
+    // Vault & marketplace seperti biasa, cukup untuk demo. REAL (prod/devnet-armed): mint sungguhan.
+    let assetAddress: string;
+    let mintTx: string | null;
+    if (this.mintMockEnabled()) {
+      assetAddress = mockAssetAddress();
+      mintTx = null;
+      this.logger.log(
+        `Mint MOCK (CC_MOCK): asset ${assetAddress} → ${params.ownerAddress} ` +
+          `(nol on-chain, tanpa PLATFORM_SECRET_KEY).`,
+      );
+    } else {
+      const minted = await this.umi.mintCoreAsset({
+        ownerAddress: params.ownerAddress,
+        name: card.name,
+        uri,
+      });
+      assetAddress = minted.assetAddress;
+      mintTx = minted.signature;
+    }
 
     const nft = await this.prisma.nft.create({
       data: {
         assetAddress,
         ownerAddress: params.ownerAddress,
-        mintTx: signature,
+        mintTx,
         metadataUri: uri,
         name: card.name,
         cardId: card.id,

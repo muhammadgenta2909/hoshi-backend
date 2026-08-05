@@ -120,7 +120,11 @@ describe('NftService', () => {
       name: 'X',
       metadataUri: null,
     });
-    config.get.mockReturnValue(undefined);
+    // PLATFORM_SECRET_KEY di-set (truthy) → jalur REAL (bukan mock); DEFAULT_METADATA_URI kosong
+    // → jatuh ke FALLBACK. (Tanpa key, mint akan MOCK — diuji terpisah.)
+    config.get.mockImplementation((k: string) =>
+      k === 'PLATFORM_SECRET_KEY' ? '[1,2,3]' : undefined,
+    );
     umi.mintCoreAsset.mockResolvedValue({ assetAddress: 'A', signature: 'S' });
     prisma.nft.create.mockResolvedValue({ id: 'n', assetAddress: 'A', mintTx: 'S' });
 
@@ -131,5 +135,46 @@ describe('NftService', () => {
     expect(umi.mintCoreAsset).toHaveBeenCalledWith(
       expect.objectContaining({ uri: expect.stringContaining('gateway.irys.xyz') }),
     );
+  });
+
+  it('CC_MOCK=1 (non-prod) → mint DISIMULASI: UmiService TAK dipanggil, NFT dicatat dgn alamat mock & mintTx null', async () => {
+    // detectProductionSignal() harus null → bersihkan sinyal prod dari env, pulihkan sesudahnya.
+    const saved = {
+      SOLANA_CLUSTER: process.env.SOLANA_CLUSTER,
+      SOLANA_RPC_URL: process.env.SOLANA_RPC_URL,
+      COLLECTORCRYPT_GACHA_BASE_URL: process.env.COLLECTORCRYPT_GACHA_BASE_URL,
+    };
+    delete process.env.SOLANA_CLUSTER;
+    delete process.env.SOLANA_RPC_URL;
+    delete process.env.COLLECTORCRYPT_GACHA_BASE_URL;
+    try {
+      prisma.card.findUnique.mockResolvedValue({
+        id: 'c1',
+        name: 'Pikachu',
+        metadataUri: 'https://meta/pikachu.json',
+      });
+      config.get.mockImplementation((k: string) => (k === 'CC_MOCK' ? '1' : undefined));
+      prisma.nft.create.mockImplementation((args: { data: { assetAddress: string } }) =>
+        Promise.resolve({ id: 'nMock', ...args.data }),
+      );
+
+      const res = await service.mintForUser(params);
+
+      // JAMINAN: nol on-chain — UmiService.mintCoreAsset TIDAK dipanggil (tanpa PLATFORM_SECRET_KEY pun jalan).
+      expect(umi.mintCoreAsset).not.toHaveBeenCalled();
+      const [createArg] = prisma.nft.create.mock.calls[0] as [
+        { data: { assetAddress: string; mintTx: string | null; ownerId: string } },
+      ];
+      // Alamat mock base58 44-char (bukan hasil umi), mintTx null (tak ada tx on-chain).
+      expect(createArg.data.assetAddress).toMatch(/^[1-9A-HJ-NP-Za-km-z]{44}$/);
+      expect(createArg.data.mintTx).toBeNull();
+      expect(createArg.data.ownerId).toBe('u1');
+      expect(res.assetAddress).toBe(createArg.data.assetAddress);
+    } finally {
+      for (const [k, v] of Object.entries(saved)) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+    }
   });
 });
