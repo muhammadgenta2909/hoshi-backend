@@ -7,7 +7,7 @@ import {
   ServiceUnavailableException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { ListingStatus, PaymentStatus } from '@prisma/client';
+import { ActivityType, ListingStatus, PaymentStatus } from '@prisma/client';
 import type { Listing, PaymentOrder } from '@prisma/client';
 import { detectProductionSignal } from '../common/demo-mode';
 import { PublicKey } from '@solana/web3.js';
@@ -365,7 +365,12 @@ export class PaymentsService {
       listing.sellerId == null &&
       !!listing.ccNftAddress &&
       listing.ccPriceUsd != null;
-    if (!isUserListing && !isCcCatalog) {
+    // INVENTARIS HOSHI: kartu milik Hoshi sendiri (di-upload admin) — source=HOSHI, tanpa penjual
+    // user. Hoshi = penjual + platform → SELURUH harga pendapatan Hoshi, TIDAK beli di CC, TIDAK
+    // ada leg USDC (priceUsdc tetap 0 karena bukan isCcCatalog). Settlement-nya cuma DB (klaim SOLD).
+    const isHoshiInventory =
+      listing.source !== 'COLLECTORCRYPT' && listing.sellerId == null;
+    if (!isUserListing && !isCcCatalog && !isHoshiInventory) {
       throw new BadRequestException(
         'Kartu ini belum bisa dibeli lewat jalur ini.',
       );
@@ -897,6 +902,13 @@ export class PaymentsService {
       return this.fulfilUserListing(order, listing, user);
     }
 
+    // INVENTARIS HOSHI (source != COLLECTORCRYPT, tanpa penjual user): Hoshi jual kartunya SENDIRI.
+    // Seluruh harga tetap di treasury = kas Hoshi. Nol beli-di-CC, nol kredit penjual eksternal,
+    // nol on-chain. Dicek SEBELUM gerbang reseller CC (yang butuh ccNftAddress + USDC).
+    if (listing.source !== 'COLLECTORCRYPT') {
+      return this.fulfilHoshiInventory(order, listing, user);
+    }
+
     const mock = this.ccMockEnabled();
     const armed =
       (this.config.get<string>('HOSHI_CC_RESELL_ENABLED') ?? '')
@@ -1026,6 +1038,64 @@ export class PaymentsService {
     this.logger.warn(
       `MOCK reseller: listing ${listing.id} (${listing.name}) "terkirim" ke user ${user.id} ` +
         `TANPA belanja treasury (order ${order.merchantOrderId} FULFILLED).`,
+    );
+    return 'FULFILLED';
+  }
+
+  /**
+   * Settlement INVENTARIS HOSHI: kartu milik Hoshi sendiri (source=HOSHI, tanpa penjual user).
+   * Hoshi adalah penjual DAN platform, jadi SELURUH harga (priceIdrx) = pendapatan Hoshi yang
+   * TETAP di treasury — TIDAK ada kredit saldo penjual eksternal, TIDAK beli di CC, TIDAK ada
+   * USDC/SOL/on-chain yang bergerak. (Fee 5% marketplace hanya relevan untuk P2P yang penjualnya
+   * user eksternal; di sini Hoshi menyimpan 100%.)
+   *
+   * Klaim ACTIVE→SOLD + FULFILLED + baris feed SALE_CARD dalam SATU transaksi (gerbang konkurensi:
+   * dua order untuk satu kartu → tepat satu menang; yang kalah = refund manual tanpa efek).
+   */
+  private async fulfilHoshiInventory(
+    order: PaymentOrder,
+    listing: Listing,
+    user: { id: string; walletAddress: string },
+  ): Promise<FulfilOutcome> {
+    const claimedCount = await this.prisma.$transaction(async (tx) => {
+      const claim = await tx.listing.updateMany({
+        where: { id: listing.id, status: ListingStatus.ACTIVE },
+        data: { status: ListingStatus.SOLD, buyerId: user.id, soldAt: new Date() },
+      });
+      if (claim.count !== 1) return claim.count;
+      await tx.paymentOrder.update({
+        where: { merchantOrderId: order.merchantOrderId },
+        data: {
+          status: PaymentStatus.FULFILLED,
+          fulfilledAt: new Date(),
+          error: null,
+        },
+      });
+      await tx.activity.create({
+        data: {
+          type: ActivityType.SALE_CARD,
+          listingId: listing.id,
+          itemName: listing.name,
+          itemImage: listing.image,
+          category: listing.category,
+          set: listing.set,
+          amount: listing.priceIdrx,
+          fromLabel: 'Hoshi',
+          toId: user.id,
+          toLabel: user.walletAddress,
+        },
+      });
+      return claim.count;
+    });
+    if (claimedCount !== 1) {
+      return this.failToRefund(
+        order,
+        `Listing ${listing.id} sudah terjual lebih dulu — pembayaran perlu di-refund manual.`,
+      );
+    }
+    this.logger.log(
+      `Inventaris Hoshi: listing ${listing.id} (${listing.name}) terjual ke user ${user.id} — ` +
+        `Rp ${listing.priceIdrx} masuk kas Hoshi (order ${order.merchantOrderId} FULFILLED).`,
     );
     return 'FULFILLED';
   }

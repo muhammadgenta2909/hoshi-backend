@@ -59,6 +59,7 @@ describe('PaymentsService', () => {
     user: { findUnique: jest.Mock };
     ccPackPurchase: { aggregate: jest.Mock };
     listing: { findUnique: jest.Mock; updateMany: jest.Mock };
+    activity: { create: jest.Mock };
     $transaction: jest.Mock;
   };
   let idrx: {
@@ -289,6 +290,8 @@ describe('PaymentsService', () => {
         findUnique: jest.fn().mockResolvedValue(null),
         updateMany: jest.fn().mockResolvedValue({ count: 1 }),
       },
+      // Feed aktivitas (SALE_CARD) — ditulis mis. saat settle inventaris Hoshi.
+      activity: { create: jest.fn().mockResolvedValue({}) },
       $transaction: jest.fn((cb: (tx: typeof prisma) => unknown) => cb(prisma)),
     };
     idrx = {
@@ -804,6 +807,60 @@ describe('PaymentsService', () => {
 
       expect(outcome).toBe('REFUND_DUE');
       expect(resellerSettlement.settle).not.toHaveBeenCalled(); // NOL belanja treasury
+    });
+
+    it('INVENTARIS HOSHI (source=HOSHI, tanpa penjual): klaim SOLD + FULFILLED, NOL kredit penjual, NOL beli-CC/pack', async () => {
+      const hoshiListing = {
+        ...catalogListing,
+        id: 'listing-hoshi-1',
+        name: 'Pikachu Hoshi',
+        source: 'HOSHI',
+        sellerId: null,
+        ccNftAddress: null,
+        ccPriceUsd: null,
+        image: null,
+        category: null,
+        set: null,
+        priceIdrx: 3_000_000,
+        status: 'ACTIVE',
+      };
+      const hoshiOrder: PaymentOrder = {
+        ...baseOrder,
+        packType: 'MARKETPLACE',
+        listingId: hoshiListing.id,
+        priceUsdc: 0,
+      };
+      prisma.paymentOrder.findUnique.mockResolvedValue(hoshiOrder);
+      prisma.listing.findUnique.mockResolvedValue(hoshiListing);
+
+      const outcome = await service.handleCallback({
+        merchantOrderId: MERCHANT_ORDER_ID,
+      });
+
+      expect(outcome).toBe('FULFILLED');
+      // Hoshi = penjual + platform → simpan 100%: NOL beli-CC, NOL beli pack, NOL kredit penjual.
+      expect(resellerSettlement.settle).not.toHaveBeenCalled();
+      expect(gacha.purchase).not.toHaveBeenCalled();
+      expect(balance.credit).not.toHaveBeenCalled();
+      // Klaim listing ACTIVE→SOLD ke pembeli + order FULFILLED + baris feed SALE_CARD.
+      expect(prisma.listing.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: hoshiListing.id, status: 'ACTIVE' },
+          data: expect.objectContaining({
+            status: 'SOLD',
+            buyerId: user.id,
+          }) as unknown,
+        }),
+      );
+      expect(prisma.paymentOrder.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { merchantOrderId: MERCHANT_ORDER_ID },
+          data: expect.objectContaining({
+            status: PaymentStatus.FULFILLED,
+          }) as unknown,
+        }),
+      );
+      expect(prisma.activity.create).toHaveBeenCalled();
     });
   });
 

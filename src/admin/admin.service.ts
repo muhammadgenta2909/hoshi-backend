@@ -221,17 +221,34 @@ export class AdminService {
    * "profit yang aman ditarik" (treasury − kewajiban) dihitung di controller (yang punya akses gacha).
    */
   async financeSummary() {
-    const [resellerAgg, p2pAgg, sellers, pendingWdAgg] = await Promise.all([
-      this.prisma.listing.aggregate({
-        where: { status: ListingStatus.SOLD, sellerId: null },
-        _sum: { priceIdrx: true },
-        _count: true,
-      }),
-      this.prisma.listing.aggregate({
-        where: { status: ListingStatus.SOLD, sellerId: { not: null } },
-        _sum: { priceIdrx: true },
-        _count: true,
-      }),
+    const [resellerAgg, hoshiInvAgg, p2pAgg, sellers, pendingWdAgg] =
+      await Promise.all([
+        // Reseller = Hoshi jual kartu KATALOG CC (source COLLECTORCRYPT, tanpa penjual user).
+        this.prisma.listing.aggregate({
+          where: {
+            status: ListingStatus.SOLD,
+            sellerId: null,
+            source: ListingSource.COLLECTORCRYPT,
+          },
+          _sum: { priceIdrx: true },
+          _count: true,
+        }),
+        // Inventaris Hoshi = Hoshi jual kartu SENDIRI (source HOSHI, tanpa penjual user).
+        // Seluruh omzet = pendapatan Hoshi (bukan modal CC, bukan titipan penjual).
+        this.prisma.listing.aggregate({
+          where: {
+            status: ListingStatus.SOLD,
+            sellerId: null,
+            source: ListingSource.HOSHI,
+          },
+          _sum: { priceIdrx: true },
+          _count: true,
+        }),
+        this.prisma.listing.aggregate({
+          where: { status: ListingStatus.SOLD, sellerId: { not: null } },
+          _sum: { priceIdrx: true },
+          _count: true,
+        }),
       this.prisma.user.findMany({
         where: { balanceIdrx: { gt: 0 } },
         select: {
@@ -266,6 +283,10 @@ export class AdminService {
       reseller: {
         count: resellerAgg._count,
         grossIdr: resellerAgg._sum.priceIdrx ?? 0,
+      },
+      hoshiInventory: {
+        count: hoshiInvAgg._count,
+        grossIdr: hoshiInvAgg._sum.priceIdrx ?? 0,
       },
       p2p: { count: p2pAgg._count, grossIdr: p2pAgg._sum.priceIdrx ?? 0 },
       liabilitiesIdr,

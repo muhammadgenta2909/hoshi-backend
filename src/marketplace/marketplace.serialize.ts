@@ -155,6 +155,9 @@ export function toCardDetailDto(row: ListingRow, related: ListingRow[]) {
     title: row.name,
     tags: [row.grade, languageTag, row.era] as [string, string, string],
     consignedBy: row.sellerAddress,
+    // true = ada PENJUAL USER (listing P2P) → fee 5% dipotong dari penjual. false = milik Hoshi
+    // sendiri / katalog CC (tak ada penjual eksternal). Sinyal andal (sellerAddress bisa apa saja).
+    sellerConsigned: row.sellerId != null,
     certificate: row.certificate ?? null,
     estMarketValueIdr: row.expectedValueIdrx,
     vaultLocation: row.vaultLocation ?? null,
