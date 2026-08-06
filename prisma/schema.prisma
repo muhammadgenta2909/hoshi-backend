@@ -446,6 +446,12 @@ model Listing {
   // `source` — BUKAN lagi disimpulkan dari buybackIdrx > 0.
   source ListingSource @default(HOSHI)
 
+  /// Kartu INVENTARIS HOSHI yang benar-benar boleh dijual (di-upload admin sbg stok). Default false
+  /// supaya baris seed/chart-filler & data placeholder (source=HOSHI, sellerId=null — bentuk DEFAULT
+  /// setiap listing) TIDAK bisa dibeli. Hanya createListing/import yang men-set true. Jalur beli
+  /// Hoshi-inventory di payments WAJIB cek flag ini (bukan sekadar "source=HOSHI tanpa penjual").
+  sellable Boolean @default(false)
+
   // Kunci upsert sync: alamat NFT (Solana asset) kartu di katalog CC.
   // @unique ⇒ re-sync meng-update baris yang sama, tidak pernah menduplikasi.
   ccNftAddress String? @unique

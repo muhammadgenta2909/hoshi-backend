@@ -816,6 +816,7 @@ describe('PaymentsService', () => {
         name: 'Pikachu Hoshi',
         source: 'HOSHI',
         sellerId: null,
+        sellable: true, // stok Hoshi genuine (bukan seed) → boleh dibeli
         ccNftAddress: null,
         ccPriceUsd: null,
         image: null,
@@ -884,9 +885,13 @@ describe('PaymentsService', () => {
       packType: 'MARKETPLACE',
       listingId: userListing.id,
       priceUsdc: 0,
+      // priceIdr = baseOrder (805.600) = yang PEMBELI benar-benar bayar (cocok dgn record IDRX).
+      // SENGAJA beda dari listing.priceIdrx (1.000.000) untuk MEMBUKTIKAN payout dihitung dari yang
+      // dibayar (order), BUKAN dari listing.priceIdrx live yang bisa penjual ubah setelah order.
     };
-    // Komisi default 5% (HOSHI_MARKETPLACE_FEE_BPS=500) → payout 950.000.
-    const PAYOUT = 950_000;
+    // Payout di-backout dari order.priceIdr: base = floor(805.600 × 10000/10070) = 799.999;
+    // komisi 5% = 39.999; payout = 760.000. (Kalau salah pakai listing.priceIdrx → jadi 950.000.)
+    const PAYOUT = 760_000;
 
     it('MOCK: klaim SOLD + kredit saldo penjual (DB) TANPA on-chain (escrow tak dipanggil)', async () => {
       const saved = {

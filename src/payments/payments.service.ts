@@ -366,10 +366,14 @@ export class PaymentsService {
       !!listing.ccNftAddress &&
       listing.ccPriceUsd != null;
     // INVENTARIS HOSHI: kartu milik Hoshi sendiri (di-upload admin) — source=HOSHI, tanpa penjual
-    // user. Hoshi = penjual + platform → SELURUH harga pendapatan Hoshi, TIDAK beli di CC, TIDAK
-    // ada leg USDC (priceUsdc tetap 0 karena bukan isCcCatalog). Settlement-nya cuma DB (klaim SOLD).
+    // user, DAN ditandai `sellable`. Flag `sellable` WAJIB: source=HOSHI+sellerId=null adalah bentuk
+    // DEFAULT tiap listing (termasuk seed/chart-filler placeholder) — tanpa flag ini kartu hantu ikut
+    // buyable & pembeli bayar rupiah untuk barang tak terkirim. Hoshi = penjual+platform → seluruh
+    // harga pendapatan Hoshi, TIDAK beli di CC, priceUsdc 0. Settlement cuma DB (klaim SOLD).
     const isHoshiInventory =
-      listing.source !== 'COLLECTORCRYPT' && listing.sellerId == null;
+      listing.source !== 'COLLECTORCRYPT' &&
+      listing.sellerId == null &&
+      listing.sellable === true;
     if (!isUserListing && !isCcCatalog && !isHoshiInventory) {
       throw new BadRequestException(
         'Kartu ini belum bisa dibeli lewat jalur ini.',
@@ -906,6 +910,15 @@ export class PaymentsService {
     // Seluruh harga tetap di treasury = kas Hoshi. Nol beli-di-CC, nol kredit penjual eksternal,
     // nol on-chain. Dicek SEBELUM gerbang reseller CC (yang butuh ccNftAddress + USDC).
     if (listing.source !== 'COLLECTORCRYPT') {
+      // Defense-in-depth: hanya stok yang DITANDAI sellable. Guard di createListingOrder sudah
+      // menolak yang tidak sellable, tapi kalau toh ada order (mis. dibuat sebelum flag ini),
+      // JANGAN tandai baris seed/placeholder terjual — refund manual.
+      if (!listing.sellable) {
+        return this.failToRefund(
+          order,
+          `Listing ${listing.id} bukan stok Hoshi yang dijual (sellable=false) — refund manual.`,
+        );
+      }
       return this.fulfilHoshiInventory(order, listing, user);
     }
 
@@ -1136,14 +1149,22 @@ export class PaymentsService {
       );
     }
 
-    // Komisi Hoshi diambil dari sisi PENJUAL (pembeli sudah bayar priceIdrx + fee QRIS). Clamp
-    // 0..100% supaya salah setting env tidak bikin payout NEGATIF (penjual malah "berutang").
+    // BASIS payout = harga yang PEMBELI BENAR-BENAR BAYAR, di-backout dari order.priceIdr (dikunci
+    // saat order dibuat), BUKAN listing.priceIdrx yang bisa diubah penjual SESUDAH order terbit.
+    // Tanpa ini: penjual menaikkan harga di tengah invoice → treasury cuma terima harga lama tapi
+    // penjual dikredit harga baru → treasury drain + over-credit. order.priceIdr = base × (1 + QRIS),
+    // jadi base = order.priceIdr × BPS / (BPS + QRIS_FEE).
+    const paidBaseIdrx = Math.floor(
+      (order.priceIdr * BPS_DENOMINATOR) / (BPS_DENOMINATOR + QRIS_FEE_BPS),
+    );
+    // Komisi Hoshi diambil dari sisi PENJUAL. Clamp 0..100% supaya salah setting env tidak bikin
+    // payout NEGATIF (penjual malah "berutang").
     const feeBps = Math.min(
       this.intConfig('HOSHI_MARKETPLACE_FEE_BPS', 500, 0),
       BPS_DENOMINATOR,
     );
-    const commission = Math.floor((listing.priceIdrx * feeBps) / BPS_DENOMINATOR);
-    const payout = listing.priceIdrx - commission;
+    const commission = Math.floor((paidBaseIdrx * feeBps) / BPS_DENOMINATOR);
+    const payout = paidBaseIdrx - commission;
 
     if (mock) {
       // MOCK: klaim ACTIVE→SOLD + kredit penjual (DB, nyata biar payout kelihatan) + order

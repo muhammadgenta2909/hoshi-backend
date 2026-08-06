@@ -370,6 +370,9 @@ export class AdminService {
         element: dto.element,
         category: dto.category,
         sellerAddress: dto.sellerAddress ?? 'admin',
+        // Stok Hoshi genuine yang di-upload admin → boleh dijual (jalur Hoshi-inventory). Seed
+        // chart-filler TIDAK lewat sini, jadi tetap sellable=false (tak bisa dibeli).
+        sellable: true,
         certificate: dto.certificate,
         vaultLocation: dto.vaultLocation,
         cardNumber: dto.cardNumber,

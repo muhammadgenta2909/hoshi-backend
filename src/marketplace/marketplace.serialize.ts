@@ -158,6 +158,9 @@ export function toCardDetailDto(row: ListingRow, related: ListingRow[]) {
     // true = ada PENJUAL USER (listing P2P) → fee 5% dipotong dari penjual. false = milik Hoshi
     // sendiri / katalog CC (tak ada penjual eksternal). Sinyal andal (sellerAddress bisa apa saja).
     sellerConsigned: row.sellerId != null,
+    // true = stok Hoshi genuine yang boleh dibeli (jalur Hoshi-inventory). Baris seed/placeholder
+    // (source=HOSHI,sellerId=null tapi sellable=false) → false, jadi UI tak menawarkan beli.
+    sellable: row.sellable,
     certificate: row.certificate ?? null,
     estMarketValueIdr: row.expectedValueIdrx,
     vaultLocation: row.vaultLocation ?? null,
