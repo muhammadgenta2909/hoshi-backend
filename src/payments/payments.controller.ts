@@ -20,6 +20,7 @@ import { CurrentUser } from '../auth/current-user.decorator';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import type { AuthUser } from '../auth/jwt.strategy';
 import { CreateListingOrderDto } from './dto/create-listing-order.dto';
+import { CreateOfferOrderDto } from './dto/create-offer-order.dto';
 import { CreatePackOrderDto } from './dto/create-pack-order.dto';
 import { CreateTopupOrderDto } from './dto/create-topup-order.dto';
 import { PaymentsService } from './payments.service';
@@ -86,6 +87,25 @@ export class PaymentsController {
     @CurrentUser() user: AuthUser,
   ) {
     return this.payments.createListingOrder(dto.listingId, user);
+  }
+
+  @Post('offer')
+  @ApiBearerAuth()
+  @UseGuards(JwtAuthGuard)
+  @Throttle({ default: { ttl: 60000, limit: 10 } })
+  @ApiOperation({
+    summary:
+      'Terbitkan tagihan rupiah untuk membayar OFFER yang sudah diterima penjual (di harga offer)',
+    description:
+      'Pembeli bayar di HARGA OFFER (di-snapshot server dari baris Offer). Saat lunas, kartu ' +
+      'dikirim ke pembeli & penjual dikredit (harga offer − komisi). Menerima offer hanya ' +
+      'menyetujui harga; kartu berpindah SETELAH pembayaran ini.',
+  })
+  createOfferOrder(
+    @Body() dto: CreateOfferOrderDto,
+    @CurrentUser() user: AuthUser,
+  ) {
+    return this.payments.createOfferOrder(dto.offerId, user);
   }
 
   @Post('topup')

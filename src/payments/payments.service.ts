@@ -592,6 +592,117 @@ export class PaymentsService {
     return toPaymentOrderDto(order);
   }
 
+  /**
+   * Terbitkan tagihan rupiah untuk MEMBAYAR OFFER yang SUDAH DITERIMA penjual. Pembeli bayar di
+   * HARGA OFFER (bukan harga listing) + fee QRIS; saat lunas, settlement P2P (fulfilUserListing)
+   * mengirim kartu ke pembeli & mengkredit penjual (harga offer − komisi). Kartu BARU pindah
+   * setelah bayar — accept hanya menyetujui harga.
+   */
+  async createOfferOrder(
+    offerId: string,
+    user: AuthUser,
+  ): Promise<PaymentOrderDto> {
+    const treasuryAddress = this.treasuryAddressOrRefuse();
+
+    const offer = await this.prisma.offer.findUnique({
+      where: { id: offerId },
+      include: { listing: true },
+    });
+    if (!offer) throw new BadRequestException('Offer tidak ditemukan.');
+    if (offer.buyerId !== user.id) {
+      throw new ForbiddenException('Offer ini bukan milik Anda.');
+    }
+    if (offer.status !== 'ACCEPTED') {
+      throw new BadRequestException(
+        'Offer belum diterima penjual — belum bisa dibayar.',
+      );
+    }
+    const listing = offer.listing;
+    if (!listing || listing.status !== ListingStatus.ACTIVE) {
+      throw new BadRequestException('Kartu sudah tidak tersedia.');
+    }
+    if (listing.sellerId == null) {
+      throw new BadRequestException('Listing ini tidak punya penjual.');
+    }
+    if (listing.sellerId === user.id) {
+      throw new BadRequestException('Tidak bisa membeli kartu yang Anda jual sendiri.');
+    }
+
+    // IDEMPOTEN per (user, listing): spam "Bayar" tidak menumpuk order/mint-request.
+    const existingPending = await this.prisma.paymentOrder.findFirst({
+      where: {
+        userId: user.id,
+        listingId: listing.id,
+        status: PaymentStatus.PENDING,
+        expiresAt: { gt: new Date() },
+      },
+      orderBy: { createdAt: 'desc' },
+    });
+    if (existingPending) return toPaymentOrderDto(existingPending);
+
+    await this.assertOrderQuota(user.id);
+
+    // HARGA OFFER (bukan listing.priceIdrx) + fee QRIS di atasnya.
+    const priceIdr = applyBps(offer.amount, BPS_DENOMINATOR + QRIS_FEE_BPS);
+    if (priceIdr < IDRX_MIN_MINT_IDR || priceIdr > IDRX_MAX_MINT_IDR) {
+      throw new BadRequestException(
+        `Harga offer (Rp ${priceIdr}) di luar batas pembayaran IDRX ` +
+          `(Rp ${IDRX_MIN_MINT_IDR}–Rp ${IDRX_MAX_MINT_IDR}).`,
+      );
+    }
+
+    const expiryMinutes = this.intConfig(
+      'HOSHI_ORDER_EXPIRY_MINUTES',
+      DEFAULT_EXPIRY_MINUTES,
+      1,
+    );
+    const returnUrl = new URL(
+      '/vault',
+      this.requiredConfig('HOSHI_PAYMENT_RETURN_URL'),
+    ).toString();
+    const mint = await this.idrx.mintRequest({
+      toBeMinted: String(priceIdr),
+      destinationWalletAddress: treasuryAddress,
+      networkChainId: this.requiredConfig('IDRX_NETWORK_CHAIN_ID'),
+      returnUrl,
+      expiryPeriod: expiryMinutes,
+      productDetails: `Hoshi offer ${listing.name}`.slice(0, 255),
+    });
+    const data = mint.data;
+    if (
+      !data ||
+      typeof data.merchantOrderId !== 'string' ||
+      !data.merchantOrderId
+    ) {
+      throw new ServiceUnavailableException(
+        'IDRX tidak mengembalikan merchantOrderId. Order tidak dibuat — coba lagi.',
+      );
+    }
+    const order = await this.prisma.paymentOrder.create({
+      data: {
+        merchantOrderId: data.merchantOrderId,
+        idrxRequestId: data.id != null ? String(data.id) : null,
+        reference: data.reference ?? null,
+        userId: user.id,
+        packType: 'MARKETPLACE',
+        listingId: listing.id,
+        priceIdr,
+        priceUsdc: 0,
+        paymentMethod: 'HOSTED',
+        qrContent: data.qrContent ?? null,
+        virtualAccountNo: data.virtualAccountNo ?? null,
+        paymentUrl: data.paymentUrl ?? null,
+        expiresAt: new Date(Date.now() + expiryMinutes * 60_000),
+        status: PaymentStatus.PENDING,
+      },
+    });
+    this.logger.log(
+      `Order offer ${order.merchantOrderId} dibuat: offer ${offerId} listing ${listing.id} ` +
+        `(${listing.name}), Rp ${priceIdr} @ harga offer (user ${user.id}).`,
+    );
+    return toPaymentOrderDto(order);
+  }
+
   /* ─────────────────────────── Callback IDRX ─────────────────────────── */
 
   /**

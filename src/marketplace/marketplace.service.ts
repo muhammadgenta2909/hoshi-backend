@@ -391,11 +391,9 @@ export class MarketplaceService {
    * TODO(pembayaran): tanpa escrow, penerimaan offer belum menarik dana pembeli.
    */
   async acceptOffer(offerId: string, user: AuthUser): Promise<OfferDto> {
-    // Menerima offer memindahkan kartu tanpa settlement, persis seperti buy().
-    // Ditaruh DI SINI, bukan di controller: acceptOfferAsAdmin() masuk lewat pintu
-    // lain ke metode yang sama, jadi penjagaan di controller akan terlewat.
-    assertDemoOnly('Menerima penawaran marketplace');
-
+    // MENERIMA OFFER = menyetujui HARGA, BUKAN memindahkan kartu. Kartu baru pindah SETELAH pembeli
+    // MEMBAYAR (createOfferPaymentOrder → settlement P2P: kartu ke pembeli + penjual dikredit di
+    // harga offer). Dulu accept langsung mint kartu gratis ke pembeli (tanpa bayar) — itu bug.
     const offer = await this.loadOffer(offerId);
     this.assertSeller(offer.listing.sellerId, user);
 
@@ -407,67 +405,18 @@ export class MarketplaceService {
         'This offer predates wallet-linked offers and cannot be accepted.',
       );
     }
-    const buyer = await this.prisma.user.findUnique({
-      where: { id: offer.buyerId },
-      select: { id: true, walletAddress: true },
-    });
-    if (!buyer) throw new NotFoundException('Buyer account not found.');
 
     const listingId = offer.listingId;
     const existing = await this.prisma.listing.findUnique({
       where: { id: listingId },
     });
     if (!existing) throw new NotFoundException('Listing tidak ditemukan.');
-    // Escrow-backed (real P2P) → jangan settle lewat demo instant-mint (mint duplikat + kartu escrow
-    // tertelantar + penjual tak dibayar). Sama seperti buy(): pakai FAKTA escrowedAt, bukan flag.
-    if (existing.escrowedAt) {
-      throw new BadRequestException(
-        'Kartu ini dijual lewat pembayaran Rupiah — tidak bisa lewat offer/accept jalur demo ini.',
-      );
+    if (existing.status !== ListingStatus.ACTIVE) {
+      throw new BadRequestException('Listing sudah tidak aktif / terjual.');
     }
 
-    // Snapshot pra-jual untuk kompensasi kalau mint gagal (lihat buy()).
-    const prev = {
-      status: existing.status,
-      buyerId: existing.buyerId,
-      soldAt: existing.soldAt,
-      nftId: existing.nftId,
-    };
-
-    // Flip ATOMIK ACTIVE→SOLD: hanya satu accept yang menang walau ada race
-    // dengan buy() atau accept offer lain pada listing yang sama.
-    const sold = await this.prisma.listing.updateMany({
-      where: { id: listingId, status: ListingStatus.ACTIVE },
-      data: {
-        status: ListingStatus.SOLD,
-        buyerId: buyer.id,
-        soldAt: new Date(),
-      },
-    });
-    if (sold.count !== 1) {
-      throw new BadRequestException('Listing already sold / inactive.');
-    }
-
-    try {
-      await this.mintAndLink(listingId, buyer, prev.nftId);
-    } catch (err) {
-      await this.prisma.listing.updateMany({
-        where: {
-          id: listingId,
-          status: ListingStatus.SOLD,
-          buyerId: buyer.id,
-          nftId: prev.nftId,
-        },
-        data: {
-          status: prev.status,
-          buyerId: prev.buyerId,
-          soldAt: prev.soldAt,
-        },
-      });
-      throw err;
-    }
-
-    // Sale sudah settle. Tandai offer diterima & tutup offer lain yang bersaing.
+    // Tandai ACCEPTED + tolak offer lain yang bersaing. TIDAK memindahkan kartu & TIDAK menandai
+    // SOLD di sini — listing tetap ACTIVE sampai pembeli bayar (klaim ACTIVE→SOLD di settlement).
     await this.prisma.$transaction([
       this.prisma.offer.update({
         where: { id: offerId },
@@ -482,16 +431,6 @@ export class MarketplaceService {
         data: { status: OfferStatus.REJECTED },
       }),
     ]);
-
-    await this.recordActivity({
-      type: ActivityType.SALE_CARD,
-      listing: offer.listing,
-      amount: offer.amount,
-      fromId: user.id,
-      fromLabel: displayLabel(user, shortWallet(user.walletAddress)),
-      toId: buyer.id,
-      toLabel: offer.user,
-    });
 
     return toOfferDto(await this.loadOffer(offerId));
   }
