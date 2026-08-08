@@ -17,6 +17,7 @@ import {
   OfferStatus,
   PaymentStatus,
   Prisma,
+  RedemptionStatus,
   StorageProvider,
   VaultStatus,
   WithdrawalStatus,
@@ -122,6 +123,63 @@ export class AdminService {
       totalCards,
       totalRevenue: revenueAgg._sum.priceIdrx ?? 0,
     };
+  }
+
+  /* ---------------------- Kirim kartu fisik (redemption) ---------------------- */
+
+  /** Semua permintaan kirim kartu fisik (admin), terbaru dulu. */
+  async listRedemptions() {
+    return this.prisma.cardRedemption.findMany({
+      orderBy: { createdAt: 'desc' },
+      take: 200,
+    });
+  }
+
+  /**
+   * Admin memajukan status kirim: REQUESTED → PACKING → SHIPPED, atau CANCELED.
+   *
+   * SHIPPED = kartu fisik benar-benar dikirim CollectorCrypt (lewat shipping API) + NFT-nya di-BURN
+   * sehingga kartu keluar dari vault (jadi fisik di tangan pemilik). Jalur REAL itu men-sentuh aset
+   * on-chain & memanggil CC → DIGERBANG dan BELUM diaktifkan (record-only). Di sini status-nya maju
+   * saja; SAAT GO-LIVE, di titik SHIPPED panggil CC shipping API + burnV1 (arming sadar, seperti
+   * gerbang treasury lain). Di staging/mock, "hilang dari vault" disimulasi frontend (vault
+   * menyembunyikan kartu yang redemption-nya SHIPPED) — nol on-chain.
+   */
+  async updateRedemptionStatus(id: string, status: RedemptionStatus) {
+    const row = await this.prisma.cardRedemption.findUnique({ where: { id } });
+    if (!row) {
+      throw new NotFoundException('Permintaan kirim tidak ditemukan.');
+    }
+    // Transisi sah: REQUESTED→PACKING→SHIPPED (maju), atau ke CANCELED dari REQUESTED/PACKING.
+    // Status terminal (SHIPPED/CANCELED) tak bisa diubah lagi.
+    const allowed: Record<RedemptionStatus, RedemptionStatus[]> = {
+      [RedemptionStatus.REQUESTED]: [
+        RedemptionStatus.PACKING,
+        RedemptionStatus.SHIPPED,
+        RedemptionStatus.CANCELED,
+      ],
+      [RedemptionStatus.PACKING]: [
+        RedemptionStatus.SHIPPED,
+        RedemptionStatus.CANCELED,
+      ],
+      [RedemptionStatus.SHIPPED]: [],
+      [RedemptionStatus.CANCELED]: [],
+    };
+    if (!allowed[row.status].includes(status)) {
+      throw new BadRequestException(
+        `Tidak bisa mengubah status dari ${row.status} ke ${status}.`,
+      );
+    }
+    if (status === RedemptionStatus.SHIPPED) {
+      this.logger.warn(
+        `Redemption ${id} → SHIPPED (record-only). Di PROD: panggil CC shipping API + burn NFT ` +
+          `${row.nftAddress}. Belum diarmed → tidak ada aksi on-chain.`,
+      );
+    }
+    return this.prisma.cardRedemption.update({
+      where: { id },
+      data: { status },
+    });
   }
 
   /**

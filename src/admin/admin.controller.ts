@@ -34,6 +34,7 @@ import { CcSyncDto } from './dto/cc-sync.dto';
 import { AdminLoginDto } from './dto/admin-login.dto';
 import { AdminUpdateListingDto } from './dto/admin-update-listing.dto';
 import { SetListingStatusDto } from './dto/set-listing-status.dto';
+import { UpdateRedemptionStatusDto } from './dto/update-redemption-status.dto';
 import {
   CreateContactMessageDto,
   MarkMessageReadDto,
@@ -202,6 +203,27 @@ export class AdminController {
   })
   rejectWithdrawal(@Param('id') id: string, @Body() dto: ProcessWithdrawalDto) {
     return this.withdrawal.adminReject(id, dto.note);
+  }
+
+  @Get('redemptions')
+  @ApiBearerAuth()
+  @UseGuards(AdminGuard)
+  @ApiOperation({ summary: 'Daftar permintaan kirim kartu fisik (redemption)' })
+  redemptions() {
+    return this.admin.listRedemptions();
+  }
+
+  @Patch('redemptions/:id/status')
+  @ApiBearerAuth()
+  @UseGuards(AdminGuard)
+  @ApiOperation({
+    summary: 'Majukan status kirim: REQUESTED→PACKING→SHIPPED, atau CANCELED',
+  })
+  updateRedemption(
+    @Param('id') id: string,
+    @Body() dto: UpdateRedemptionStatusDto,
+  ) {
+    return this.admin.updateRedemptionStatus(id, dto.status);
   }
 
   @Get('listings')
