@@ -916,6 +916,12 @@ model PaymentOrder {
   /// invariant "satu order satu penjualan" ditegakkan oleh flip atomik Listing ACTIVE→SOLD.
   listingId String?
 
+  /// Order BAYAR-OFFER (P2P): id Offer yang sedang dibayar. Membedakan order harga-offer dari order
+  /// beli-langsung (harga listing) pada listing yang SAMA. Kritis untuk idempotensi: tanpa kolom ini
+  /// kedua rail berbagi kunci (user,listing) dan "Bayar Offer" bisa mengembalikan order harga-listing
+  /// (pembeli kena harga salah). Rail beli-langsung memakai offerId=null; rail bayar-offer=offer.id.
+  offerId String?
+
   /// Pesan error terakhir. JANGAN pernah menuliskan kredensial IDRX ke sini.
   error String?
 
@@ -929,6 +935,7 @@ model PaymentOrder {
   @@index([status])
   @@index([userId])
   @@index([listingId])
+  @@index([offerId])
   @@map("payment_orders")
 }
 

@@ -380,13 +380,16 @@ export class PaymentsService {
       );
     }
 
-    // IDEMPOTEN per (user, listing): kalau user sudah punya order PENDING belum kedaluwarsa untuk
-    // listing INI, kembalikan yang itu — spam klik "Beli via Rupiah" jadi TIDAK menumpuk order
-    // yatim, tidak boros mint-request IDRX, dan tidak kena kuota gara-gara kartu yang sama.
+    // IDEMPOTEN per (user, listing) untuk rail BELI-LANGSUNG saja (offerId=null): kalau user sudah
+    // punya order PENDING belum kedaluwarsa untuk listing INI, kembalikan yang itu — spam klik "Beli
+    // via Rupiah" jadi TIDAK menumpuk order yatim, tidak boros mint-request IDRX, dan tidak kena
+    // kuota gara-gara kartu yang sama. `offerId: null` WAJIB: order bayar-offer (harga offer) pada
+    // listing yang sama TIDAK boleh dikembalikan ke sini — beda harga, beda rail.
     const existingPending = await this.prisma.paymentOrder.findFirst({
       where: {
         userId: user.id,
         listingId: listing.id,
+        offerId: null,
         status: PaymentStatus.PENDING,
         expiresAt: { gt: new Date() },
       },
@@ -628,11 +631,14 @@ export class PaymentsService {
       throw new BadRequestException('Tidak bisa membeli kartu yang Anda jual sendiri.');
     }
 
-    // IDEMPOTEN per (user, listing): spam "Bayar" tidak menumpuk order/mint-request.
+    // IDEMPOTEN per OFFER (bukan per listing): spam "Bayar" tidak menumpuk order/mint-request.
+    // WAJIB di-scope ke offerId: kalau di-scope (user,listing) saja, order "beli-langsung" (harga
+    // listing) yang masih PENDING untuk listing yang sama akan dikembalikan ke sini → pembeli kena
+    // HARGA LISTING padahal mau bayar HARGA OFFER (bug uang). offerId memisahkan kedua rail.
     const existingPending = await this.prisma.paymentOrder.findFirst({
       where: {
         userId: user.id,
-        listingId: listing.id,
+        offerId: offer.id,
         status: PaymentStatus.PENDING,
         expiresAt: { gt: new Date() },
       },
@@ -686,6 +692,7 @@ export class PaymentsService {
         userId: user.id,
         packType: 'MARKETPLACE',
         listingId: listing.id,
+        offerId: offer.id,
         priceIdr,
         priceUsdc: 0,
         paymentMethod: 'HOSTED',

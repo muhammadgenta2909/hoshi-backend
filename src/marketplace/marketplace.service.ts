@@ -15,6 +15,7 @@ import {
   ListingStatus,
   NftStatus,
   OfferStatus,
+  PaymentStatus,
   Prisma,
 } from '@prisma/client';
 import type { CcPackPurchase, Grader } from '@prisma/client';
@@ -415,8 +416,14 @@ export class MarketplaceService {
       throw new BadRequestException('Listing sudah tidak aktif / terjual.');
     }
 
-    // Tandai ACCEPTED + tolak offer lain yang bersaing. TIDAK memindahkan kartu & TIDAK menandai
-    // SOLD di sini — listing tetap ACTIVE sampai pembeli bayar (klaim ACTIVE→SOLD di settlement).
+    // Tandai ACCEPTED + tolak SEMUA offer bersaing. TIDAK memindahkan kartu & TIDAK menandai SOLD di
+    // sini — listing tetap ACTIVE sampai pembeli bayar (klaim ACTIVE→SOLD di settlement).
+    //
+    // SINGLE-WINNER: sapu offer lain berstatus PENDING **dan ACCEPTED**. Kalau hanya PENDING yang
+    // disapu, offer yang sebelumnya di-accept-tapi-belum-bayar tetap hidup → pembeli lama masih bisa
+    // membayar di harga murahnya dan merampok penjual (penjual kira sudah "kunci" di offer baru).
+    // Sekalian kedaluwarsakan order bayar-offer PENDING milik offer-offer lain di listing ini, supaya
+    // pembeli yang barusan disapu tak bisa melunasi order yang terlanjur dibuat.
     await this.prisma.$transaction([
       this.prisma.offer.update({
         where: { id: offerId },
@@ -425,10 +432,18 @@ export class MarketplaceService {
       this.prisma.offer.updateMany({
         where: {
           listingId,
-          status: OfferStatus.PENDING,
+          status: { in: [OfferStatus.PENDING, OfferStatus.ACCEPTED] },
           id: { not: offerId },
         },
         data: { status: OfferStatus.REJECTED },
+      }),
+      this.prisma.paymentOrder.updateMany({
+        where: {
+          listingId,
+          offerId: { not: null, notIn: [offerId] },
+          status: PaymentStatus.PENDING,
+        },
+        data: { status: PaymentStatus.EXPIRED },
       }),
     ]);
 

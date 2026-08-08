@@ -156,6 +156,7 @@ describe('PaymentsService', () => {
     txHash: null,
     packMemo: null,
     listingId: null,
+    offerId: null,
     error: null,
     createdAt: now,
     updatedAt: now,
