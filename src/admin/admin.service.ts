@@ -45,6 +45,10 @@ export interface AdminStatsResponse {
   totalListings: number;
   activeListings: number;
   soldListings: number;
+  /** Ditarik penjual (delisting). */
+  cancelledListings: number;
+  /** Nunggu kartu masuk escrow (hanya jalur P2P real; 0 di staging mock). */
+  pendingEscrowListings: number;
   totalUsers: number;
   totalCards: number;
   totalRevenue: number;
@@ -83,12 +87,18 @@ export class AdminService {
       totalListings,
       activeListings,
       soldListings,
+      cancelledListings,
+      pendingEscrowListings,
       totalUsers,
       totalCards,
     ] = await Promise.all([
       this.prisma.listing.count(),
       this.prisma.listing.count({ where: { status: ListingStatus.ACTIVE } }),
       this.prisma.listing.count({ where: { status: ListingStatus.SOLD } }),
+      this.prisma.listing.count({ where: { status: ListingStatus.CANCELLED } }),
+      this.prisma.listing.count({
+        where: { status: ListingStatus.PENDING_ESCROW },
+      }),
       this.prisma.user.count(),
       // "Jenis kartu" = jumlah DESAIN UNIK yang benar-benar dipajang (distinct nama listing), BUKAN
       // baris tabel `Card` internal. Mayoritas listing (hasil sinkron CC) tak mengisi cardId, jadi
@@ -106,6 +116,8 @@ export class AdminService {
       totalListings,
       activeListings,
       soldListings,
+      cancelledListings,
+      pendingEscrowListings,
       totalUsers,
       totalCards,
       totalRevenue: revenueAgg._sum.priceIdrx ?? 0,
