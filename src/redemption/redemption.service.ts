@@ -7,6 +7,7 @@ import {
 import {
   ActivityType,
   CcPackStatus,
+  ListingStatus,
   Prisma,
   RedemptionStatus,
 } from '@prisma/client';
@@ -68,7 +69,15 @@ export class RedemptionService {
     dto: RequestRedemptionDto,
     user: AuthUser,
   ): Promise<CardRedemptionDto> {
-    // 1. Kepemilikan lewat LEDGER, bukan klaim klien: kartu harus hasil pack user yang OPENED.
+    // 1. Kepemilikan lewat LEDGER, bukan klaim klien. DUA sumber kartu vault yang sah:
+    //    (a) hasil PACK yang OPENED (ccPackPurchase), atau
+    //    (b) kartu yang DIBELI user di marketplace (Listing SOLD, buyerId = user).
+    //    Keduanya mewakili kartu fisik di vault CC → boleh diminta kirim. Info kartu (nama/gambar/
+    //    set) diambil dari sumber yang cocok, bukan dari body.
+    let cardName = 'Kartu';
+    let cardImage: string | null = null;
+    let cardSet: string | null = null;
+
     const pull = await this.prisma.ccPackPurchase.findFirst({
       where: {
         userId: user.id,
@@ -76,13 +85,32 @@ export class RedemptionService {
         status: CcPackStatus.OPENED,
       },
     });
-    if (!pull) {
-      this.logger.warn(
-        `Redeem ditolak: NFT ${dto.nftAddress} bukan hasil pack user ${user.id}.`,
-      );
-      throw new ForbiddenException(
-        'Kartu ini bukan hasil pack yang Anda buka di Hoshi.',
-      );
+    if (pull) {
+      cardName = pull.ccItemName ?? pull.nftName ?? 'Kartu';
+      cardImage = pull.nftImage ?? null;
+      cardSet = pull.ccSet ?? pull.ccCategory ?? null;
+    } else {
+      const bought = await this.prisma.listing.findFirst({
+        where: {
+          buyerId: user.id,
+          status: ListingStatus.SOLD,
+          OR: [
+            { ccNftAddress: dto.nftAddress },
+            { nft: { assetAddress: dto.nftAddress } },
+          ],
+        },
+      });
+      if (!bought) {
+        this.logger.warn(
+          `Redeem ditolak: NFT ${dto.nftAddress} bukan pack/pembelian user ${user.id}.`,
+        );
+        throw new ForbiddenException(
+          'Kartu ini bukan milikmu di Hoshi (bukan hasil pack maupun pembelian).',
+        );
+      }
+      cardName = bought.name;
+      cardImage = bought.image ?? null;
+      cardSet = bought.set ?? bought.category ?? null;
     }
 
     // 2. Alamat tujuan harus milik user.
@@ -108,10 +136,6 @@ export class RedemptionService {
         'Kartu ini sudah dalam proses pengiriman fisik.',
       );
     }
-
-    const cardName = pull.ccItemName ?? pull.nftName ?? 'Kartu';
-    const cardImage = pull.nftImage ?? null;
-    const cardSet = pull.ccSet ?? pull.ccCategory ?? null;
 
     // 4. Record + activity dalam SATU transaksi. NOL burn/transfer — murni catatan.
     //    Gerbang anti-dobel yang SEBENARNYA = partial unique index (nftAddress WHERE status aktif)
