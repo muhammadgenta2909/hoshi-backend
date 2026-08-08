@@ -173,7 +173,11 @@ export class MarketplaceService {
     });
     const sorter = SORTERS[query.sort ?? 'newest'];
     rows.sort(sorter);
-    return rows.slice(0, query.limit ?? 200).map(toListingDto);
+    // TANPA cap default: kembalikan SEMUA listing ACTIVE → "N Cards Available" di depan = jumlah asli
+    // (permintaan: tampilkan total asli tanpa pagination). `query.limit` tetap dihormati bila dikirim
+    // eksplisit oleh pemanggil; feed marketplace publik tidak mengirimnya → dapat semua.
+    const limited = query.limit != null ? rows.slice(0, query.limit) : rows;
+    return limited.map(toListingDto);
   }
 
   /** Listing milik user login (semua status, terbaru dulu). */
