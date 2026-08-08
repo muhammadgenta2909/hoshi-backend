@@ -90,7 +90,13 @@ export class AdminService {
       this.prisma.listing.count({ where: { status: ListingStatus.ACTIVE } }),
       this.prisma.listing.count({ where: { status: ListingStatus.SOLD } }),
       this.prisma.user.count(),
-      this.prisma.card.count(),
+      // "Jenis kartu" = jumlah DESAIN UNIK yang benar-benar dipajang (distinct nama listing), BUKAN
+      // baris tabel `Card` internal. Mayoritas listing (hasil sinkron CC) tak mengisi cardId, jadi
+      // card.count() dulu cuma menghitung ~8 desain ter-mint/admin → menyesatkan. Distinct nama
+      // listing mencerminkan variasi kartu yang sebenarnya di marketplace.
+      this.prisma.listing
+        .findMany({ distinct: ['name'], select: { name: true } })
+        .then((rows) => rows.length),
     ]);
     const revenueAgg = await this.prisma.listing.aggregate({
       where: { status: ListingStatus.SOLD },
