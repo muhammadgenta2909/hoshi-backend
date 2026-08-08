@@ -15,7 +15,6 @@ import {
   ListingStatus,
   NftStatus,
   OfferStatus,
-  PaymentStatus,
   Prisma,
 } from '@prisma/client';
 import type { CcPackPurchase, Grader } from '@prisma/client';
@@ -333,12 +332,16 @@ export class MarketplaceService {
     if (offer.buyerId !== user.id) {
       throw new ForbiddenException('Only the buyer can cancel this offer.');
     }
+    // PENDING atau ACCEPTED (belum dibayar) boleh ditarik pembeli. PAID/REJECTED/CANCELED = terminal.
     const done = await this.prisma.offer.updateMany({
-      where: { id: offerId, status: OfferStatus.PENDING },
+      where: {
+        id: offerId,
+        status: { in: [OfferStatus.PENDING, OfferStatus.ACCEPTED] },
+      },
       data: { status: OfferStatus.CANCELED },
     });
     if (done.count !== 1) {
-      throw new BadRequestException('Offer is no longer pending.');
+      throw new BadRequestException('Offer is no longer open.');
     }
 
     await this.recordActivity({
@@ -360,12 +363,17 @@ export class MarketplaceService {
     const offer = await this.loadOffer(offerId);
     this.assertSeller(offer.listing.sellerId, user);
 
+    // Penjual boleh menolak offer PENDING **atau ACCEPTED yang belum dibayar** (mencabut penerimaan).
+    // PAID = pembeli sudah bayar (terminal) → tak bisa ditolak.
     const done = await this.prisma.offer.updateMany({
-      where: { id: offerId, status: OfferStatus.PENDING },
+      where: {
+        id: offerId,
+        status: { in: [OfferStatus.PENDING, OfferStatus.ACCEPTED] },
+      },
       data: { status: OfferStatus.REJECTED },
     });
     if (done.count !== 1) {
-      throw new BadRequestException('Offer is no longer pending.');
+      throw new BadRequestException('Offer is no longer open.');
     }
 
     await this.recordActivity({
@@ -419,11 +427,12 @@ export class MarketplaceService {
     // Tandai ACCEPTED + tolak SEMUA offer bersaing. TIDAK memindahkan kartu & TIDAK menandai SOLD di
     // sini — listing tetap ACTIVE sampai pembeli bayar (klaim ACTIVE→SOLD di settlement).
     //
-    // SINGLE-WINNER: sapu offer lain berstatus PENDING **dan ACCEPTED**. Kalau hanya PENDING yang
-    // disapu, offer yang sebelumnya di-accept-tapi-belum-bayar tetap hidup → pembeli lama masih bisa
-    // membayar di harga murahnya dan merampok penjual (penjual kira sudah "kunci" di offer baru).
-    // Sekalian kedaluwarsakan order bayar-offer PENDING milik offer-offer lain di listing ini, supaya
-    // pembeli yang barusan disapu tak bisa melunasi order yang terlanjur dibuat.
+    // SINGLE-WINNER: sapu offer lain berstatus PENDING **dan ACCEPTED** → jadi hanya SATU offer yang
+    // ACCEPTED. Offer yang di-supersede menjadi REJECTED. Kalau pembeli lama terlanjur bikin order
+    // bayar & melunasinya, gerbang settlement (fulfilUserListing meng-klaim offer ACCEPTED→PAID) yang
+    // menolaknya → REFUND_DUE. SENGAJA TIDAK meng-EXPIRE order bayar di sini: meng-EXPIRE order yang
+    // invoice IDRX-nya masih hidup bikin pembayaran yang telat mendarat jadi "hilang diam-diam"
+    // (EXPIRED = terminal, tak direkonsiliasi). Gerbang settlement menutup balapannya dengan benar.
     await this.prisma.$transaction([
       this.prisma.offer.update({
         where: { id: offerId },
@@ -436,14 +445,6 @@ export class MarketplaceService {
           id: { not: offerId },
         },
         data: { status: OfferStatus.REJECTED },
-      }),
-      this.prisma.paymentOrder.updateMany({
-        where: {
-          listingId,
-          offerId: { not: null, notIn: [offerId] },
-          status: PaymentStatus.PENDING,
-        },
-        data: { status: PaymentStatus.EXPIRED },
       }),
     ]);
 
@@ -886,9 +887,13 @@ export class MarketplaceService {
       throw err;
     }
 
-    // Beli langsung menutup semua penawaran yang masih menggantung di listing ini.
+    // Beli langsung menutup semua penawaran yang masih menggantung (PENDING **atau ACCEPTED** yang
+    // belum dibayar) di listing ini — kartunya sudah terjual, tak ada offer yang bisa dipenuhi lagi.
     await this.prisma.offer.updateMany({
-      where: { listingId: id, status: OfferStatus.PENDING },
+      where: {
+        listingId: id,
+        status: { in: [OfferStatus.PENDING, OfferStatus.ACCEPTED] },
+      },
       data: { status: OfferStatus.REJECTED },
     });
 
@@ -1020,8 +1025,13 @@ export class MarketplaceService {
       }
     }
 
+    // Batal listing menutup semua penawaran menggantung (PENDING **atau ACCEPTED** belum dibayar) —
+    // supaya tak ada offer ACCEPTED basi yang tersisa di tab "Offers Made" pembeli.
     await this.prisma.offer.updateMany({
-      where: { listingId: id, status: OfferStatus.PENDING },
+      where: {
+        listingId: id,
+        status: { in: [OfferStatus.PENDING, OfferStatus.ACCEPTED] },
+      },
       data: { status: OfferStatus.REJECTED },
     });
 

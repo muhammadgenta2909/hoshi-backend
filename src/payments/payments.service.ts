@@ -7,7 +7,12 @@ import {
   ServiceUnavailableException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { ActivityType, ListingStatus, PaymentStatus } from '@prisma/client';
+import {
+  ActivityType,
+  ListingStatus,
+  OfferStatus,
+  PaymentStatus,
+} from '@prisma/client';
 import type { Listing, PaymentOrder } from '@prisma/client';
 import { detectProductionSignal } from '../common/demo-mode';
 import { PublicKey } from '@solana/web3.js';
@@ -1265,6 +1270,27 @@ export class PaymentsService {
         order,
         'Jual-beli antar user belum diaktifkan (HOSHI_P2P_ENABLED=false) — pembayaran perlu di-refund manual.',
       );
+    }
+
+    // GERBANG OFFER (order bayar-offer, offerId != null). Settle HANYA jika offer ini MASIH yang
+    // diterima penjual. Klaim atomik ACCEPTED→PAID (tepat satu pemenang) MENUTUP balapan TOCTOU: kalau
+    // penjual sudah men-supersede offer ini (accept offer lain → offer ini REJECTED) atau menolaknya
+    // selagi invoice pembeli masih hidup, klaim gagal (count 0) → pembeli DI-REFUND, kartu TIDAK
+    // pindah, penjual TIDAK dikredit di harga basi. Klaim ini SEBELUM klaim listing ACTIVE→SOLD =
+    // gerbang keputusan; kegagalannya tidak menyentuh listing. (Order beli-langsung offerId=null →
+    // lewati; single-winner-nya cukup dijaga klaim listing.)
+    if (order.offerId) {
+      const offerClaim = await this.prisma.offer.updateMany({
+        where: { id: order.offerId, status: OfferStatus.ACCEPTED },
+        data: { status: OfferStatus.PAID },
+      });
+      if (offerClaim.count !== 1) {
+        return this.failToRefund(
+          order,
+          `Offer ${order.offerId} bukan lagi penawaran yang diterima penjual ` +
+            `(sudah di-supersede / ditolak / dibatalkan) — pembayaran perlu di-refund manual.`,
+        );
+      }
     }
 
     // BASIS payout = harga yang PEMBELI BENAR-BENAR BAYAR, di-backout dari order.priceIdr (dikunci

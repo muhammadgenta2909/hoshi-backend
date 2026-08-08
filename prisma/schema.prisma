@@ -517,6 +517,7 @@ model Listing {
 enum OfferStatus {
   PENDING
   ACCEPTED
+  PAID // pembeli SUDAH membayar offer ini & settle → kartu pindah (status terminal, dipakai gerbang settlement)
   REJECTED // ditolak penjual
   CANCELED // ditarik kembali oleh pembuat offer
 }

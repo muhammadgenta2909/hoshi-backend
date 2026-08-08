@@ -59,6 +59,7 @@ describe('PaymentsService', () => {
     user: { findUnique: jest.Mock };
     ccPackPurchase: { aggregate: jest.Mock };
     listing: { findUnique: jest.Mock; updateMany: jest.Mock };
+    offer: { updateMany: jest.Mock };
     activity: { create: jest.Mock };
     $transaction: jest.Mock;
   };
@@ -291,6 +292,9 @@ describe('PaymentsService', () => {
         findUnique: jest.fn().mockResolvedValue(null),
         updateMany: jest.fn().mockResolvedValue({ count: 1 }),
       },
+      // Gerbang offer di settlement P2P: klaim ACCEPTED→PAID. Default MENANG (count 1); test
+      // "offer basi" menimpanya dengan count 0.
+      offer: { updateMany: jest.fn().mockResolvedValue({ count: 1 }) },
       // Feed aktivitas (SALE_CARD) — ditulis mis. saat settle inventaris Hoshi.
       activity: { create: jest.fn().mockResolvedValue({}) },
       $transaction: jest.fn((cb: (tx: typeof prisma) => unknown) => cb(prisma)),
@@ -1008,6 +1012,52 @@ describe('PaymentsService', () => {
       });
 
       expect(outcome).toBe('REFUND_DUE');
+      expect(escrow.transferCoreAssetTo).not.toHaveBeenCalled();
+      expect(balance.credit).not.toHaveBeenCalled();
+    });
+
+    // GERBANG OFFER: order bayar-offer (offerId != null) hanya settle bila offer MASIH ACCEPTED.
+    const offerOrder: PaymentOrder = { ...userOrder, offerId: 'offer-77' };
+
+    it('ARMED real, order bayar-offer & offer masih ACCEPTED → klaim ACCEPTED→PAID lalu settle FULFILLED', async () => {
+      configValues.HOSHI_P2P_ENABLED = 'true';
+      prisma.paymentOrder.findUnique.mockResolvedValue(offerOrder);
+      prisma.listing.findUnique.mockResolvedValue(userListing);
+
+      const outcome = await service.handleCallback({
+        merchantOrderId: MERCHANT_ORDER_ID,
+      });
+
+      expect(outcome).toBe('FULFILLED');
+      // Offer di-klaim atomik ACCEPTED→PAID (tepat satu pemenang) SEBELUM kartu pindah.
+      expect(prisma.offer.updateMany).toHaveBeenCalledWith({
+        where: { id: 'offer-77', status: 'ACCEPTED' },
+        data: { status: 'PAID' },
+      });
+      expect(escrow.transferCoreAssetTo).toHaveBeenCalled();
+      expect(balance.credit).toHaveBeenCalledWith(
+        expect.objectContaining({ userId: 'seller-9', amountIdrx: PAYOUT }),
+      );
+    });
+
+    it('ARMED real, offer SUDAH di-supersede (klaim count 0) → REFUND_DUE, kartu TAK pindah, penjual TAK dikredit', async () => {
+      configValues.HOSHI_P2P_ENABLED = 'true';
+      prisma.paymentOrder.findUnique.mockResolvedValue(offerOrder);
+      prisma.listing.findUnique.mockResolvedValue(userListing);
+      // Offer ini bukan lagi yang diterima penjual (accept offer lain / ditolak) → klaim gagal.
+      prisma.offer.updateMany.mockResolvedValue({ count: 0 });
+
+      const outcome = await service.handleCallback({
+        merchantOrderId: MERCHANT_ORDER_ID,
+      });
+
+      expect(outcome).toBe('REFUND_DUE');
+      // Gerbang menolak SEBELUM klaim listing → tak ada SOLD, tak ada transfer, tak ada kredit.
+      expect(prisma.listing.updateMany).not.toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ status: 'SOLD' }) as unknown,
+        }),
+      );
       expect(escrow.transferCoreAssetTo).not.toHaveBeenCalled();
       expect(balance.credit).not.toHaveBeenCalled();
     });
