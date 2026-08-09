@@ -242,6 +242,11 @@ model CardRedemption {
   cardImage String?
   cardSet   String?
 
+  /// ASAL kartu (di-snapshot saat request) → membantu admin tahu SIAPA yang kirim fisik:
+  /// PACK / CC_CATALOG / P2P (semua fisiknya di gudang CC → CC kirim) vs HOSHI (stok fisik Hoshi
+  /// sendiri → Hoshi kirim). null = data lama sebelum kolom ini ada.
+  source String?
+
   /// Alamat tujuan — FK opsional (jejak) + snapshot penuh (sumber kebenaran pesanan).
   shippingAddressId String?
   recipientName     String

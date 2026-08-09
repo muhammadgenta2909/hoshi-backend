@@ -77,6 +77,9 @@ export class RedemptionService {
     let cardName = 'Kartu';
     let cardImage: string | null = null;
     let cardSet: string | null = null;
+    // ASAL kartu → petunjuk siapa yang kirim fisik. PACK/CC_CATALOG/P2P fisiknya di gudang CC (CC
+    // kirim); HOSHI = stok fisik Hoshi sendiri (Hoshi kirim). Di-snapshot saat request.
+    let source = 'PACK';
 
     const pull = await this.prisma.ccPackPurchase.findFirst({
       where: {
@@ -89,6 +92,7 @@ export class RedemptionService {
       cardName = pull.ccItemName ?? pull.nftName ?? 'Kartu';
       cardImage = pull.nftImage ?? null;
       cardSet = pull.ccSet ?? pull.ccCategory ?? null;
+      source = 'PACK';
     } else {
       const bought = await this.prisma.listing.findFirst({
         where: {
@@ -111,6 +115,14 @@ export class RedemptionService {
       cardName = bought.name;
       cardImage = bought.image ?? null;
       cardSet = bought.set ?? bought.category ?? null;
+      // Beli dari user lain (sellerId ada) = P2P; katalog CC (source CC, tanpa penjual) = CC_CATALOG;
+      // selain itu (source HOSHI) = stok fisik Hoshi sendiri.
+      source =
+        bought.sellerId != null
+          ? 'P2P'
+          : bought.source === 'COLLECTORCRYPT'
+            ? 'CC_CATALOG'
+            : 'HOSHI';
     }
 
     // 2. Alamat tujuan harus milik user.
@@ -152,6 +164,7 @@ export class RedemptionService {
             cardName,
             cardImage,
             cardSet,
+            source,
             shippingAddressId: addr.id,
             recipientName: addr.fullName,
             country: addr.country,
