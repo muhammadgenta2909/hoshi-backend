@@ -225,6 +225,7 @@ export class AdminService {
               name: true,
               sellerId: true,
               sellerAddress: true,
+              source: true,
             },
           })
         : Promise.resolve(
@@ -233,6 +234,7 @@ export class AdminService {
               name: string;
               sellerId: string | null;
               sellerAddress: string;
+              source: ListingSource;
             }[],
           ),
       this.prisma.user.findMany({
@@ -266,6 +268,17 @@ export class AdminService {
         : listing && listing.sellerId == null
           ? 'RESELLER'
           : 'P2P';
+      // "Vault" ala model PM: CC vault (kartu CC, harga default, Hoshi 0% margin) vs Hoshi vault
+      // (Hoshi ambil 5% / stok Hoshi sendiri). RESELLER katalog CC = CC vault; RESELLER stok Hoshi
+      // (source ≠ COLLECTORCRYPT) & P2P antar user = Hoshi vault; PACK/TOPUP bukan kartu vault.
+      const vault: 'CC' | 'HOSHI' | null =
+        type === 'PACK'
+          ? null
+          : type === 'P2P'
+            ? 'HOSHI'
+            : listing?.source === ListingSource.COLLECTORCRYPT
+              ? 'CC'
+              : 'HOSHI';
       const seller = listing?.sellerId
         ? sellerMap.get(listing.sellerId)
         : null;
@@ -273,6 +286,7 @@ export class AdminService {
         id: o.id,
         merchantOrderId: o.merchantOrderId,
         type,
+        vault,
         status: o.status,
         priceIdr: o.priceIdr,
         item: listing?.name ?? (type === 'PACK' ? o.packType : null),
