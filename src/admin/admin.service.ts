@@ -1116,16 +1116,22 @@ export class AdminService {
       return { url: uploaded.secure_url };
     }
 
-    // Di PRODUCTION jangan pernah diam-diam jatuh ke disk: URL yang dihasilkan
-    // relatif (`/uploads/...`) sehingga di-resolve ke origin FRONTEND dan selalu
-    // 404, sementara filenya hilang tiap redeploy (disk Render ephemeral). Admin
-    // akan melihat "upload sukses" lalu menyimpan gambar yang rusak permanen.
-    // Lebih baik gagal keras dan terlihat.
-    if (this.config.get<string>('NODE_ENV') === 'production')
-      throw new BadRequestException(
-        'Upload gambar belum dikonfigurasi: set CLOUDINARY_URL (atau CLOUDINARY_CLOUD_NAME + ' +
-          'CLOUDINARY_API_KEY + CLOUDINARY_API_SECRET) di environment server.',
-      );
+    // Tanpa Cloudinary di PRODUKSI/staging: simpan sebagai DATA URL base64. Berbeda dari fallback
+    // disk (URL relatif `/uploads/...` yang 404 di origin frontend & hilang tiap redeploy), data URL
+    // SELF-CONTAINED: render langsung di <img>, tersimpan di DB (bukan disk ephemeral), tanpa host
+    // eksternal. Dibatasi 2MB supaya baris DB tidak membengkak — untuk volume besar tetap set
+    // CLOUDINARY_URL. Ini bikin upload LANGSUNG JALAN tanpa kredensial apa pun.
+    if (this.config.get<string>('NODE_ENV') === 'production') {
+      const MAX = 2 * 1024 * 1024;
+      const size = file.size ?? file.buffer.length;
+      if (size > MAX)
+        throw new BadRequestException(
+          'Gambar terlalu besar (maks 2MB tanpa Cloudinary). Kompres dulu, atau set CLOUDINARY_URL di server.',
+        );
+      return {
+        url: `data:${file.mimetype};base64,${file.buffer.toString('base64')}`,
+      };
+    }
 
     // Fallback dev-only: tulis ke disk lokal (URL relatif — hanya berguna lokal).
     this.logger.warn(
