@@ -8,8 +8,17 @@ import { NestExpressApplication } from '@nestjs/platform-express';
 import { join } from 'node:path';
 
 async function bootstrap() {
-  const app = await NestFactory.create<NestExpressApplication>(AppModule);
+  // bodyParser: false → kita daftarkan sendiri dengan LIMIT lebih besar di bawah (default Express
+  // cuma 100kb). Create-listing bisa membawa gambar sbg DATA URL base64 (fallback tanpa Cloudinary)
+  // yang gampang >100kb → 413 "request entity too large". Multer (upload multipart) tak terpengaruh.
+  const app = await NestFactory.create<NestExpressApplication>(AppModule, {
+    bodyParser: false,
+  });
   const config = app.get(ConfigService);
+
+  // 12mb menampung 2 gambar (guard upload 2MB/gambar → ~2.7MB base64 masing-masing) + field lain.
+  app.useBodyParser('json', { limit: '12mb' });
+  app.useBodyParser('urlencoded', { extended: true, limit: '12mb' });
 
   // Di belakang load balancer (Render/Railway), tanpa ini Express melaporkan IP PROXY
   // sebagai req.ip untuk SETIAP request. Akibatnya bukan sekadar rate-limit yang longgar —
