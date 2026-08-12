@@ -7,7 +7,10 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { v2 as cloudinary } from 'cloudinary';
+// CATATAN: cloudinary SENGAJA TIDAK di-import di sini (top-level). SDK-nya memvalidasi CLOUDINARY_URL
+// saat MODULE DI-LOAD dan melempar Error kalau formatnya salah (harus diawali 'cloudinary://'). Import
+// top-level = satu env rusak meng-crash SELURUH backend saat boot (crash-loop, deploy gagal). Kita
+// require LAZY + tangkap error di cloudinaryLib() → env rusak cuma menonaktifkan cloudinary.
 import { JwtService } from '@nestjs/jwt';
 import { hash, verify } from '@node-rs/argon2';
 import {
@@ -1097,14 +1100,36 @@ export class AdminService {
    *   b) CLOUDINARY_CLOUD_NAME + CLOUDINARY_API_KEY + CLOUDINARY_API_SECRET (3 baris).
    * Dua-duanya didukung supaya tidak tergantung format yang ditampilkan dashboard.
    */
+  // Cache instance cloudinary (atau null kalau gagal load). undefined = belum dicoba.
+  private cld: (typeof import('cloudinary'))['v2'] | null | undefined = undefined;
+
+  /** Load cloudinary LAZY + DEFENSIF. require di sini bisa THROW kalau CLOUDINARY_URL salah format —
+   *  ditangkap → return null (cloudinary dianggap tak tersedia), backend TETAP jalan. */
+  private cloudinaryLib(): (typeof import('cloudinary'))['v2'] | null {
+    if (this.cld !== undefined) return this.cld;
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      this.cld = (require('cloudinary') as typeof import('cloudinary')).v2;
+    } catch (e) {
+      this.logger.error(
+        `Cloudinary gagal dimuat (CLOUDINARY_URL kemungkinan salah format — harus 'cloudinary://…'): ` +
+          `${e instanceof Error ? e.message : String(e)}. Upload gambar jatuh ke DATA URL.`,
+      );
+      this.cld = null;
+    }
+    return this.cld;
+  }
+
   private cloudinaryReady(): boolean {
+    const cld = this.cloudinaryLib();
+    if (!cld) return false;
     // SDK otomatis membaca process.env.CLOUDINARY_URL saat config() dipanggil.
-    if (cloudinary.config().cloud_name) return true;
+    if (cld.config().cloud_name) return true;
     const cloudName = this.config.get<string>('CLOUDINARY_CLOUD_NAME');
     const apiKey = this.config.get<string>('CLOUDINARY_API_KEY');
     const apiSecret = this.config.get<string>('CLOUDINARY_API_SECRET');
     if (cloudName && apiKey && apiSecret) {
-      cloudinary.config({
+      cld.config({
         cloud_name: cloudName,
         api_key: apiKey,
         api_secret: apiSecret,
@@ -1120,10 +1145,10 @@ export class AdminService {
     if (!file.mimetype?.startsWith('image/'))
       throw new BadRequestException('Hanya file gambar yang diperbolehkan');
 
-    const configured = this.cloudinaryReady();
-    if (configured) {
+    const cld = this.cloudinaryLib();
+    if (cld && this.cloudinaryReady()) {
       const dataUri = `data:${file.mimetype};base64,${file.buffer.toString('base64')}`;
-      const uploaded = await cloudinary.uploader.upload(dataUri, {
+      const uploaded = await cld.uploader.upload(dataUri, {
         folder: 'hoshi/listings',
         resource_type: 'image',
       });
