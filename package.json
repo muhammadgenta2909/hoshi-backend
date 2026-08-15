@@ -21,7 +21,7 @@
     "test:e2e": "jest --config ./test/jest-e2e.json",
     "prisma:generate": "prisma generate",
     "prisma:migrate": "prisma migrate dev",
-    "prisma:deploy": "prisma migrate deploy || (prisma migrate resolve --rolled-back 20260815000000_add_listing_tcg && prisma migrate deploy)",
+    "prisma:deploy": "prisma migrate deploy",
     "prisma:seed": "ts-node prisma/seed.ts",
     "db:studio": "prisma studio",
     "db:reset": "prisma migrate reset"
