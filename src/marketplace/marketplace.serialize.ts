@@ -99,6 +99,10 @@ export function toListingDto(row: ListingRow) {
     era: row.era,
     element: row.element,
     category: row.category,
+    // Game/TCG franchise dari CC ("Pokemon" dst). Dipakai FE utk deteksi jenis kartu 100%
+    // akurat; null ⇒ FE jatuh ke heuristik kata kunci. Muncul di list DAN detail (detail
+    // menyematkan toListingDto).
+    tcg: row.tcg ?? null,
     views: row.views,
     status: row.status,
     // Provenance vault: 'HOSHI' | 'COLLECTORCRYPT'. Badge di kartu dirender dari
@@ -136,6 +140,7 @@ export function toCardDetailDto(row: ListingRow, related: ListingRow[]) {
   const details = [
     { label: 'Set', value: row.set },
     { label: 'Rarity', value: row.rarity },
+    ...(row.tcg ? [{ label: 'Game', value: row.tcg }] : []),
     { label: 'Category', value: row.category },
     { label: 'Grader', value: row.grader },
     ...(row.cardNumber ? [{ label: 'Card no.', value: row.cardNumber }] : []),

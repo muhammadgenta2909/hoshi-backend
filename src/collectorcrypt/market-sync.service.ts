@@ -285,6 +285,9 @@ export class MarketSyncService {
       // Kategori kita dipakai sebagai badge bebas — nama franchise CC ("Pokemon")
       // informatif di sana walau listing lokal memakainya untuk jenis ilustrasi.
       category: card.category ?? '',
+      // Game/TCG franchise APA ADANYA dari CC — dipakai FE utk deteksi jenis kartu (ikon Pokéball
+      // dst) secara 100% akurat. null kalau CC tak menyebut → FE jatuh ke heuristik nama.
+      tcg: card.category?.trim() || null,
       certificate: card.gradingID ?? null,
       vaultLocation: card.vault
         ? `CollectorCrypt ${card.vault}`

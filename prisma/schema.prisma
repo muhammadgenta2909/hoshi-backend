@@ -432,6 +432,11 @@ model Listing {
   era        String // "Scarlet & Violet", dst
   element    String // "Fire", "Water", dst
   category   String // "Special Illustration", dst
+  // Game / TCG franchise APA ADANYA dari CollectorCrypt (card.category): "Pokemon",
+  // "One Piece", "Magic", dst. BEDA dari `category` (yang bermakna ganda: franchise utk baris
+  // CC, jenis ilustrasi utk baris manual). Frontend memakainya utk deteksi jenis kartu 100%
+  // akurat (mis. ikon Pokéball). null = tak diketahui (baris lokal/legacy) → FE pakai heuristik.
+  tcg        String?
   views      Int    @default(0)
 
   // Detail-page data. Nullable while a listing is still a lightweight market row;

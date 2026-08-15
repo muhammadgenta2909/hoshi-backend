@@ -62,6 +62,7 @@ type CcListingAttrs = {
   certificate: string | null;
   set: string;
   category: string;
+  tcg: string | null;
   language: string;
   era: string;
   rarity: string;
@@ -547,6 +548,8 @@ export class MarketplaceService {
       certificate: facts.gradeCert,
       set: facts.set ?? '',
       category: facts.category ?? '',
+      // Game/TCG franchise dari CC (card.category) — dipakai FE utk deteksi jenis kartu.
+      tcg: facts.category ?? null,
       language: facts.language ?? '',
       era: eraFromYear(facts.year),
       // Rarity APA ADANYA dari undian VRF CollectorCrypt (Common|Uncommon|Rare|
