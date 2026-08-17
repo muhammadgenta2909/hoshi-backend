@@ -1096,6 +1096,7 @@ export class PaymentsService {
             order,
             `KARTU SUDAH/MUNGKIN DIBELI treasury (buy ${err.buySignature}) tapi belum terkirim ke ` +
               `pembeli. CEK ON-CHAIN & KIRIM ULANG NFT manual ke ${user.walletAddress} — JANGAN refund. (${err.message})`,
+            false, // PASCA-belanja: treasury sudah/mungkin bayar → JANGAN refund (rugi dobel).
           );
         }
         // Gagal SEBELUM belanja (kutip/build/verify/sign): belum ada USDC keluar → balikkan
@@ -1387,6 +1388,7 @@ export class PaymentsService {
           `Kartu P2P ${listing.ccNftAddress} MUNGKIN sudah terkirim ke pembeli tapi konfirmasi ` +
             `gagal. CEK ON-CHAIN (owner kartu) — JANGAN refund; kredit penjual ${sellerId} manual ` +
             `bila kartu sudah pindah. (${err.message})`,
+          false, // PASCA-transfer: kartu mungkin sudah pindah → JANGAN refund (rugi dobel).
         );
       }
       // Pra-kirim (mis. escrow belum memiliki kartunya) → belum ada yang pindah → rollback + refund.
@@ -1553,8 +1555,14 @@ export class PaymentsService {
       );
     }
     if (summary.refundDue > 0) {
+      // JANGAN klaim semua REFUND_DUE = "boleh refund". Sebagian mungkin pasca-belanja (refundSafe=false)
+      // di mana treasury SUDAH bayar + kartu SUDAH terkirim → refund = RUGI DOBEL. Operator wajib cek
+      // kolom `refundSafe` per order, BUKAN status/teks doang.
       this.logger.error(
-        `${summary.refundDue} order berstatus REFUND_DUE: user SUDAH BAYAR dan belum menerima pack.`,
+        `${summary.refundDue} order REFUND_DUE — CEK kolom refundSafe PER ORDER sebelum refund. ` +
+          `refundSafe=true → user bayar & belum terima → refund benar. ` +
+          `refundSafe=false → treasury SUDAH bayar + kartu SUDAH terkirim → JANGAN REFUND (cek on-chain manual). ` +
+          `JANGAN refund massal.`,
       );
     }
     return summary;
@@ -1838,8 +1846,17 @@ export class PaymentsService {
   private async failToRefund(
     order: PaymentOrder,
     reason: string,
+    // false HANYA untuk kegagalan PASCA-belanja (treasury sudah/mungkin bayar + kartu sudah/mungkin
+    // terkirim): tandai order TIDAK-aman-refund. Semua pemanggil lain = pra-belanja → aman (default).
+    refundSafe = true,
   ): Promise<FulfilOutcome> {
-    await this.markRefundDueRaw(order, reason, [PaymentStatus.FULFILLING]);
+    await this.markRefundDueRaw(
+      order,
+      reason,
+      [PaymentStatus.FULFILLING],
+      undefined,
+      refundSafe,
+    );
     return 'REFUND_DUE';
   }
 
@@ -1868,12 +1885,21 @@ export class PaymentsService {
     reason: string,
     fromStatuses: PaymentStatus[],
     extra?: { idrxPaymentStatus: string; idrxUserMintStatus: string },
+    refundSafe = true,
   ): Promise<void> {
     const message = reason.slice(0, ERROR_MAX);
-    this.logger.error(
-      `REFUND_DUE ${order.merchantOrderId} (user ${order.userId}, Rp ${order.priceIdr}): ${message} ` +
-        '— user SUDAH BAYAR dan belum menerima pack. Ini utang, bukan kegagalan.',
-    );
+    if (refundSafe) {
+      this.logger.error(
+        `REFUND_DUE ${order.merchantOrderId} (user ${order.userId}, Rp ${order.priceIdr}): ${message} ` +
+          '— user SUDAH BAYAR dan belum menerima pack. Ini utang, bukan kegagalan.',
+      );
+    } else {
+      // JANGAN samakan dengan utang-refund biasa: ini kegagalan pasca-belanja. Refund = rugi dobel.
+      this.logger.error(
+        `REFUND_DUE[JANGAN-REFUND] ${order.merchantOrderId} (user ${order.userId}, Rp ${order.priceIdr}): ${message} ` +
+          '— ⚠️ treasury SUDAH/MUNGKIN bayar + kartu SUDAH/MUNGKIN terkirim. CEK ON-CHAIN & kirim ulang manual. JANGAN REFUND.',
+      );
+    }
     try {
       // Predikat status: jangan pernah menimpa keadaan terminal (FULFILLED/EXPIRED/FAILED) atau
       // klaim milik racer lain. Uang tetap dilaporkan lewat log di atas walau update-nya no-op.
@@ -1885,6 +1911,7 @@ export class PaymentsService {
         data: {
           status: PaymentStatus.REFUND_DUE,
           error: message,
+          refundSafe,
           ...(extra ?? {}),
         },
       });

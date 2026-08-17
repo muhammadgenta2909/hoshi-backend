@@ -936,6 +936,12 @@ model PaymentOrder {
   /// Pesan error terakhir. JANGAN pernah menuliskan kredensial IDRX ke sini.
   error String?
 
+  /// Apakah AMAN merefund order ini saat status=REFUND_DUE. true (default) = user bayar tapi belum
+  /// menerima → refund BENAR. false = kegagalan PASCA-belanja: treasury SUDAH/MUNGKIN bayar + kartu
+  /// SUDAH/MUNGKIN terkirim → REFUND = RUGI DOBEL (cek on-chain + kirim ulang manual, JANGAN refund).
+  /// Gerbang refund apa pun WAJIB membaca FIELD ini, BUKAN teks `error`.
+  refundSafe Boolean @default(true)
+
   createdAt   DateTime  @default(now())
   updatedAt   DateTime  @updatedAt
   paidAt      DateTime?
