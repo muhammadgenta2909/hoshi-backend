@@ -18,6 +18,7 @@ import { detectProductionSignal } from '../common/demo-mode';
 import { PublicKey } from '@solana/web3.js';
 import type { AuthUser } from '../auth/jwt.strategy';
 import {
+  GachaPostSpendError,
   GachaService,
   TREASURY_MAX_PACK_PRICE_USDC,
 } from '../collectorcrypt/gacha.service';
@@ -928,19 +929,30 @@ export class PaymentsService {
         { viaRupiahPayment: true },
       );
 
-      const done = await this.prisma.paymentOrder.update({
-        where: { merchantOrderId: order.merchantOrderId },
-        data: {
-          status: PaymentStatus.FULFILLED,
-          packMemo: pack.memo,
-          fulfilledAt: new Date(),
-          error: null,
-        },
-      });
-      this.logger.log(
-        `Order ${done.merchantOrderId} FULFILLED → memo ${pack.memo} (user ${user.id}).`,
-      );
-      return 'FULFILLED';
+      // purchase() SUKSES → pack SUDAH dibeli + dibuka (kartu ke user). DARI SINI post-spend:
+      // apa pun yang gagal (mis. tulis FULFILLED) TIDAK boleh di-refund (rugi dobel).
+      try {
+        const done = await this.prisma.paymentOrder.update({
+          where: { merchantOrderId: order.merchantOrderId },
+          data: {
+            status: PaymentStatus.FULFILLED,
+            packMemo: pack.memo,
+            fulfilledAt: new Date(),
+            error: null,
+          },
+        });
+        this.logger.log(
+          `Order ${done.merchantOrderId} FULFILLED → memo ${pack.memo} (user ${user.id}).`,
+        );
+        return 'FULFILLED';
+      } catch (writeErr) {
+        return this.failToRefund(
+          order,
+          `Pack SUDAH dibeli+dibuka (memo ${pack.memo}) tapi tulis FULFILLED gagal: ` +
+            `${errorMessage(writeErr)} — tandai FULFILLED manual, JANGAN refund.`,
+          false,
+        );
+      }
     } catch (err) {
       // USER SUDAH BAYAR. Ini UTANG, bukan kegagalan yang boleh dilupakan.
       //
@@ -954,6 +966,13 @@ export class PaymentsService {
       // REFUND_DUE adalah status SERAP: tidak pernah di-retry otomatis, dan cara keluarnya adalah
       // manusia yang membaca ledger CcPackPurchase (lewat packMemo/userId) untuk memutuskan
       // "kirim pack-nya" atau "kembalikan uangnya".
+      //
+      // PISAH PRA vs PASCA-belanja: purchase() melempar GachaPostSpendError untuk kegagalan SESUDAH
+      // submitTransaction (USDC mungkin/sudah keluar, pack milik user) → JANGAN refund. Kegagalan
+      // PRA-submit (sign/harga/generate) → aman di-refund (refundSafe=true default).
+      if (err instanceof GachaPostSpendError) {
+        return this.failToRefund(order, errorMessage(err), false);
+      }
       return this.failToRefund(order, errorMessage(err));
     }
   }
