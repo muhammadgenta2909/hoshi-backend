@@ -98,6 +98,21 @@ export const TREASURY_MAX_PACK_PRICE_USDC = 100_000_000;
  */
 const TREASURY_DAILY_CAP_USDC = 100_000_000_000;
 
+/**
+ * Kegagalan gacha SETELAH submitTransaction: USDC treasury MUNGKIN/SUDAH keluar & pack jadi milik
+ * user. Ditangani KHUSUS oleh pemanggil: JANGAN refund (rugi dobel) — selesaikan/kirim manual lewat
+ * packStatus(memo). BEDA dari kegagalan PRA-submit yang aman di-refund.
+ */
+export class GachaPostSpendError extends Error {
+  constructor(
+    message: string,
+    readonly memo: string,
+  ) {
+    super(message);
+    this.name = 'GachaPostSpendError';
+  }
+}
+
 const TREASURY_SPEND_WINDOW_MS = 24 * 60 * 60 * 1000;
 
 /**
@@ -1008,7 +1023,12 @@ export class GachaService {
       // bukan "gagal": menulis FAILED di sini membuka jalan submit ulang → treasury
       // membayar dua kali untuk satu pack. Jalan keluarnya cuma packStatus(memo).
       await this.flagError(memo, err);
-      throw err;
+      // POST-submit: USDC treasury MUNGKIN sudah keluar → JANGAN refund (rugi dobel).
+      throw new GachaPostSpendError(
+        `Submit pembelian pack (memo ${memo}) TIDAK PASTI — USDC treasury mungkin sudah keluar. ` +
+          `Cek packStatus(${memo}); JANGAN refund. (${err instanceof Error ? err.message : String(err)})`,
+        memo,
+      );
     }
 
     if (!submitted.success) {
@@ -1018,7 +1038,12 @@ export class GachaService {
         'CollectorCrypt tidak mengonfirmasi pembayaran pack ini. Cek status pack — jangan ulangi pembelian.',
       );
       await this.flagError(memo, err);
-      throw err;
+      // Indeterminate: transaksi mungkin tetap tayang on-chain → JANGAN refund (rugi dobel).
+      throw new GachaPostSpendError(
+        `Pembelian pack (memo ${memo}) tidak dikonfirmasi CC tapi mungkin tayang on-chain. ` +
+          `Cek packStatus(${memo}); JANGAN refund.`,
+        memo,
+      );
     }
 
     const submittedRow = await this.prisma.ccPackPurchase.update({
@@ -1048,7 +1073,12 @@ export class GachaService {
       opened = await this.client.openPack({ memo });
     } catch (err) {
       await this.flagError(memo, err);
-      throw new ServiceUnavailableException(PAID_NOT_DELIVERED);
+      // Pack SUDAH dibayar (SUBMITTED) & milik user; hanya BUKA yang gagal → JANGAN refund.
+      throw new GachaPostSpendError(
+        `Pack (memo ${memo}) SUDAH dibayar treasury tapi buka gagal — selesaikan open(${memo}) manual. ` +
+          `JANGAN refund. (${err instanceof Error ? err.message : String(err)})`,
+        memo,
+      );
     }
 
     const hold = openPackHoldReason(opened);
@@ -1060,7 +1090,12 @@ export class GachaService {
       // Jadi: tetap SUBMITTED (= sudah bayar, belum terkirim), catat alasannya, dan minta
       // user mengambilnya lagi nanti.
       await this.flagError(memo, new Error(`openPack belum final: ${hold}`));
-      throw new ServiceUnavailableException(PAID_NOT_DELIVERED);
+      // Pack SUDAH dibayar treasury; buka belum final → JANGAN refund (rugi dobel).
+      throw new GachaPostSpendError(
+        `Pack (memo ${memo}) SUDAH dibayar treasury tapi buka belum final (${hold}) — ambil ulang/` +
+          `selesaikan manual. JANGAN refund.`,
+        memo,
+      );
     }
 
     // Sama seperti open(): normalkan rarity ke kanonik kapital, dan JANGAN gagalkan pack yang
