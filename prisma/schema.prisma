@@ -220,6 +220,17 @@ enum RedemptionStatus {
   PACKING
   SHIPPED
   CANCELED
+  // --- Jalur REAL (CC Vault Shipping API) — additive; baris record-only lama tetap pakai yang di atas.
+  AWAITING_PAYMENT      // order ongkir Rupiah dibuat, nunggu bayar
+  READY_TO_FUND         // Rupiah PAID+MINTED (fulfilShipping) — PRA-danai, refundSafe=true
+  FUNDING               // klaim atomik, treasury.fundUsdc lagi jalan
+  FUNDED                // USDC ada di wallet user + CC prepare selesai, nunggu TTD — PASCA-danai, refundSafe=false
+  BURN_SUBMITTED        // tx TTD dikirim ke CC burn (indeterminate/confirmed)
+  IN_TRANSIT            // dari getShipment (Shipped)
+  DELIVERED             // dari getShipment (Delivered)
+  REFUND_DUE            // Rupiah wajib dibalikin — HANYA reachable pra-danai; refundSafe=true
+  RECLAIM_DUE           // USDC sudah didanai tapi user tak menuntaskan burn; refundSafe=false; JANGAN refund Rupiah
+  SHIP_FAILED_POST_BURN // burn sudah jadi tapi shipment CC bermasalah (support/sisi CC)
 }
 
 /// Permintaan menukar kartu vault (hasil pack) jadi kartu fisik yang dikirim ke rumah.
@@ -264,6 +275,19 @@ model CardRedemption {
   createdAt   DateTime         @default(now())
   updatedAt   DateTime         @updatedAt
   processedAt DateTime?
+
+  // --- Jalur REAL (CC Vault Shipping API). Semua nullable → baris record-only lama tetap valid.
+  ccShippingAddressId String? // id ShippingAddress yang dibuat di CC (POST /shipping-address/create)
+  outboundShipmentId  String? @unique // id shipment CC (POST /redeem/prepare) — @unique = anti dobel-burn
+  totalCostUsdc       Int? // ongkir dari CC prepare (base unit USDC 6-desimal) — angka OTORITATIF buat danai
+  paymentOrderId      String? // FK ke PaymentOrder ongkir Rupiah (packType='SHIPPING')
+  fundingSignature    String? // sig transfer USDC treasury→user
+  burnSignature       String? // sig/ref burn+ship dari CC (kalau ada)
+  trackingIds         String[] // dari GET /outbound-shipment/:id
+  trackingUrls        String[]
+  /// false = kegagalan PASCA-danai (USDC sudah keluar ke wallet user) → JANGAN refund Rupiah (rugi
+  /// dobel). Gerbang refund WAJIB baca FIELD ini, BUKAN teks status. Sama semantik PaymentOrder.refundSafe.
+  refundSafe Boolean @default(true)
 
   @@index([userId, createdAt])
   @@index([nftAddress])
@@ -933,6 +957,12 @@ model PaymentOrder {
   /// (pembeli kena harga salah). Rail beli-langsung memakai offerId=null; rail bayar-offer=offer.id.
   offerId String?
 
+  /// Order ONGKIR KIRIM-FISIK (CC Vault Shipping): id CardRedemption yang ongkirnya dibayar.
+  /// `packType='SHIPPING' && redemptionId != null` mengarah ke fulfilShipping (tandai redemption
+  /// READY_TO_FUND) — BUKAN pack/listing. Pendanaan USDC + panggilan CC dilakukan MALAS di sesi
+  /// TTD user, bukan di fulfilment → jalur fulfilment tetap refund-safe.
+  redemptionId String?
+
   /// Pesan error terakhir. JANGAN pernah menuliskan kredensial IDRX ke sini.
   error String?
 
@@ -953,6 +983,7 @@ model PaymentOrder {
   @@index([userId])
   @@index([listingId])
   @@index([offerId])
+  @@index([redemptionId])
   @@map("payment_orders")
 }
 

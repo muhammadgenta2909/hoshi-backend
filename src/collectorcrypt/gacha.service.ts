@@ -42,6 +42,7 @@ import { TreasuryService } from './treasury.service';
 import { randomUUID } from 'crypto';
 import { assertDemoOnly, detectProductionSignal } from '../common/demo-mode';
 import { CC_MOCK_MACHINES, pickMockCard } from './cc-mock';
+import { USDC_MINT_MAINNET, USDC_MINT_DEVNET } from './usdc.constants';
 
 /** Mesin default CollectorCrypt bila klien tidak menyebut packType. */
 const DEFAULT_PACK_TYPE = 'pokemon_50';
@@ -116,12 +117,10 @@ export class GachaPostSpendError extends Error {
 const TREASURY_SPEND_WINDOW_MS = 24 * 60 * 60 * 1000;
 
 /**
- * Mint SPL USDC per cluster — dibutuhkan untuk MEMBACA saldo USDC treasury pada
- * preflight kecukupan dana (sebelum user membayar). Mainnet = USDC Circle; devnet =
- * USDC faucet. Bisa dioverride lewat env USDC_MINT bila perlu.
+ * Mint SPL USDC per cluster — dibutuhkan untuk MEMBACA saldo USDC treasury pada preflight
+ * kecukupan dana (sebelum user membayar). Di-lift ke usdc.constants.ts (import di atas) supaya
+ * jalur BACA (sini) & jalur TRANSFER (treasury.service.fundUsdc) memakai mint yang sama.
  */
-const USDC_MINT_MAINNET = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
-const USDC_MINT_DEVNET = '4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU';
 
 /** TTL cache saldo treasury — supaya tidak satu RPC-call per order. */
 const TREASURY_BALANCE_TTL_MS = 15_000;

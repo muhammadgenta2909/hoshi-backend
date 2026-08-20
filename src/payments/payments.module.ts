@@ -22,8 +22,11 @@ import { PaymentsService } from './payments.service';
  * 'jwt' yang sudah didaftarkan AuthModule secara global lewat Passport.
  *
  * IdrxClient di-provide di sini (transport murni ke IDRX; ia yang meminjam penandatanganan
- * dari src/idrx/idrx.signature.ts). Tidak ada yang di-`exports`: PaymentsService cuma dipakai
- * oleh PaymentsController di modul ini.
+ * dari src/idrx/idrx.signature.ts).
+ *
+ * PaymentsService di-`exports` untuk RedemptionModule: taksiran ongkir (RedemptionService.estimate)
+ * memakai quoteRupiah yang SAMA dengan invoice ongkir supaya harga tidak lahir dari dua kalkulasi.
+ * Ini TIDAK melingkar: RedemptionModule → PaymentsModule → CollectorCryptModule (satu arah).
  *
  * PaymentsReconcileScheduler WAJIB terdaftar di sini: callback IDRX tidak pernah di-retry, jadi
  * penyapu berkala inilah satu-satunya yang menyelamatkan order berbayar yang callbacknya hilang.
@@ -37,5 +40,6 @@ import { PaymentsService } from './payments.service';
     IdrxMockStore,
     PaymentsReconcileScheduler,
   ],
+  exports: [PaymentsService],
 })
 export class PaymentsModule {}

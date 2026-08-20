@@ -13,7 +13,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { CcGachaClient } from './cc-gacha.client';
 import type { CcMachineNormalized } from './cc-gacha.types';
 import { toCcRarity } from './cc-gacha.types';
-import { GachaService } from './gacha.service';
+import { GachaService, GachaPostSpendError } from './gacha.service';
 import { GeneratePackDto } from './dto/generate-pack.dto';
 import { PurchasePackDto } from './dto/purchase-pack.dto';
 import { TreasuryService } from './treasury.service';
@@ -28,6 +28,21 @@ jest.mock('@solana/web3.js', () => ({
   Keypair: class Keypair {},
   Transaction: class Transaction {},
   VersionedTransaction: class VersionedTransaction {},
+  // treasury.service kini punya konstanta level-modul `new PublicKey(...)` (USDC mint / program id
+  // untuk fundUsdc) → wajib ada di mock ini agar impor modul tidak throw. Selaras reseller spec.
+  PublicKey: class PublicKey {
+    constructor(readonly value: string) {}
+    toBase58() {
+      return String(this.value);
+    }
+    toString() {
+      return String(this.value);
+    }
+    equals(o: { value?: string }) {
+      return o?.value === this.value;
+    }
+  },
+  clusterApiUrl: () => 'http://localhost:8899',
 }));
 
 describe('GachaService', () => {
@@ -1167,8 +1182,10 @@ describe('GachaService', () => {
         new ServiceUnavailableException('CollectorCrypt down'),
       );
 
+      // Submit gagal PASCA-belanja → GachaPostSpendError (refactor refund-safety), BUKAN
+      // ServiceUnavailableException mentah. Errornya tetap DIREKAM (flagError) & status tak turun.
       await expect(service.purchase({}, user)).rejects.toThrow(
-        ServiceUnavailableException,
+        GachaPostSpendError,
       );
 
       expect(prisma.ccPackPurchase.update).toHaveBeenCalledWith({
@@ -1189,7 +1206,7 @@ describe('GachaService', () => {
 
       // Pesannya tidak boleh terdengar seperti kegagalan: uangnya sudah keluar dan
       // pack-nya milik user — ia cuma belum menerima kartunya.
-      await expect(service.purchase({}, user)).rejects.toThrow(/SUDAH DIBAYAR/);
+      await expect(service.purchase({}, user)).rejects.toThrow(/SUDAH DIBAYAR/i);
 
       expect(prisma.ccPackPurchase.update).toHaveBeenCalledWith({
         where: { memo: MEMO },
@@ -1223,7 +1240,7 @@ describe('GachaService', () => {
         rarity: 'Common',
       });
 
-      await expect(service.purchase({}, user)).rejects.toThrow(/SUDAH DIBAYAR/);
+      await expect(service.purchase({}, user)).rejects.toThrow(/SUDAH DIBAYAR/i);
 
       expect(statusesWritten()).toEqual([CcPackStatus.SUBMITTED]);
       expect(statusesWritten()).not.toContain(CcPackStatus.OPENED);

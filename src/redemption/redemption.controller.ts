@@ -1,10 +1,12 @@
-import { Body, Controller, Get, Post, UseGuards } from '@nestjs/common';
+import { Body, Controller, Get, Param, Post, UseGuards } from '@nestjs/common';
 import { ApiBearerAuth, ApiOperation, ApiTags } from '@nestjs/swagger';
 import { Throttle } from '@nestjs/throttler';
 import { CurrentUser } from '../auth/current-user.decorator';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import type { AuthUser } from '../auth/jwt.strategy';
+import { PrivyToken } from '../auth/privy-token.decorator';
 import { RequestRedemptionDto } from './dto/request-redemption.dto';
+import { SubmitBurnDto } from './dto/submit-burn.dto';
 import { RedemptionService } from './redemption.service';
 
 /**
@@ -41,5 +43,74 @@ export class RedemptionController {
   })
   listMine(@CurrentUser() user: AuthUser) {
     return this.redemption.listMine(user.id);
+  }
+
+  /* ---------------- Jalur REAL CC Vault Shipping (digerbang HOSHI_CC_SHIPPING_ENABLED) ----------------
+     Semua butuh token identitas Privy user di header x-privy-identity-token (400 bila kosong). */
+
+  @Post(':id/estimate')
+  @ApiBearerAuth()
+  @UseGuards(JwtAuthGuard)
+  @Throttle({ default: { ttl: 60000, limit: 20 } })
+  @ApiOperation({
+    summary: 'Taksir ongkir kirim fisik (USD + USDC + Rupiah) — READ-ONLY, tak menyentuh dana',
+  })
+  estimate(
+    @Param('id') id: string,
+    @CurrentUser() user: AuthUser,
+    @PrivyToken() privyToken: string,
+  ) {
+    return this.redemption.estimate(id, user, privyToken);
+  }
+
+  @Post(':id/fund-and-prepare')
+  @ApiBearerAuth()
+  @UseGuards(JwtAuthGuard)
+  @Throttle({ default: { ttl: 60000, limit: 5 } })
+  @ApiOperation({
+    summary:
+      'Danai USDC ongkir ke wallet user + bangun transaksi burn UNSIGNED (setelah ongkir Rupiah lunas)',
+  })
+  fundAndPrepare(
+    @Param('id') id: string,
+    @CurrentUser() user: AuthUser,
+    @PrivyToken() privyToken: string,
+  ) {
+    return this.redemption.fundAndPrepare(id, user, privyToken);
+  }
+
+  @Post(':id/submit-burn')
+  @ApiBearerAuth()
+  @UseGuards(JwtAuthGuard)
+  @Throttle({ default: { ttl: 60000, limit: 5 } })
+  @ApiOperation({
+    summary: 'Teruskan transaksi burn+ship yang sudah ditandatangani user ke CollectorCrypt',
+  })
+  submitBurn(
+    @Param('id') id: string,
+    @CurrentUser() user: AuthUser,
+    @PrivyToken() privyToken: string,
+    @Body() dto: SubmitBurnDto,
+  ) {
+    return this.redemption.submitBurn(
+      id,
+      user,
+      privyToken,
+      dto.signedTransactions,
+    );
+  }
+
+  @Get(':id/status')
+  @ApiBearerAuth()
+  @UseGuards(JwtAuthGuard)
+  @ApiOperation({
+    summary: 'Poll status shipment CC → status Hoshi + tracking',
+  })
+  status(
+    @Param('id') id: string,
+    @CurrentUser() user: AuthUser,
+    @PrivyToken() privyToken: string,
+  ) {
+    return this.redemption.status(id, user, privyToken);
   }
 }

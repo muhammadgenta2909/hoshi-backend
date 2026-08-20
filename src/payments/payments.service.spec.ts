@@ -17,6 +17,7 @@ import {
   EscrowTransferIndeterminateError,
 } from '../escrow/escrow.service';
 import { BalanceService } from '../balance/balance.service';
+import { CcShippingService } from '../collectorcrypt/cc-shipping.service';
 import type { CcMachineNormalized } from '../collectorcrypt/cc-gacha.types';
 import { PrismaService } from '../prisma/prisma.service';
 import { IdrxClient } from './idrx.client';
@@ -78,6 +79,10 @@ describe('PaymentsService', () => {
   let resellerSettlement: { settle: jest.Mock };
   let escrow: { transferCoreAssetTo: jest.Mock };
   let balance: { credit: jest.Mock };
+  let ccShipping: {
+    assertEnabled: jest.Mock;
+    estimateForRedemption: jest.Mock;
+  };
 
   const now = new Date('2026-07-14T00:00:00.000Z');
 
@@ -158,7 +163,9 @@ describe('PaymentsService', () => {
     packMemo: null,
     listingId: null,
     offerId: null,
+    redemptionId: null,
     error: null,
+    refundSafe: true,
     createdAt: now,
     updatedAt: now,
     paidAt: null,
@@ -323,6 +330,12 @@ describe('PaymentsService', () => {
     };
     escrow = { transferCoreAssetTo: jest.fn().mockResolvedValue('P2PXFERSIG') };
     balance = { credit: jest.fn().mockResolvedValue({ credited: true }) };
+    ccShipping = {
+      assertEnabled: jest.fn(),
+      estimateForRedemption: jest
+        .fn()
+        .mockResolvedValue({ usd: 25, usdcBaseUnits: 25_000_000 }),
+    };
 
     const moduleRef = await Test.createTestingModule({
       providers: [
@@ -334,6 +347,7 @@ describe('PaymentsService', () => {
         { provide: ResellerSettlementService, useValue: resellerSettlement },
         { provide: EscrowService, useValue: escrow },
         { provide: BalanceService, useValue: balance },
+        { provide: CcShippingService, useValue: ccShipping },
       ],
     }).compile();
 

@@ -14,6 +14,11 @@ import {
 import type { CardRedemption } from '@prisma/client';
 import type { AuthUser } from '../auth/jwt.strategy';
 import { PrismaService } from '../prisma/prisma.service';
+import {
+  CcShippingService,
+  type FundAndPrepareResult,
+} from '../collectorcrypt/cc-shipping.service';
+import { PaymentsService } from '../payments/payments.service';
 import { RequestRedemptionDto } from './dto/request-redemption.dto';
 
 export type CardRedemptionDto = {
@@ -63,7 +68,11 @@ function toDto(r: CardRedemption): CardRedemptionDto {
 export class RedemptionService {
   private readonly logger = new Logger(RedemptionService.name);
 
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly ccShipping: CcShippingService,
+    private readonly payments: PaymentsService,
+  ) {}
 
   async request(
     dto: RequestRedemptionDto,
@@ -219,5 +228,61 @@ export class RedemptionService {
       take: 50,
     });
     return rows.map(toDto);
+  }
+
+  /* ---------------------- Jalur REAL (CC Vault Shipping) ---------------------- */
+  /* Semua di bawah DIGERBANG HOSHI_CC_SHIPPING_ENABLED di dalam CcShippingService.assertEnabled();
+     kalau mati, mereka menolak dan perilaku record-only di atas tidak berubah sama sekali. */
+
+  /**
+   * Taksiran ongkir (READ-ONLY) untuk redemption ini: USD + USDC base unit + Rupiah. Rupiah dihitung
+   * lewat PaymentsService.quoteRupiah — SUMBER HARGA yang sama dengan invoice ongkir (createShippingOrder)
+   * — supaya angka yang dilihat user dan yang ditagihkan tidak lahir dari dua kalkulasi berbeda.
+   */
+  async estimate(
+    id: string,
+    user: AuthUser,
+    privyToken: string,
+  ): Promise<{ usd: number; usdcBaseUnits: number; rupiah: number }> {
+    const est = await this.ccShipping.estimateForRedemption(
+      id,
+      user,
+      privyToken,
+    );
+    const rupiah = await this.payments.quoteRupiah(est.usdcBaseUnits);
+    return { usd: est.usd, usdcBaseUnits: est.usdcBaseUnits, rupiah };
+  }
+
+  /** Danai USDC ongkir ke wallet user + bangun transaksi burn UNSIGNED (money-critical, di CcShippingService). */
+  fundAndPrepare(
+    id: string,
+    user: AuthUser,
+    privyToken: string,
+  ): Promise<FundAndPrepareResult> {
+    return this.ccShipping.fundAndPrepare(id, user, privyToken);
+  }
+
+  /** Teruskan transaksi burn+ship yang sudah ditandatangani user ke CC. */
+  submitBurn(
+    id: string,
+    user: AuthUser,
+    privyToken: string,
+    signedTransactions: string[],
+  ): Promise<{ status: RedemptionStatus; burnSignature: string | null }> {
+    return this.ccShipping.submitBurn(id, user, privyToken, signedTransactions);
+  }
+
+  /** Poll status shipment CC → petakan ke status Hoshi + tracking. */
+  async status(
+    id: string,
+    user: AuthUser,
+    privyToken: string,
+  ): Promise<CardRedemptionDto & { trackingIds: string[]; trackingUrls: string[] }> {
+    const row = await this.ccShipping.refreshStatus(id, user, privyToken);
+    return {
+      ...toDto(row),
+      trackingIds: row.trackingIds,
+      trackingUrls: row.trackingUrls,
+    };
   }
 }

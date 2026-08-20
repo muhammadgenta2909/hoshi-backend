@@ -19,9 +19,11 @@ import { AdminGuard } from '../auth/admin.guard';
 import { CurrentUser } from '../auth/current-user.decorator';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import type { AuthUser } from '../auth/jwt.strategy';
+import { PrivyToken } from '../auth/privy-token.decorator';
 import { CreateListingOrderDto } from './dto/create-listing-order.dto';
 import { CreateOfferOrderDto } from './dto/create-offer-order.dto';
 import { CreatePackOrderDto } from './dto/create-pack-order.dto';
+import { CreateShippingOrderDto } from './dto/create-shipping-order.dto';
 import { CreateTopupOrderDto } from './dto/create-topup-order.dto';
 import { PaymentsService } from './payments.service';
 
@@ -125,6 +127,26 @@ export class PaymentsController {
     @CurrentUser() user: AuthUser,
   ) {
     return this.payments.createTopupOrder(dto.amountIdr, user);
+  }
+
+  @Post('shipping')
+  @ApiBearerAuth()
+  @UseGuards(JwtAuthGuard)
+  @Throttle({ default: { ttl: 60000, limit: 10 } })
+  @ApiOperation({
+    summary:
+      'Terbitkan tagihan rupiah untuk ONGKIR kirim kartu fisik (CC Vault Shipping) → QR/VA/paymentUrl IDRX',
+    description:
+      'Ongkir (USD) di-taksir SERVER dari CollectorCrypt (butuh header x-privy-identity-token), ' +
+      'lalu di-Rupiah-kan lewat kurs IDRX. TIDAK ADA USDC yang bergerak di request ini — pendanaan ' +
+      'USDC ke wallet user + burn kartu dilakukan setelah Rupiah lunas, di sesi tanda-tangan user.',
+  })
+  createShippingOrder(
+    @Body() dto: CreateShippingOrderDto,
+    @CurrentUser() user: AuthUser,
+    @PrivyToken() privyToken: string,
+  ) {
+    return this.payments.createShippingOrder(dto.redemptionId, user, privyToken);
   }
 
   @Get('me/orders')
