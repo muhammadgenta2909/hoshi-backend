@@ -139,23 +139,29 @@ export class AdminService {
   }
 
   /**
-   * Admin memajukan status kirim: REQUESTED → PACKING → SHIPPED, atau CANCELED.
+   * Admin memajukan status kirim REDEMPTION — HANYA baris RECORD-ONLY + resolusi manual jalur real.
    *
-   * SHIPPED = kartu fisik benar-benar dikirim CollectorCrypt (lewat shipping API) + NFT-nya di-BURN
-   * sehingga kartu keluar dari vault (jadi fisik di tangan pemilik). Jalur REAL itu men-sentuh aset
-   * on-chain & memanggil CC → DIGERBANG dan BELUM diaktifkan (record-only). Di sini status-nya maju
-   * saja; SAAT GO-LIVE, di titik SHIPPED panggil CC shipping API + burnV1 (arming sadar, seperti
-   * gerbang treasury lain). Di staging/mock, "hilang dari vault" disimulasi frontend (vault
-   * menyembunyikan kartu yang redemption-nya SHIPPED) — nol on-chain.
+   * PEMBAGIAN TEGAS setelah CC Vault Shipping ada:
+   *  - Baris RECORD-ONLY (REQUESTED/PACKING/SHIPPED): admin yang memenuhi fisik manual
+   *    (REQUESTED→PACKING→SHIPPED) atau membatalkan (→CANCELED). Nol on-chain — tak ada burn/transfer.
+   *  - Baris JALUR REAL (AWAITING_PAYMENT…): burn-nya USER yang menandatangani (bukan admin), dan
+   *    status majunya digerakkan CcShippingService + poll shipment CC — BUKAN dari sini. Yang admin
+   *    boleh cuma RESOLUSI MANUAL: menandai funding yang ditinggalkan user sebagai RECLAIM_DUE
+   *    (USDC sudah/mungkin keluar → refundSafe=false, JANGAN refund Rupiah; reclaim USDC on-chain).
+   *
+   * Status yang tak ada di peta transisi (READY_TO_FUND, BURN_SUBMITTED, IN_TRANSIT, DELIVERED,
+   * REFUND_DUE, RECLAIM_DUE, SHIP_FAILED_POST_BURN) SENGAJA tak bisa digerakkan admin lewat endpoint
+   * ini — mereka milik alur user-signed / poll CC / penyelesaian refund.
    */
   async updateRedemptionStatus(id: string, status: RedemptionStatus) {
     const row = await this.prisma.cardRedemption.findUnique({ where: { id } });
     if (!row) {
       throw new NotFoundException('Permintaan kirim tidak ditemukan.');
     }
-    // Transisi sah: REQUESTED→PACKING→SHIPPED (maju), atau ke CANCELED dari REQUESTED/PACKING.
-    // Status terminal (SHIPPED/CANCELED) tak bisa diubah lagi.
-    const allowed: Record<RedemptionStatus, RedemptionStatus[]> = {
+    // Partial: status yang tak tercantum → tak punya transisi admin (default []). Ini yang menutup
+    // BURN_SUBMITTED/IN_TRANSIT/DELIVERED dst. dari sentuhan admin, sekaligus menyenangkan tipe
+    // (enum RedemptionStatus kini punya banyak nilai jalur-real).
+    const allowed: Partial<Record<RedemptionStatus, RedemptionStatus[]>> = {
       [RedemptionStatus.REQUESTED]: [
         RedemptionStatus.PACKING,
         RedemptionStatus.SHIPPED,
@@ -165,23 +171,35 @@ export class AdminService {
         RedemptionStatus.SHIPPED,
         RedemptionStatus.CANCELED,
       ],
-      [RedemptionStatus.SHIPPED]: [],
-      [RedemptionStatus.CANCELED]: [],
+      // Resolusi manual jalur real: funding yang ditinggalkan user → RECLAIM_DUE (USDC sudah/mungkin
+      // keluar; JANGAN refund Rupiah, reclaim USDC on-chain manual).
+      [RedemptionStatus.FUNDING]: [RedemptionStatus.RECLAIM_DUE],
+      [RedemptionStatus.FUNDED]: [RedemptionStatus.RECLAIM_DUE],
     };
-    if (!allowed[row.status].includes(status)) {
+    if (!(allowed[row.status] ?? []).includes(status)) {
       throw new BadRequestException(
         `Tidak bisa mengubah status dari ${row.status} ke ${status}.`,
       );
     }
     if (status === RedemptionStatus.SHIPPED) {
       this.logger.warn(
-        `Redemption ${id} → SHIPPED (record-only). Di PROD: panggil CC shipping API + burn NFT ` +
-          `${row.nftAddress}. Belum diarmed → tidak ada aksi on-chain.`,
+        `Redemption ${id} → SHIPPED (record-only, pemenuhan fisik manual). Burn CC jalur real ` +
+          `di-tandatangani USER lewat /redemptions/:id/submit-burn — bukan di sini.`,
+      );
+    }
+    // RECLAIM_DUE: USDC treasury sudah/mungkin didanai ke wallet user tapi burn tak dituntaskan →
+    // refundSafe=false supaya gerbang refund tak pernah membalikkan Rupiah (rugi dobel).
+    const extra =
+      status === RedemptionStatus.RECLAIM_DUE ? { refundSafe: false } : {};
+    if (status === RedemptionStatus.RECLAIM_DUE) {
+      this.logger.warn(
+        `Redemption ${id} → RECLAIM_DUE (resolusi manual). USDC ongkir sudah/mungkin di wallet ` +
+          `user — reclaim on-chain; JANGAN refund Rupiah (refundSafe=false).`,
       );
     }
     return this.prisma.cardRedemption.update({
       where: { id },
-      data: { status },
+      data: { status, ...extra },
     });
   }
 

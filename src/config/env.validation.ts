@@ -243,6 +243,34 @@ class EnvironmentVariables {
   @IsOptional()
   @IsString()
   HOSHI_MARKETPLACE_FEE_BPS?: string;
+
+  // ── CC Vault Shipping: kirim kartu fisik keluar dari vault CC ─────────────
+  // Opsional — "true" MENGAKTIFKAN jalur REAL kirim kartu fisik: user bayar ongkir Rupiah, treasury
+  // MENDANAI USDC ongkir ke wallet user, user menandatangani burn+ship CC. Default MATI: redemption
+  // tetap RECORD-ONLY (NFT tak di-burn; pemenuhan fisik manual admin). Nyalakan HANYA setelah treasury
+  // didanai & alur diuji. String (bukan boolean) mengikuti pola flag lain agar salah ketik tak jadi truthy.
+  @IsOptional()
+  @IsString()
+  HOSHI_CC_SHIPPING_ENABLED?: string;
+
+  // Opsional — base URL CC Vault Shipping API. Devnet default: https://dev-api.collectorcrypt.com,
+  // produksi: https://api.collectorcrypt.com. Di mainnet, dev-api DITOLAK (assertMainnetConsistency).
+  @IsOptional()
+  @IsString()
+  COLLECTORCRYPT_SHIPPING_BASE_URL?: string;
+
+  // Opsional — User-Agent yang dikirim ke CC Shipping (CC menolak sebagian request tanpa UA).
+  // Client punya fallback non-kosong bila ini tidak di-set.
+  @IsOptional()
+  @IsString()
+  COLLECTORCRYPT_SHIPPING_USER_AGENT?: string;
+
+  // Opsional — plafon pendanaan USDC ongkir dalam 24 jam berjalan (base unit, 6 desimal;
+  // 5000000000 = $5000). Default 5000000000. Batas nominal treasury→user untuk ongkir; turunkan
+  // sesuai isi dompet panas. @IsInt (bukan string) sama seperti GACHA_TREASURY_DAILY_CAP_USDC.
+  @IsOptional()
+  @IsInt()
+  HOSHI_SHIPPING_FUND_DAILY_CAP_USDC?: number;
 }
 
 /**
@@ -293,6 +321,15 @@ function assertMainnetConsistency(config: Record<string, unknown>): void {
   if (!str('HOSHI_TREASURY_ADDRESS')) {
     problems.push(
       'HOSHI_TREASURY_ADDRESS wajib diisi di mainnet (verifikasi pembayaran + tujuan mint).',
+    );
+  }
+
+  // CC Vault Shipping: kalau jalur real diaktifkan di mainnet, base URL-nya TIDAK boleh dev-api
+  // (user membayar ASLI + treasury mendanai USDC ASLI untuk shipment yang dibuat di lingkungan test).
+  const shipBase = str('COLLECTORCRYPT_SHIPPING_BASE_URL').toLowerCase();
+  if (shipBase.includes('dev-api.collectorcrypt.com')) {
+    problems.push(
+      `COLLECTORCRYPT_SHIPPING_BASE_URL masih dev-api (${str('COLLECTORCRYPT_SHIPPING_BASE_URL')}) di mainnet — pakai https://api.collectorcrypt.com.`,
     );
   }
 

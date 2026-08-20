@@ -12,6 +12,7 @@ import {
   ListingStatus,
   OfferStatus,
   PaymentStatus,
+  RedemptionStatus,
 } from '@prisma/client';
 import type { Listing, PaymentOrder } from '@prisma/client';
 import { detectProductionSignal } from '../common/demo-mode';
@@ -22,6 +23,8 @@ import {
   GachaService,
   TREASURY_MAX_PACK_PRICE_USDC,
 } from '../collectorcrypt/gacha.service';
+import { CcShippingService } from '../collectorcrypt/cc-shipping.service';
+import { SHIPPING_FUND_MAX_PER_TX_USDC } from '../collectorcrypt/treasury.service';
 import {
   ResellerPostBuyError,
   ResellerSettlementService,
@@ -209,6 +212,7 @@ export class PaymentsService {
     private readonly resellerSettlement: ResellerSettlementService,
     private readonly escrow: EscrowService,
     private readonly balance: BalanceService,
+    private readonly ccShipping: CcShippingService,
   ) {}
 
   /* ─────────────────────────── Bikin order ─────────────────────────── */
@@ -716,6 +720,156 @@ export class PaymentsService {
     return toPaymentOrderDto(order);
   }
 
+  /**
+   * Terbitkan tagihan rupiah untuk ONGKIR KIRIM-FISIK (CC Vault Shipping). Model createListingOrder.
+   *
+   * Ongkir (USD) di-taksir SERVER dari CC (bukan dari body klien), lalu di-Rupiah-kan lewat
+   * quoteRupiah yang SAMA dengan pack — jadi tak ada nominal yang datang dari user. TIDAK ADA USDC
+   * yang bergerak di sini: pendanaan USDC + burn dilakukan MALAS di sesi TTD user setelah Rupiah
+   * lunas (fulfilShipping → READY_TO_FUND → fundAndPrepare).
+   *
+   * Urutan = properti keamanannya:
+   *   0. gate + validasi redemption milik user + status REQUESTED  → menolak SEBELUM bayar itu gratis
+   *   1. taksir ongkir USD dari CC → USDC base unit
+   *   2. assertTreasuryCapacity(ongkir, plafon per-transfer ongkir)  → treasury harus sanggup mendanai
+   *   3. quoteRupiah  → Rupiah yang dibayar user
+   *   4. mint-request IDRX  → merchantOrderId lahir di sana
+   *   5. persist PaymentOrder (packType='SHIPPING', redemptionId) + redemption → AWAITING_PAYMENT
+   */
+  async createShippingOrder(
+    redemptionId: string,
+    user: AuthUser,
+    privyToken: string,
+  ): Promise<PaymentOrderDto> {
+    const treasuryAddress = this.treasuryAddressOrRefuse();
+    // Gate fitur: kalau HOSHI_CC_SHIPPING_ENABLED mati → tolak (record-only tak tersentuh).
+    this.ccShipping.assertEnabled();
+
+    const redemption = await this.prisma.cardRedemption.findUnique({
+      where: { id: redemptionId },
+    });
+    if (!redemption) throw new NotFoundException('Redemption tidak ditemukan.');
+    if (redemption.userId !== user.id) {
+      throw new ForbiddenException('Redemption ini bukan milik Anda.');
+    }
+    if (redemption.status !== RedemptionStatus.REQUESTED) {
+      throw new BadRequestException(
+        `Redemption ini tidak dalam status yang bisa dibuatkan tagihan ongkir (status ${redemption.status}).`,
+      );
+    }
+
+    // IDEMPOTEN per redemption: order ongkir PENDING yang belum kedaluwarsa → kembalikan yang itu
+    // (spam "Bayar Ongkir" tidak menumpuk order/mint-request).
+    const existingPending = await this.prisma.paymentOrder.findFirst({
+      where: {
+        userId: user.id,
+        redemptionId,
+        packType: 'SHIPPING',
+        status: PaymentStatus.PENDING,
+        expiresAt: { gt: new Date() },
+      },
+      orderBy: { createdAt: 'desc' },
+    });
+    if (existingPending) return toPaymentOrderDto(existingPending);
+
+    await this.assertOrderQuota(user.id);
+
+    // 1. Taksir ongkir (USD) dari CC → USDC base unit. Server-side; tak pernah dari klien.
+    const { usdcBaseUnits: priceUsdc } =
+      await this.ccShipping.estimateForRedemption(
+        redemptionId,
+        user,
+        privyToken,
+      );
+    if (!Number.isSafeInteger(priceUsdc) || priceUsdc <= 0) {
+      throw new ServiceUnavailableException(
+        'Ongkir dari CollectorCrypt sedang tidak wajar. Coba lagi nanti.',
+      );
+    }
+
+    // 2. Plafon: pakai plafon per-transfer ongkir yang SAMA dengan fundUsdc (impor konstanta agar
+    //    tak mungkin melenceng), plus cap harian + preflight saldo treasury (treasury yang mendanai).
+    await this.assertTreasuryCapacity(priceUsdc, SHIPPING_FUND_MAX_PER_TX_USDC);
+
+    // 3. Rupiah-kan lewat sumber harga yang sama dengan pack.
+    const priceIdr = await this.quoteRupiah(priceUsdc);
+
+    // 4. mint-request IDRX.
+    const expiryMinutes = this.intConfig(
+      'HOSHI_ORDER_EXPIRY_MINUTES',
+      DEFAULT_EXPIRY_MINUTES,
+      1,
+    );
+    // Sesudah bayar, balik ke /vault (halaman itu me-resume order lalu lanjut ke sesi TTD kirim).
+    const shippingReturnUrl = new URL(
+      '/vault',
+      this.requiredConfig('HOSHI_PAYMENT_RETURN_URL'),
+    ).toString();
+    const mint = await this.idrx.mintRequest({
+      toBeMinted: String(priceIdr),
+      destinationWalletAddress: treasuryAddress,
+      networkChainId: this.requiredConfig('IDRX_NETWORK_CHAIN_ID'),
+      returnUrl: shippingReturnUrl,
+      expiryPeriod: expiryMinutes,
+      productDetails: `Hoshi ongkir kirim ${redemption.cardName}`.slice(0, 255),
+    });
+    const data = mint.data;
+    if (
+      !data ||
+      typeof data.merchantOrderId !== 'string' ||
+      !data.merchantOrderId
+    ) {
+      throw new ServiceUnavailableException(
+        'IDRX tidak mengembalikan merchantOrderId. Order tidak dibuat — coba lagi.',
+      );
+    }
+
+    // 5. Persist order (packType='SHIPPING', redemptionId) + redemption → AWAITING_PAYMENT +
+    //    paymentOrderId, dalam SATU transaksi (klaim REQUESTED terjaga predikat). Kalah klaim
+    //    (count!==1) → rollback, order tak dibuat (mint-request yatim akan kedaluwarsa sendiri).
+    const created = await this.prisma.$transaction(async (tx) => {
+      const claim = await tx.cardRedemption.updateMany({
+        where: { id: redemptionId, status: RedemptionStatus.REQUESTED },
+        data: { status: RedemptionStatus.AWAITING_PAYMENT },
+      });
+      if (claim.count !== 1) return null;
+      const order = await tx.paymentOrder.create({
+        data: {
+          merchantOrderId: data.merchantOrderId,
+          idrxRequestId: data.id != null ? String(data.id) : null,
+          reference: data.reference ?? null,
+          userId: user.id,
+          packType: 'SHIPPING',
+          redemptionId,
+          priceIdr,
+          priceUsdc,
+          paymentMethod: 'HOSTED',
+          qrContent: data.qrContent ?? null,
+          virtualAccountNo: data.virtualAccountNo ?? null,
+          paymentUrl: data.paymentUrl ?? null,
+          expiresAt: new Date(Date.now() + expiryMinutes * 60_000),
+          status: PaymentStatus.PENDING,
+        },
+      });
+      await tx.cardRedemption.update({
+        where: { id: redemptionId },
+        data: { paymentOrderId: order.id },
+      });
+      return order;
+    });
+    if (!created) {
+      throw new BadRequestException(
+        'Redemption ini sudah dalam proses pembayaran ongkir. Cek order Anda.',
+      );
+    }
+
+    this.logger.log(
+      `Order ongkir ${created.merchantOrderId} dibuat: redemption ${redemptionId} ` +
+        `(${redemption.cardName}), Rp ${priceIdr}, ongkir ${priceUsdc} USDC base unit (user ${user.id}).`,
+    );
+    return toPaymentOrderDto(created);
+  }
+
   /* ─────────────────────────── Callback IDRX ─────────────────────────── */
 
   /**
@@ -889,6 +1043,13 @@ export class PaymentsService {
       return this.fulfilTopup(order);
     }
 
+    // ONGKIR KIRIM-FISIK (CC Vault Shipping): sentinel packType='SHIPPING' + redemptionId. Di ATAS
+    // fallback pack. fulfilShipping HANYA menandai redemption READY_TO_FUND (paruh AMAN) — TIDAK
+    // mendanai USDC / memanggil CC (itu MALAS, di sesi TTD user), jadi jalur fulfilment tetap refund-safe.
+    if (order.packType === 'SHIPPING' && order.redemptionId) {
+      return this.fulfilShipping(order, user);
+    }
+
     // Order MARKETPLACE (reseller kartu CC): jalur settlement TERSENDIRI — cek harga & delivery
     // spesifik-listing, BUKAN gacha.purchase() + assertPriceStillHonourable (yang untuk pack).
     if (order.listingId) {
@@ -1015,6 +1176,75 @@ export class PaymentsService {
       return this.releaseClaimForRetry(
         order,
         `Top-up credit/mark gagal: ${errorMessage(err)}`,
+      );
+    }
+  }
+
+  /**
+   * Fulfilment ONGKIR KIRIM-FISIK untuk order yang sudah diklaim (FULFILLING) — PARUH AMAN saja.
+   *
+   * TIDAK ADA belanja/pendanaan USDC di sini, dan TIDAK memanggil CC: ia HANYA menandai redemption
+   * AWAITING_PAYMENT → READY_TO_FUND + order FULFILLED, dalam SATU transaksi. Pendanaan USDC + CC
+   * prepare/burn dikerjakan MALAS di sesi tanda-tangan user (CcShippingService.fundAndPrepare),
+   * BUKAN di sini — supaya jalur fulfilment ini tetap sepenuhnya refund-safe (I2): satu-satunya hal
+   * yang sudah terjadi sampai titik ini adalah Rupiah masuk; belum ada satu pun USDC yang bergerak.
+   *
+   * Penanganan gagalnya seperti fulfilTopup: nol treasury → TIDAK PERNAH REFUND_DUE pasca-belanja.
+   * Kegagalan transien → lepas klaim ke PAID (reconciler mengulang). Kalau redemption sudah tidak
+   * AWAITING_PAYMENT (mis. dibatalkan admin) → refund manual (pra-danai, refundSafe=true).
+   */
+  private async fulfilShipping(
+    order: PaymentOrder,
+    _user: { id: string; walletAddress: string },
+  ): Promise<FulfilOutcome> {
+    const redemptionId = order.redemptionId;
+    if (!redemptionId) {
+      return this.failToRefund(
+        order,
+        `Order SHIPPING ${order.merchantOrderId} tanpa redemptionId — refund manual.`,
+      );
+    }
+    try {
+      // Klaim AWAITING_PAYMENT → READY_TO_FUND + order FULFILLED, ALL-OR-NOTHING dalam SATU tx.
+      // count!==1 = redemption bukan lagi AWAITING_PAYMENT (dibatalkan / sudah maju) → jangan
+      // diam-diam menandai order FULFILLED; lempar untuk memicu penanganan di bawah.
+      const claimed = await this.prisma.$transaction(async (tx) => {
+        const c = await tx.cardRedemption.updateMany({
+          where: {
+            id: redemptionId,
+            status: RedemptionStatus.AWAITING_PAYMENT,
+          },
+          data: { status: RedemptionStatus.READY_TO_FUND },
+        });
+        if (c.count !== 1) return 0;
+        await tx.paymentOrder.update({
+          where: { merchantOrderId: order.merchantOrderId },
+          data: {
+            status: PaymentStatus.FULFILLED,
+            fulfilledAt: new Date(),
+            error: null,
+          },
+        });
+        return 1;
+      });
+      if (claimed !== 1) {
+        // Redemption tak lagi AWAITING_PAYMENT (mis. dibatalkan). Rupiah sudah masuk, ongkir belum
+        // dilayani, NOL USDC bergerak → utang refund AMAN (refundSafe=true default).
+        return this.failToRefund(
+          order,
+          `Redemption ${redemptionId} bukan lagi AWAITING_PAYMENT — ongkir Rupiah perlu di-refund manual.`,
+        );
+      }
+      this.logger.log(
+        `Ongkir ${order.merchantOrderId} FULFILLED → redemption ${redemptionId} READY_TO_FUND ` +
+          `(user ${order.userId}). Pendanaan USDC ditunda ke sesi TTD user.`,
+      );
+      return 'FULFILLED';
+    } catch (err) {
+      // Transien (DB blip) → aman diulang: nol treasury, klaim redemption predikat-terjaga. Lepas ke PAID.
+      return this.releaseClaimForRetry(
+        order,
+        `Fulfil ongkir gagal: ${errorMessage(err)}`,
       );
     }
   }
@@ -1647,8 +1877,12 @@ export class PaymentsService {
    *
    * SEMUA aritmetika di sini INTEGER dan dibulatkan KE ATAS. Rupiah pecahan tidak ada, dan
    * pembulatan ke bawah = tiap pack menjual sedikit di bawah modal, selamanya.
+   *
+   * PUBLIK: RedemptionService memakainya untuk mengubah ongkir USDC (dari CC) → Rupiah, memakai
+   * SUMBER HARGA yang sama dengan invoice ongkir (createShippingOrder) — supaya taksiran yang
+   * dilihat user dan tagihan yang diterbitkan tidak lahir dari dua kalkulasi yang bisa melenceng.
    */
-  private async quoteRupiah(priceUsdc: number): Promise<number> {
+  async quoteRupiah(priceUsdc: number): Promise<number> {
     // usdtAmount dibangun dari base unit integer TANPA float: harga pack IEEE-754 = bug uang
     // yang tak terlacak. Contoh: 50_500_000 → "50.5", 50_000_000 → "50".
     const usdtAmount = usdcBaseUnitsToDecimalString(priceUsdc);

@@ -5,6 +5,8 @@ import { CcBuyService } from './cc-buy.service';
 import { CcCardFactsService } from './cc-card-facts.service';
 import { CcGachaClient } from './cc-gacha.client';
 import { CcMarketClient } from './cc-market.client';
+import { CcShippingClient } from './cc-shipping.client';
+import { CcShippingService } from './cc-shipping.service';
 import { GachaController } from './gacha.controller';
 import { GachaService } from './gacha.service';
 import { JupiterClient } from './jupiter.client';
@@ -29,8 +31,9 @@ import { TreasuryService } from './treasury.service';
  *   - GachaService             → menandatangani pembelian pack (USDC keluar)
  *   - TreasurySwapService      → menandatangani swap IDRX→USDC (uang berpindah BENTUK)
  *   - ResellerSettlementService → beli kartu katalog CC (USDC keluar) + transfer NFT ke pembeli
+ *   - CcShippingService        → mendanai USDC ongkir ke wallet user (fundUsdc) untuk burn+ship CC
  *
- * Ketiganya di-export (bukan TreasuryService) supaya modul lain menuju penandatangan hanya
+ * Keempatnya di-export (bukan TreasuryService) supaya modul lain menuju penandatangan hanya
  * lewat pintu yang membawa semua pengaman, tanpa private key bocor lintas modul.
  *
  * TreasurySwapService diletakkan di sini justru KARENA batasan itu: menutup lingkaran
@@ -60,6 +63,9 @@ import { TreasuryService } from './treasury.service';
     CcBuyService,
     // Settlement REAL reseller: treasury beli kartu CC (USDC keluar) + kirim NFT ke pembeli.
     ResellerSettlementService,
+    // CC Vault Shipping: danai USDC ongkir ke wallet user + orkestrasi burn+ship (user-signed).
+    CcShippingClient,
+    CcShippingService,
     GachaService,
     MarketSyncService,
     TreasuryService,
@@ -75,6 +81,8 @@ import { TreasuryService } from './treasury.service';
     CcCardFactsService,
     // PaymentsModule memanggilnya dari fulfilListing (settlement reseller saat di-arm).
     ResellerSettlementService,
+    // PaymentsModule (createShippingOrder) + RedemptionModule (fund/burn/status) memakainya.
+    CcShippingService,
   ],
 })
 export class CollectorCryptModule {}
