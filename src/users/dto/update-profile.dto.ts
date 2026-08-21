@@ -1,11 +1,16 @@
 import { ApiPropertyOptional } from '@nestjs/swagger';
 import { Transform } from 'class-transformer';
 import {
+  IsBoolean,
+  IsEmail,
+  IsInt,
   IsOptional,
   IsString,
   Length,
   Matches,
+  Max,
   MaxLength,
+  Min,
   ValidateIf,
 } from 'class-validator';
 
@@ -94,4 +99,45 @@ export class UpdateProfileDto {
     message: 'phoneNumber hanya boleh digit/spasi/strip, 4-20 karakter.',
   })
   phoneNumber?: string;
+
+  @ApiPropertyOptional({
+    example: 'satoshi@hoshi.example.com',
+    description: 'Email kontak. String kosong = hapus.',
+  })
+  @IsOptional()
+  @IsString()
+  @Transform(trim)
+  // String kosong SENGAJA lolos: itu perintah "hapus", bukan email yang salah.
+  @ValidateIf((o: UpdateProfileDto) => o.email !== '')
+  @IsEmail({}, { message: 'email harus berformat email yang valid.' })
+  email?: string;
+
+  @ApiPropertyOptional({
+    example: true,
+    description: 'Beri notifikasi saat ada offer masuk.',
+  })
+  @IsOptional()
+  @IsBoolean()
+  notifyOffers?: boolean;
+
+  @ApiPropertyOptional({
+    example: 50,
+    minimum: 0,
+    maximum: 100,
+    description:
+      'Ambang minimal (persen 0-100) beda offer vs listing sebelum diberi tahu.',
+  })
+  @IsOptional()
+  @IsInt()
+  @Min(0)
+  @Max(100)
+  notifyOfferThreshold?: number;
+
+  @ApiPropertyOptional({
+    example: true,
+    description: 'Beri notifikasi saat ada pesan baru.',
+  })
+  @IsOptional()
+  @IsBoolean()
+  notifyMessages?: boolean;
 }

@@ -67,6 +67,12 @@ export class UsersService {
       data.phoneCountryCode = emptyToNull(dto.phoneCountryCode);
     if (dto.phoneNumber !== undefined)
       data.phoneNumber = emptyToNull(dto.phoneNumber);
+    if (dto.email !== undefined) data.email = emptyToNull(dto.email);
+    if (dto.notifyOffers !== undefined) data.notifyOffers = dto.notifyOffers;
+    if (dto.notifyOfferThreshold !== undefined)
+      data.notifyOfferThreshold = dto.notifyOfferThreshold;
+    if (dto.notifyMessages !== undefined)
+      data.notifyMessages = dto.notifyMessages;
 
     if (Object.keys(data).length === 0) {
       throw new BadRequestException('Nothing to update.');
@@ -174,6 +180,9 @@ function toProfileDto(user: User) {
     website: user.website,
     phoneCountryCode: user.phoneCountryCode,
     phoneNumber: user.phoneNumber,
+    notifyOffers: user.notifyOffers,
+    notifyOfferThreshold: user.notifyOfferThreshold,
+    notifyMessages: user.notifyMessages,
     createdAt: user.createdAt,
   };
 }
