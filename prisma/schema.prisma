@@ -77,6 +77,12 @@ model User {
   phoneCountryCode String? // format "+62" (divalidasi di DTO)
   phoneNumber      String?
 
+  // Preferensi notifikasi (bukan uang). Default aman: aktif. Threshold 0-100 (persen,
+  // divalidasi di DTO) — minimal beda harga offer vs listing sebelum user diberi tahu.
+  notifyOffers         Boolean @default(true)
+  notifyOfferThreshold Int     @default(50)
+  notifyMessages       Boolean @default(true)
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
