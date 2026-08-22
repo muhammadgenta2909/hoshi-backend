@@ -111,3 +111,58 @@ export interface CcShippingErrorBody {
   error?: string;
   details?: string;
 }
+
+/* ─────────────────────── SIWS (Sign-In With Solana) — Track B ───────────────────────
+ * Handshake LOGIN wallet CC untuk user Phantom/wallet (Track A/Privy tetap untuk user Google).
+ * nonce/verify/refresh adalah PRA-AUTH: TIDAK membawa Authorization bearer (lihat requestNoAuth
+ * di client). Respons diketik LONGGAR ([k:string]:unknown) — CC boleh menambah field tanpa
+ * membuat parsing kita gagal; field yang kita andalkan tetap diketik tegas. */
+
+/**
+ * Body POST /auth/wallet/nonce. `partnerAppId`/`domain`/`uri` DISUNTIK dari config oleh service
+ * (client cuma transport) — frontend hanya mengirim wallet-nya.
+ */
+export interface CcSiwsNonceRequest {
+  wallet: string;
+  partnerAppId: string;
+  domain: string;
+  uri: string;
+}
+
+/**
+ * Respons /auth/wallet/nonce. `message` = teks SIWS KANONIK yang HARUS ditandatangani user
+ * VERBATIM (byte-for-byte) — jangan dibangun ulang di sisi kita.
+ */
+export interface CcSiwsNonceResponse {
+  nonce: string;
+  expiresAt: number;
+  message: string;
+  [k: string]: unknown;
+}
+
+/** Body POST /auth/wallet/verify. `signature` = base58 ed25519 atas UTF-8 bytes dari `message`. */
+export interface CcSiwsVerifyRequest {
+  message: string;
+  signature: string;
+}
+
+/** Respons /auth/wallet/verify — accessToken (prefix cca_) + refreshToken (prefix ccr_). */
+export interface CcSiwsVerifyResponse {
+  accessToken: string;
+  refreshToken: string;
+  expiresAt: number;
+  [k: string]: unknown;
+}
+
+/** Body POST /auth/wallet/refresh — tukar refreshToken lama dengan pasangan token baru. */
+export interface CcSiwsRefreshRequest {
+  refreshToken: string;
+}
+
+/** Respons /auth/wallet/refresh — pasangan token baru (bentuk sama dengan verify). */
+export interface CcSiwsRefreshResponse {
+  accessToken: string;
+  refreshToken: string;
+  expiresAt: number;
+  [k: string]: unknown;
+}

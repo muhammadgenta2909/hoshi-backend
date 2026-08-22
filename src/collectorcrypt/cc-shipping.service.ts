@@ -15,6 +15,9 @@ import { CcShippingClient } from './cc-shipping.client';
 import type {
   CcShipmentStatus,
   CcShippingAddressInput,
+  CcSiwsNonceResponse,
+  CcSiwsRefreshResponse,
+  CcSiwsVerifyResponse,
 } from './cc-shipping.types';
 import {
   TreasuryFundIndeterminateError,
@@ -416,7 +419,61 @@ export class CcShippingService {
     return refreshed ?? row;
   }
 
+  /* ---------------------- SIWS (Track B) — login handshake CC ----------------------
+     Relay PRA-AUTH murni untuk user wallet (Phantom) agar dapat sesi CC. TANPA DB, TANPA
+     persistensi — sama seperti sikap "token identitas tak pernah dipersist" di jalur shipping:
+     kita cuma meneruskan dan mengembalikan token ke frontend. DIGERBANG HOSHI_CC_SHIPPING_ENABLED
+     lewat assertEnabled() (pola sama dengan estimate/fund/burn/status). Kepemilikan wallet
+     (body.wallet === user.walletAddress) ditegakkan di controller. */
+
+  /** nonce: suntik partnerAppId/domain/uri dari config lalu relay. Config kosong → 503 (siwsConfig). */
+  async siwsNonce(wallet: string): Promise<CcSiwsNonceResponse> {
+    this.assertEnabled();
+    const { partnerAppId, domain, uri } = this.siwsConfig();
+    return this.client.siwsNonce({ wallet, partnerAppId, domain, uri });
+  }
+
+  /** verify: relay message+signature apa adanya → token sesi CC (cca_/ccr_). */
+  // async: assertEnabled() throw jadi rejected promise (bukan sync throw), konsisten dgn method lain.
+  async siwsVerify(
+    message: string,
+    signature: string,
+  ): Promise<CcSiwsVerifyResponse> {
+    this.assertEnabled();
+    return this.client.siwsVerify({ message, signature });
+  }
+
+  /** refresh: relay refreshToken apa adanya → pasangan token baru. */
+  async siwsRefresh(refreshToken: string): Promise<CcSiwsRefreshResponse> {
+    this.assertEnabled();
+    return this.client.siwsRefresh({ refreshToken });
+  }
+
   /* --- Internal --- */
+
+  /**
+   * Baca config SIWS LAZY (pola sama endpoint() di client). Salah satu kosong → 503 jelas
+   * ("SIWS not configured …") supaya kita TIDAK memanggil CC dengan partnerAppId/domain/uri
+   * undefined. Hanya jalur nonce yang butuh config; verify/refresh tidak.
+   */
+  private siwsConfig(): { partnerAppId: string; domain: string; uri: string } {
+    const read = (k: string): string =>
+      (this.config.get<string>(k) ?? '').trim();
+    const partnerAppId = read('COLLECTORCRYPT_PARTNER_APP_ID');
+    const domain = read('COLLECTORCRYPT_SIWS_DOMAIN');
+    const uri = read('COLLECTORCRYPT_SIWS_URI');
+    const missing = [
+      partnerAppId ? '' : 'COLLECTORCRYPT_PARTNER_APP_ID',
+      domain ? '' : 'COLLECTORCRYPT_SIWS_DOMAIN',
+      uri ? '' : 'COLLECTORCRYPT_SIWS_URI',
+    ].filter((k) => k.length > 0);
+    if (missing.length > 0) {
+      throw new ServiceUnavailableException(
+        `SIWS not configured — set ${missing.join(', ')}.`,
+      );
+    }
+    return { partnerAppId, domain, uri };
+  }
 
   /**
    * Redemption milik user login. Kepemilikan lewat LEDGER (userId), bukan klaim klien — id

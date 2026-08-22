@@ -131,6 +131,62 @@ describe('CcShippingClient', () => {
     });
   });
 
+  // SIWS (Track B) memakai jalur PRA-AUTH: nonce/verify/refresh MENGHASILKAN token, jadi TIDAK
+  // mengirim Authorization — tapi tetap mengirim User-Agent + content-type (kontrak "selalu UA").
+  describe('SIWS (no-auth path)', () => {
+    it('siwsNonce POSTs to /auth/wallet/nonce with User-Agent + content-type and NO Authorization', async () => {
+      mockFetchJson({ nonce: 'N', expiresAt: 1, message: 'MSG' });
+
+      const res = await client.siwsNonce({
+        wallet: 'Wallet1',
+        partnerAppId: 'app-1',
+        domain: 'hoshimarket.xyz',
+        uri: 'https://hoshimarket.xyz',
+      });
+
+      expect(fetchUrl()).toBe(`${BASE_URL}/auth/wallet/nonce`);
+      const init = fetchInit();
+      expect(init.method).toBe('POST');
+      expect(init.headers['User-Agent']).toBe(USER_AGENT);
+      expect(init.headers['content-type']).toBe('application/json');
+      // KONTRAK INTI Track B: tidak ada bearer pada handshake pra-auth.
+      expect(init.headers.Authorization).toBeUndefined();
+      expect(JSON.parse(init.body ?? '{}')).toMatchObject({
+        wallet: 'Wallet1',
+        partnerAppId: 'app-1',
+      });
+      expect(res.message).toBe('MSG');
+    });
+
+    it('siwsVerify / siwsRefresh also send no Authorization header', async () => {
+      mockFetchJson({ accessToken: 'cca_x', refreshToken: 'ccr_x', expiresAt: 2 });
+      await client.siwsVerify({ message: 'MSG', signature: 'SIG' });
+      expect(fetchUrl()).toBe(`${BASE_URL}/auth/wallet/verify`);
+      expect(fetchInit().headers.Authorization).toBeUndefined();
+
+      mockFetchJson({ accessToken: 'cca_y', refreshToken: 'ccr_y', expiresAt: 3 });
+      await client.siwsRefresh({ refreshToken: 'ccr_x' });
+      expect(fetchUrl()).toBe(`${BASE_URL}/auth/wallet/refresh`);
+      expect(fetchInit().headers.Authorization).toBeUndefined();
+    });
+
+    it('maps a CC error on the no-auth path the same way (400 → BadRequest, surfacing the message)', async () => {
+      mockFetchError(400, JSON.stringify({ message: 'bad nonce request' }));
+
+      const err = await client
+        .siwsNonce({
+          wallet: 'Wallet1',
+          partnerAppId: 'app-1',
+          domain: 'hoshimarket.xyz',
+          uri: 'https://hoshimarket.xyz',
+        })
+        .catch((e: unknown) => e);
+
+      expect(err).toBeInstanceOf(BadRequestException);
+      expect((err as Error).message).toContain('bad nonce request');
+    });
+  });
+
   describe('status mapping', () => {
     it('maps 401 → Unauthorized', async () => {
       mockFetchError(401, JSON.stringify({ message: 'bad token' }));
