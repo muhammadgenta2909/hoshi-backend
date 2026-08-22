@@ -18,6 +18,11 @@ import {
   CcShippingService,
   type FundAndPrepareResult,
 } from '../collectorcrypt/cc-shipping.service';
+import type {
+  CcSiwsNonceResponse,
+  CcSiwsRefreshResponse,
+  CcSiwsVerifyResponse,
+} from '../collectorcrypt/cc-shipping.types';
 import { PaymentsService } from '../payments/payments.service';
 import { RequestRedemptionDto } from './dto/request-redemption.dto';
 
@@ -284,5 +289,27 @@ export class RedemptionService {
       trackingIds: row.trackingIds,
       trackingUrls: row.trackingUrls,
     };
+  }
+
+  /* ---------------------- SIWS (Track B) — login wallet ke CC ----------------------
+     Pass-through tipis ke CcShippingService (relay + gerbang HOSHI_CC_SHIPPING_ENABLED).
+     Guard kepemilikan wallet ada di controller; di sini murni delegasi. */
+
+  /** Minta nonce SIWS CC untuk wallet user (partnerAppId/domain/uri disuntik service). */
+  siwsNonce(wallet: string): Promise<CcSiwsNonceResponse> {
+    return this.ccShipping.siwsNonce(wallet);
+  }
+
+  /** Verifikasi message+signature → token sesi CC (cca_/ccr_). */
+  siwsVerify(
+    message: string,
+    signature: string,
+  ): Promise<CcSiwsVerifyResponse> {
+    return this.ccShipping.siwsVerify(message, signature);
+  }
+
+  /** Tukar refreshToken CC dengan pasangan token baru. */
+  siwsRefresh(refreshToken: string): Promise<CcSiwsRefreshResponse> {
+    return this.ccShipping.siwsRefresh(refreshToken);
   }
 }

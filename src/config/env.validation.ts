@@ -271,6 +271,26 @@ class EnvironmentVariables {
   @IsOptional()
   @IsInt()
   HOSHI_SHIPPING_FUND_DAILY_CAP_USDC?: number;
+
+  // ── CC SIWS (Track B — login wallet Phantom ke CC) ───────────────────────
+  // Ketiganya OPSIONAL saat boot: deploy yang belum memakai Track B tetap harus bisa start.
+  // Kalau kosong, endpoint /redemptions/siws/nonce menolak dengan 503 "SIWS not configured"
+  // (CcShippingService.siwsConfig) — TIDAK memanggil CC dengan partnerAppId/domain/uri undefined.
+
+  // Slug partner CC kita (atau Privy App ID) — dikirim sebagai partnerAppId ke /auth/wallet/nonce.
+  @IsOptional()
+  @IsString()
+  COLLECTORCRYPT_PARTNER_APP_ID?: string;
+
+  // Hostname BARE untuk pesan SIWS (tanpa skema/port), mis. "hoshimarket.xyz". Masuk ke domain.
+  @IsOptional()
+  @IsString()
+  COLLECTORCRYPT_SIWS_DOMAIN?: string;
+
+  // URL origin aplikasi untuk pesan SIWS, mis. "https://hoshimarket.xyz". Masuk ke uri.
+  @IsOptional()
+  @IsString()
+  COLLECTORCRYPT_SIWS_URI?: string;
 }
 
 /**

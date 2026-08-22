@@ -50,6 +50,9 @@ describe('CcShippingService', () => {
     prepare: jest.Mock;
     burn: jest.Mock;
     getShipment: jest.Mock;
+    siwsNonce: jest.Mock;
+    siwsVerify: jest.Mock;
+    siwsRefresh: jest.Mock;
   };
   let treasury: { fundUsdc: jest.Mock };
 
@@ -149,6 +152,19 @@ describe('CcShippingService', () => {
       prepare: jest.fn(),
       burn: jest.fn(),
       getShipment: jest.fn(),
+      siwsNonce: jest
+        .fn()
+        .mockResolvedValue({ nonce: 'NONCE', expiresAt: 123, message: 'SIWS MSG' }),
+      siwsVerify: jest.fn().mockResolvedValue({
+        accessToken: 'cca_x',
+        refreshToken: 'ccr_x',
+        expiresAt: 456,
+      }),
+      siwsRefresh: jest.fn().mockResolvedValue({
+        accessToken: 'cca_y',
+        refreshToken: 'ccr_y',
+        expiresAt: 789,
+      }),
     };
     treasury = { fundUsdc: jest.fn().mockResolvedValue({ signature: 'FUNDSIG' }) };
 
@@ -587,6 +603,75 @@ describe('CcShippingService', () => {
       await expect(
         service.refreshStatus(REDEMPTION_ID, user, PRIVY),
       ).rejects.toBeInstanceOf(ServiceUnavailableException);
+    });
+  });
+
+  /* ─────────────────────────────── SIWS (Track B) ─────────────────────────────── */
+
+  describe('SIWS', () => {
+    const WALLET = user.walletAddress;
+
+    beforeEach(() => {
+      configFlags.COLLECTORCRYPT_PARTNER_APP_ID = 'hoshi-partner';
+      configFlags.COLLECTORCRYPT_SIWS_DOMAIN = 'hoshimarket.xyz';
+      configFlags.COLLECTORCRYPT_SIWS_URI = 'https://hoshimarket.xyz';
+    });
+
+    it('siwsNonce injects partnerAppId/domain/uri from config and relays the wallet', async () => {
+      const res = await service.siwsNonce(WALLET);
+
+      expect(client.siwsNonce).toHaveBeenCalledWith({
+        wallet: WALLET,
+        partnerAppId: 'hoshi-partner',
+        domain: 'hoshimarket.xyz',
+        uri: 'https://hoshimarket.xyz',
+      });
+      expect(res).toEqual({ nonce: 'NONCE', expiresAt: 123, message: 'SIWS MSG' });
+    });
+
+    it('siwsNonce returns 503 "SIWS not configured" and never calls CC when config is missing', async () => {
+      configFlags.COLLECTORCRYPT_SIWS_DOMAIN = undefined;
+
+      await expect(service.siwsNonce(WALLET)).rejects.toBeInstanceOf(
+        ServiceUnavailableException,
+      );
+      expect(client.siwsNonce).not.toHaveBeenCalled();
+    });
+
+    it('siwsVerify relays message + signature as-is (no config needed)', async () => {
+      const res = await service.siwsVerify('MSG', 'SIG');
+
+      expect(client.siwsVerify).toHaveBeenCalledWith({
+        message: 'MSG',
+        signature: 'SIG',
+      });
+      expect(res.accessToken).toBe('cca_x');
+    });
+
+    it('siwsRefresh relays the refreshToken as-is', async () => {
+      const res = await service.siwsRefresh('ccr_old');
+
+      expect(client.siwsRefresh).toHaveBeenCalledWith({
+        refreshToken: 'ccr_old',
+      });
+      expect(res.refreshToken).toBe('ccr_y');
+    });
+
+    it('all SIWS methods are gated by HOSHI_CC_SHIPPING_ENABLED (503 when off, no CC call)', async () => {
+      configFlags.HOSHI_CC_SHIPPING_ENABLED = 'false';
+
+      await expect(service.siwsNonce(WALLET)).rejects.toBeInstanceOf(
+        ServiceUnavailableException,
+      );
+      await expect(service.siwsVerify('m', 's')).rejects.toBeInstanceOf(
+        ServiceUnavailableException,
+      );
+      await expect(service.siwsRefresh('r')).rejects.toBeInstanceOf(
+        ServiceUnavailableException,
+      );
+      expect(client.siwsNonce).not.toHaveBeenCalled();
+      expect(client.siwsVerify).not.toHaveBeenCalled();
+      expect(client.siwsRefresh).not.toHaveBeenCalled();
     });
   });
 });

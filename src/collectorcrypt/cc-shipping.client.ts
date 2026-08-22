@@ -20,6 +20,12 @@ import type {
   CcShipmentResponse,
   CcShippingAddressInput,
   CcShippingErrorBody,
+  CcSiwsNonceRequest,
+  CcSiwsNonceResponse,
+  CcSiwsRefreshRequest,
+  CcSiwsRefreshResponse,
+  CcSiwsVerifyRequest,
+  CcSiwsVerifyResponse,
 } from './cc-shipping.types';
 
 /** Devnet default. Produksi: https://api.collectorcrypt.com (di-set via env). */
@@ -117,6 +123,37 @@ export class CcShippingClient {
     );
   }
 
+  /* --- SIWS (Sign-In With Solana) — Track B login handshake, PRA-AUTH ---
+     nonce/verify/refresh TIDAK membawa bearer: mereka MENGHASILKAN token, jadi lewat
+     requestNoAuth (User-Agent + content-type tetap dikirim, Authorization tidak). */
+
+  /** POST /auth/wallet/nonce → nonce + teks SIWS kanonik untuk ditandatangani wallet. */
+  siwsNonce(body: CcSiwsNonceRequest): Promise<CcSiwsNonceResponse> {
+    return this.requestNoAuth<CcSiwsNonceResponse>(
+      'POST',
+      '/auth/wallet/nonce',
+      body,
+    );
+  }
+
+  /** POST /auth/wallet/verify → tukar message+signature dengan token sesi CC (cca_/ccr_). */
+  siwsVerify(body: CcSiwsVerifyRequest): Promise<CcSiwsVerifyResponse> {
+    return this.requestNoAuth<CcSiwsVerifyResponse>(
+      'POST',
+      '/auth/wallet/verify',
+      body,
+    );
+  }
+
+  /** POST /auth/wallet/refresh → pasangan token baru dari refreshToken. */
+  siwsRefresh(body: CcSiwsRefreshRequest): Promise<CcSiwsRefreshResponse> {
+    return this.requestNoAuth<CcSiwsRefreshResponse>(
+      'POST',
+      '/auth/wallet/refresh',
+      body,
+    );
+  }
+
   /* --- Internal --- */
 
   /**
@@ -137,19 +174,71 @@ export class CcShippingClient {
     return { baseUrl: baseUrl.replace(/\/+$/, ''), userAgent };
   }
 
+  /**
+   * Jalur AUTH: kirim `Authorization: Bearer <privy-identity-token>` (token identitas user).
+   * Token WAJIB non-kosong — tanpa itu CC pasti 401 dan kita boros satu round-trip.
+   */
   private async request<T>(
     method: 'GET' | 'POST',
     path: string,
     privyToken: string,
     body?: unknown,
   ): Promise<T> {
-    // Token identitas user WAJIB ada — tanpa itu CC pasti 401 dan kita boros satu round-trip.
     if (typeof privyToken !== 'string' || privyToken.trim().length === 0) {
+      // async → throw jadi rejected promise (bukan sync throw), sama seperti pemanggil lain harapkan.
       throw new UnauthorizedException(
         'Token identitas Privy tidak ada — kirim header x-privy-identity-token.',
       );
     }
     const { baseUrl, userAgent } = this.endpoint();
+    return this.send<T>(
+      method,
+      path,
+      baseUrl,
+      {
+        Authorization: `Bearer ${privyToken.trim()}`,
+        'User-Agent': userAgent,
+        'content-type': 'application/json',
+      },
+      body,
+    );
+  }
+
+  /**
+   * Jalur PRA-AUTH (SIWS nonce/verify/refresh): TANPA Authorization — endpoint ini yang MENGHASILKAN
+   * token, jadi belum ada bearer untuk dikirim. Header WAJIB `User-Agent` + `content-type` TETAP
+   * dikirim; timeout, pemetaan error, dan parsing JSON identik dengan jalur auth (lewat send()).
+   */
+  private requestNoAuth<T>(
+    method: 'GET' | 'POST',
+    path: string,
+    body?: unknown,
+  ): Promise<T> {
+    const { baseUrl, userAgent } = this.endpoint();
+    return this.send<T>(
+      method,
+      path,
+      baseUrl,
+      {
+        'User-Agent': userAgent,
+        'content-type': 'application/json',
+      },
+      body,
+    );
+  }
+
+  /**
+   * Transport bersama untuk jalur auth & pra-auth: satu-satunya tempat fetch dijalankan, timeout
+   * di-abort, status dipetakan (toHttpException), dan body JSON diparse. Header disuplai pemanggil
+   * (dengan/atau tanpa Authorization) — itulah satu-satunya beda antara request & requestNoAuth.
+   */
+  private async send<T>(
+    method: 'GET' | 'POST',
+    path: string,
+    baseUrl: string,
+    headers: Record<string, string>,
+    body?: unknown,
+  ): Promise<T> {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), CC_SHIPPING_TIMEOUT_MS);
 
@@ -157,11 +246,7 @@ export class CcShippingClient {
     try {
       res = await fetch(`${baseUrl}${path}`, {
         method,
-        headers: {
-          Authorization: `Bearer ${privyToken.trim()}`,
-          'User-Agent': userAgent,
-          'content-type': 'application/json',
-        },
+        headers,
         body: body === undefined ? undefined : JSON.stringify(body),
         signal: controller.signal,
       });
