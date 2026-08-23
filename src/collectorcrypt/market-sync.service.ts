@@ -3,9 +3,17 @@ import { ConfigService } from '@nestjs/config';
 import { ListingSource, Prisma } from '@prisma/client';
 import { IDRX_MAX } from '../marketplace/marketplace.constants';
 import { PrismaService } from '../prisma/prisma.service';
-import { eraFromYear, mapGrader, parseGradeScore } from './cc-card-facts';
+import {
+  eraFromYear,
+  illustrationCategoryFromCard,
+  mapGrader,
+  parseGradeScore,
+} from './cc-card-facts';
 import { CcMarketClient } from './cc-market.client';
 import type { CcMarketCard } from './cc-market.types';
+
+// illustrationCategoryFromCard dipindah ke ./cc-card-facts (satu sumber, dipakai bersama
+// jalur katalog-sync ini + jalur kartu-hasil-pull di marketplace.service).
 
 /** Kurs default USD→IDR untuk harga display marketplace (POC; override via env). */
 const DEFAULT_USD_IDR_RATE = 16_000;
@@ -282,9 +290,12 @@ export class MarketSyncService {
       language: card.language ?? '',
       era: eraFromYear(card.year),
       element: '',
-      // Kategori kita dipakai sebagai badge bebas — nama franchise CC ("Pokemon")
-      // informatif di sana walau listing lokal memakainya untuk jenis ilustrasi.
-      category: card.category ?? '',
+      // Kategori kita = JENIS ILUSTRASI (chip filter frontend), diturunkan dari
+      // NAMA kartu — bukan `card.category` (itu nama franchise "Pokemon", yang
+      // membuat semua chip ilustrasi kosong). '' bila tak ada yang cocok (jujur;
+      // kartu tetap muncul di "All"). Hanya memengaruhi sync ke depan: baris DB
+      // lama ter-update kategorinya pada run sync berikutnya.
+      category: illustrationCategoryFromCard(card),
       // Game/TCG franchise APA ADANYA dari CC — dipakai FE utk deteksi jenis kartu (ikon Pokéball
       // dst) secara 100% akurat. null kalau CC tak menyebut → FE jatuh ke heuristik nama.
       tcg: card.category?.trim() || null,
