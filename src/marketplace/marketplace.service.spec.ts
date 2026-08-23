@@ -16,6 +16,7 @@ import { CcCardFactsService } from '../collectorcrypt/cc-card-facts.service';
 import { NftService } from '../nft/nft.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { EscrowService } from '../escrow/escrow.service';
+import { MailService } from '../mail/mail.service';
 import { MarketplaceService } from './marketplace.service';
 
 // Prevent the Metaplex/Solana ESM chain from loading through NftService.
@@ -160,6 +161,10 @@ describe('MarketplaceService', () => {
         { provide: CcCardFactsService, useValue: ccFacts },
         { provide: ConfigService, useValue: config },
         { provide: EscrowService, useValue: escrow },
+        {
+          provide: MailService,
+          useValue: { sendEmail: jest.fn().mockResolvedValue(undefined) },
+        },
       ],
     }).compile();
 

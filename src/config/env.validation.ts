@@ -291,6 +291,20 @@ class EnvironmentVariables {
   @IsOptional()
   @IsString()
   COLLECTORCRYPT_SIWS_URI?: string;
+
+  // ── Email notifikasi (Resend) ────────────────────────────────────────────
+  // Keduanya OPSIONAL: fitur email GELAP sampai di-provision. Tanpa RESEND_API_KEY,
+  // MailService jadi no-op (satu debug log) — aksi bisnis (offer/pesan) tetap jalan.
+  // Isi RESEND_API_KEY untuk mengaktifkan; salah ketik tidak boleh mematikan boot.
+  @IsOptional()
+  @IsString()
+  RESEND_API_KEY?: string;
+
+  // Alamat pengirim untuk email Resend, mis. "Hoshi <no-reply@hoshimarket.xyz>".
+  // Default dipakai MailService bila kosong. Domainnya harus terverifikasi di Resend.
+  @IsOptional()
+  @IsString()
+  MAIL_FROM?: string;
 }
 
 /**
