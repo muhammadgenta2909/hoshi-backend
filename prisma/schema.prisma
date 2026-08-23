@@ -83,6 +83,10 @@ model User {
   notifyOfferThreshold Int     @default(50)
   notifyMessages       Boolean @default(true)
 
+  // Profil ikut hasil pencarian/discovery user lain. Default false: opt-in eksplisit
+  // (privasi aman by default — beda dari notif yang default aktif).
+  discoverable Boolean @default(false)
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 

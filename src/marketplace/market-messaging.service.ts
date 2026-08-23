@@ -4,8 +4,10 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { MarketSenderType, MarketThreadStatus } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
+import { MailService } from '../mail/mail.service';
 import type { AuthUser } from '../auth/jwt.strategy';
 
 const USER_LABEL = {
@@ -28,13 +30,58 @@ function label(u: { displayName: string | null; walletAddress: string }): string
  */
 @Injectable()
 export class MarketMessagingService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly mail: MailService,
+    private readonly config: ConfigService,
+  ) {}
+
+  /**
+   * Kirim email "pesan baru" ke penerima — HANYA bila penerima punya notifyMessages = true
+   * DAN punya email. SENGAJA tidak menyertakan isi pesan (bisa sensitif): cukup notice singkat
+   * + tautan. Fire-and-forget: MailService tak pernah throw; .catch tambahan sebagai jaring pengaman.
+   */
+  private notifyNewMessage(
+    recipient: { email: string | null; notifyMessages: boolean } | null,
+  ): void {
+    // Dibungkus try/catch: bug sinkron pun tak boleh menggagalkan pengiriman pesan
+    // (pesan sudah terlanjur persist sebelum method ini dipanggil).
+    try {
+      if (!recipient || !recipient.notifyMessages || !recipient.email) return;
+
+      // FRONTEND_ORIGIN bisa CSV multi-origin (lihat main.ts) — pakai origin PERTAMA untuk link email.
+      const site = (this.config.get<string>('FRONTEND_ORIGIN') ?? '').split(',')[0].trim();
+      const linkHtml = site
+        ? `<p><a href="${site}">Buka Hoshi untuk membaca pesan Anda</a></p>`
+        : '';
+      const html = `
+        <p>Halo,</p>
+        <p>Anda menerima pesan baru di Hoshi.</p>
+        ${linkHtml}
+        <p>— Hoshi</p>
+      `;
+      void this.mail
+        .sendEmail({
+          to: recipient.email,
+          subject: 'You have a new message on Hoshi',
+          html,
+        })
+        .catch(() => {});
+    } catch {
+      // Sengaja ditelan: notifikasi email bukan bagian dari kontrak pesan.
+    }
+  }
 
   /** Pembeli membuka / melanjutkan percakapan pada sebuah listing. */
   async postToListing(listingId: string, user: AuthUser, body: string) {
     const listing = await this.prisma.listing.findUnique({
       where: { id: listingId },
-      select: { id: true, sellerId: true },
+      select: {
+        id: true,
+        sellerId: true,
+        // Preferensi notifikasi + email penjual (penerima) untuk email "pesan baru".
+        seller: { select: { email: true, notifyMessages: true } },
+      },
     });
     if (!listing) throw new NotFoundException('Listing tidak ditemukan.');
     // Kartu katalog CC (sellerId null) tidak punya penjual user untuk dihubungi.
@@ -64,6 +111,8 @@ export class MarketMessagingService {
       where: { id: thread.id },
       data: { status: MarketThreadStatus.OPEN },
     });
+    // Penerima = penjual. Fire-and-forget; tak boleh menggagalkan pengiriman pesan.
+    this.notifyNewMessage(listing.seller);
     return { threadId: thread.id };
   }
 
@@ -165,7 +214,14 @@ export class MarketMessagingService {
   async reply(threadId: string, user: AuthUser, body: string) {
     const thread = await this.prisma.marketThread.findUnique({
       where: { id: threadId },
-      select: { id: true, buyerId: true, sellerId: true },
+      select: {
+        id: true,
+        buyerId: true,
+        sellerId: true,
+        // Kedua sisi: penerima ditentukan setelah kita tahu pengirim siapa.
+        buyer: { select: { email: true, notifyMessages: true } },
+        seller: { select: { email: true, notifyMessages: true } },
+      },
     });
     if (!thread) throw new NotFoundException('Percakapan tidak ditemukan.');
     const iAmBuyer = thread.buyerId === user.id;
@@ -185,6 +241,8 @@ export class MarketMessagingService {
       where: { id: threadId },
       data: { status: MarketThreadStatus.OPEN },
     });
+    // Penerima = lawan bicara (kalau saya buyer → penjual, sebaliknya). Fire-and-forget.
+    this.notifyNewMessage(iAmBuyer ? thread.seller : thread.buyer);
     return { ok: true };
   }
 

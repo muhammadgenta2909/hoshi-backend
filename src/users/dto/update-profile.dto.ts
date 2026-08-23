@@ -140,4 +140,12 @@ export class UpdateProfileDto {
   @IsOptional()
   @IsBoolean()
   notifyMessages?: boolean;
+
+  @ApiPropertyOptional({
+    example: false,
+    description: 'Profil ikut hasil pencarian/discovery user lain.',
+  })
+  @IsOptional()
+  @IsBoolean()
+  discoverable?: boolean;
 }

@@ -35,6 +35,7 @@ import { UpdateListingDto } from './dto/update-listing.dto';
 import { SubmitEscrowDto } from './dto/submit-escrow.dto';
 import { assertDemoOnly, detectProductionSignal } from '../common/demo-mode';
 import { EscrowService } from '../escrow/escrow.service';
+import { MailService } from '../mail/mail.service';
 import {
   ActivityDto,
   displayLabel,
@@ -127,6 +128,7 @@ export class MarketplaceService {
     private readonly ccFacts: CcCardFactsService,
     private readonly config: ConfigService,
     private readonly escrow: EscrowService,
+    private readonly mail: MailService,
   ) {}
 
   /**
@@ -267,9 +269,19 @@ export class MarketplaceService {
         set: true,
         status: true,
         source: true,
+        expectedValueIdrx: true,
         sellerId: true,
         sellerAddress: true,
-        seller: { select: USER_LABEL_SELECT },
+        // Selain label From/To, kita perlu preferensi notifikasi + email penjual
+        // (penerima) untuk memutuskan apakah mengirim email offer.
+        seller: {
+          select: {
+            ...USER_LABEL_SELECT,
+            email: true,
+            notifyOffers: true,
+            notifyOfferThreshold: true,
+          },
+        },
       },
     });
     if (!listing) throw new NotFoundException('Listing tidak ditemukan.');
@@ -310,7 +322,71 @@ export class MarketplaceService {
       toLabel: displayLabel(listing.seller, listing.sellerAddress),
     });
 
+    // Notifikasi email ke PENJUAL (penerima). Fire-and-forget: TIDAK di-await dengan
+    // cara yang bisa menggagalkan pembuatan offer — bila email gagal, offer tetap sukses.
+    this.notifyOfferReceived(listing, offer.amount);
+
     return toOfferDto(offer);
+  }
+
+  /**
+   * Kirim email "offer diterima" ke penjual — HANYA bila:
+   *  • penjual punya preferensi notifyOffers = true, DAN
+   *  • penjual punya email, DAN
+   *  • nominal offer >= (notifyOfferThreshold% × expected/insured value listing).
+   * Aman sebagai no-op bila salah satu syarat tak terpenuhi. Tidak pernah throw
+   * (MailService menelan errornya; guard di sini murni sinkron & tak bisa gagal).
+   */
+  private notifyOfferReceived(
+    listing: {
+      name: string;
+      expectedValueIdrx: number;
+      seller: {
+        email: string | null;
+        notifyOffers: boolean;
+        notifyOfferThreshold: number;
+      } | null;
+    },
+    amount: number,
+  ): void {
+    // Seluruh badan dibungkus try/catch: bahkan bug sinkron di sini tak boleh
+    // menggagalkan submitOffer (offer sudah terlanjur persist sebelum dipanggil).
+    try {
+      const seller = listing.seller;
+      if (!seller || !seller.notifyOffers || !seller.email) return;
+
+      // Threshold = persen dari nilai insured/expected. notifyOfferThreshold 0..100.
+      const pct = Math.max(0, Math.min(100, seller.notifyOfferThreshold ?? 0));
+      const minAmount = (pct / 100) * (listing.expectedValueIdrx ?? 0);
+      if (amount < minAmount) return;
+
+      const cardName = listing.name || 'kartu Anda';
+      const amountLabel = amount.toLocaleString('id-ID');
+      const subject = `You received an offer of Rp ${amountLabel} on ${cardName}`;
+      // FRONTEND_ORIGIN bisa CSV multi-origin (lihat main.ts) — pakai origin PERTAMA untuk link email.
+      const site = (this.config.get<string>('FRONTEND_ORIGIN') ?? '').split(',')[0].trim();
+      const linkHtml = site
+        ? `<p><a href="${site}">Buka Hoshi untuk meninjau penawaran</a></p>`
+        : '';
+      const html = `
+        <p>Halo,</p>
+        <p>Anda menerima penawaran sebesar <strong>Rp ${amountLabel}</strong> untuk <strong>${cardName}</strong>.</p>
+        ${linkHtml}
+        <p>— Hoshi</p>
+      `;
+
+      // Fire-and-forget: MailService.sendEmail sudah tak pernah throw, tapi rantai .catch
+      // di sini adalah jaring pengaman ekstra agar rejection tak pernah lolos.
+      void this.mail
+        .sendEmail({ to: seller.email, subject, html })
+        .catch(() => {});
+    } catch (err) {
+      this.logger.debug(
+        `notifyOfferReceived diabaikan (tak boleh menggagalkan offer): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
   }
 
   /* ---------------------- offers: profile tabs ---------------------- */

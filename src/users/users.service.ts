@@ -73,6 +73,7 @@ export class UsersService {
       data.notifyOfferThreshold = dto.notifyOfferThreshold;
     if (dto.notifyMessages !== undefined)
       data.notifyMessages = dto.notifyMessages;
+    if (dto.discoverable !== undefined) data.discoverable = dto.discoverable;
 
     if (Object.keys(data).length === 0) {
       throw new BadRequestException('Nothing to update.');
@@ -183,6 +184,7 @@ function toProfileDto(user: User) {
     notifyOffers: user.notifyOffers,
     notifyOfferThreshold: user.notifyOfferThreshold,
     notifyMessages: user.notifyMessages,
+    discoverable: user.discoverable,
     createdAt: user.createdAt,
   };
 }

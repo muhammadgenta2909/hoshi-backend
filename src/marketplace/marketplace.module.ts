@@ -1,6 +1,7 @@
 import { Module } from '@nestjs/common';
 import { CollectorCryptModule } from '../collectorcrypt/collectorcrypt.module';
 import { EscrowModule } from '../escrow/escrow.module';
+import { MailModule } from '../mail/mail.module';
 import { NftModule } from '../nft/nft.module';
 import { MarketMessagingController } from './market-messaging.controller';
 import { MarketMessagingService } from './market-messaging.service';
@@ -14,7 +15,7 @@ import { MarketplaceService } from './marketplace.service';
  * (transfer kartu penjual → wallet escrow) untuk jalur P2P real.
  */
 @Module({
-  imports: [NftModule, CollectorCryptModule, EscrowModule],
+  imports: [NftModule, CollectorCryptModule, EscrowModule, MailModule],
   controllers: [MarketplaceController, MarketMessagingController],
   providers: [MarketplaceService, MarketMessagingService],
   exports: [MarketplaceService],
