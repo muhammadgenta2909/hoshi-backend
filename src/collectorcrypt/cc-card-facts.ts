@@ -95,6 +95,42 @@ export function eraFromYear(year: number | null | undefined): string {
   return 'Vintage';
 }
 
+/**
+ * Turunkan JENIS ILUSTRASI (salah satu dari 6 chip kategori frontend) dari teks
+ * manusia pada kartu — `itemName` utama, `set` sebagai cadangan. Dipakai BERSAMA oleh
+ * jalur katalog-sync (MarketSyncService) dan jalur kartu-hasil-pull (marketplace.create),
+ * supaya kolom Listing.category berarti sama dari KEDUA penulis (dulu mereka beda).
+ *
+ * KENAPA: `card.category` dari CC adalah nama FRANCHISE ("Pokemon"), BUKAN rarity
+ * ilustrasi. Chip kategori frontend adalah 6 jenis ilustrasi ("Special Illustration",
+ * "Secret Rare", "Rainbow", "Character Illustration", "Full Art", "PROMO CARD"), jadi
+ * menyimpan "Pokemon" sebagai category membuat SEMUA chip ilustrasi memfilter ke kosong
+ * untuk kartu CC nyata. Franchise tetap dipertahankan di field `tcg`.
+ *
+ * PRINSIP: UTAMAKAN PRESISI di atas recall — tag salah lebih buruk daripada kosong;
+ * kartu tak cocok cukup muncul di "All". Frasa lengkap dicek case-insensitive, yang
+ * lebih spesifik dulu. Singkatan ambigu ("SR") SENGAJA tak dicocokkan; "SIR"/"FA" hanya
+ * HURUF BESAR + batas kata supaya "sir"/"fa" biasa tak false-positive.
+ *
+ * @returns salah satu dari 6 jenis ilustrasi, atau '' jika tak ada yang cocok.
+ */
+export function illustrationCategoryFromCard(card: {
+  itemName?: string | null;
+  set?: string | null;
+}): string {
+  const text = `${card.itemName ?? ''} ${card.set ?? ''}`;
+  // Urutan = prioritas; yang lebih spesifik/panjang dicek lebih dulu.
+  if (/character\s+illustration/i.test(text)) return 'Character Illustration';
+  if (/special\s+illustration/i.test(text) || /\bSIR\b/.test(text)) {
+    return 'Special Illustration';
+  }
+  if (/secret\s+rare/i.test(text)) return 'Secret Rare';
+  if (/rainbow\s+rare|\brainbow\b/i.test(text)) return 'Rainbow';
+  if (/full\s*art/i.test(text) || /\bFA\b/.test(text)) return 'Full Art';
+  if (/\bpromo\b/i.test(text)) return 'PROMO CARD';
+  return '';
+}
+
 /** Satu kartu katalog CC → fakta kita. Field yang tidak dikirim CC tetap null. */
 export function readCardFacts(card: CcMarketCard): CcCardFacts {
   return {

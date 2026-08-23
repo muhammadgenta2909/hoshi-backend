@@ -19,7 +19,11 @@ import {
 } from '@prisma/client';
 import type { CcPackPurchase, Grader } from '@prisma/client';
 import type { AuthUser } from '../auth/jwt.strategy';
-import { eraFromYear, listableGrade } from '../collectorcrypt/cc-card-facts';
+import {
+  eraFromYear,
+  illustrationCategoryFromCard,
+  listableGrade,
+} from '../collectorcrypt/cc-card-facts';
 import { CcCardFactsService } from '../collectorcrypt/cc-card-facts.service';
 import { NftService } from '../nft/nft.service';
 import { PrismaService } from '../prisma/prisma.service';
@@ -547,7 +551,10 @@ export class MarketplaceService {
       gradeScore: grade.gradeScore,
       certificate: facts.gradeCert,
       set: facts.set ?? '',
-      category: facts.category ?? '',
+      // Jenis ilustrasi diturunkan dari nama kartu — SAMA seperti jalur katalog-sync
+      // (market-sync), supaya kolom category konsisten antar-penulis. `card.category`
+      // CC di sini adalah franchise ("Pokemon") → tetap dipakai untuk `tcg`, bukan category.
+      category: illustrationCategoryFromCard(facts),
       // Game/TCG franchise dari CC (card.category) — dipakai FE utk deteksi jenis kartu.
       tcg: facts.category ?? null,
       language: facts.language ?? '',
