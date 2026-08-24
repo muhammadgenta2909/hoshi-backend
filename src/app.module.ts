@@ -22,6 +22,7 @@ import { SupportModule } from './support/support.module';
 import { BalanceModule } from './balance/balance.module';
 import { RedemptionModule } from './redemption/redemption.module';
 import { SwapModule } from './swap/swap.module';
+import { GeoModule } from './geo/geo.module';
 
 @Module({
   imports: [
@@ -45,6 +46,7 @@ import { SwapModule } from './swap/swap.module';
     BalanceModule,
     RedemptionModule,
     SwapModule,
+    GeoModule,
   ],
   controllers: [AppController],
   providers: [
