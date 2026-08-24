@@ -305,6 +305,15 @@ class EnvironmentVariables {
   @IsOptional()
   @IsString()
   MAIL_FROM?: string;
+
+  // ── GEO proxy (countrystatecity.in) ──────────────────────────────────────
+  // Opsional — API key untuk https://api.countrystatecity.in (header X-CSCAPI-KEY).
+  // GELAP sampai diisi: tanpa key, GET /api/geo/* menjawab 503 "Geo lookup not
+  // configured" dan frontend jatuh ke input teks bebas (address form tetap jalan).
+  // Dibaca LAZY oleh GeoService — key TIDAK PERNAH sampai ke browser (proxy server-side).
+  @IsOptional()
+  @IsString()
+  CSC_API_KEY?: string;
 }
 
 /**
