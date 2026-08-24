@@ -523,6 +523,40 @@ export class GachaService {
     return this.ccMockEnabled();
   }
 
+  /**
+   * Saldo SOL dompet ESCROW (SOL, bukan lamports) — dibaca SERVER-SIDE lewat RPC yang SAMA
+   * dengan treasuryBalances() (SOLANA_RPC_URL, connection yang dimemoisasi). Dashboard admin
+   * dulu membaca ini via RPC BROWSER (rapuh, sering menampilkan "—"); sekarang backend yang
+   * membacanya sehingga selalu konsisten.
+   *
+   * `ESCROW_ADDRESS` = pubkey Solana BIASA (read-only) — BUKAN secret key: kita hanya
+   * getBalance by address, tidak pernah menandatangani apa pun dari sini.
+   *
+   *   • ESCROW_ADDRESS tidak di-set    → { configured: false, sol: null }
+   *   • di-set, RPC belum ada / error  → { configured: true,  sol: null }  (JANGAN jatuhkan endpoint)
+   *   • di-set & terbaca               → { configured: true,  sol: <SOL> }
+   */
+  async escrowSolBalance(): Promise<{ configured: boolean; sol: number | null }> {
+    const address = this.config?.get<string>('ESCROW_ADDRESS')?.trim();
+    if (!address) return { configured: false, sol: null };
+    try {
+      const rpc = this.config?.get<string>('SOLANA_RPC_URL');
+      if (!rpc) return { configured: true, sol: null };
+      // Pakai kembali connection yang sama dengan pembaca saldo treasury (lazy, dimemoisasi).
+      if (!this.balanceConn)
+        this.balanceConn = new Connection(rpc, 'confirmed');
+      const lamports = await this.balanceConn.getBalance(new PublicKey(address));
+      return { configured: true, sol: lamports / 1_000_000_000 };
+    } catch (err) {
+      this.logger.warn(
+        `escrowSolBalance: gagal baca saldo SOL escrow (${
+          err instanceof Error ? err.message : 'unknown'
+        }). escrowSol=null.`,
+      );
+      return { configured: true, sol: null };
+    }
+  }
+
   /** Tulis satu baris pack OPENED palsu (kartu di-undi lokal) dan kembalikan DTO-nya. */
   private async mockPurchase(
     packType: string,

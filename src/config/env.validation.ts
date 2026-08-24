@@ -228,6 +228,14 @@ class EnvironmentVariables {
   @IsString()
   HOSHI_ESCROW_SECRET_KEY?: string;
 
+  // Opsional — pubkey Solana dompet ESCROW (read-only, BUKAN secret key). Dipakai dashboard admin
+  // untuk membaca saldo SOL escrow SERVER-SIDE (GET /admin/treasury → escrowSol) lewat RPC backend,
+  // menggantikan pembacaan via RPC browser yang rapuh. Tidak di-set → escrowConfigured=false &
+  // escrowSol=null. Aman dipisah dari HOSHI_ESCROW_SECRET_KEY: hanya alamat publik, tak bisa menandatangani.
+  @IsOptional()
+  @IsString()
+  ESCROW_ADDRESS?: string;
+
   // Opsional — "true" MENGAKTIFKAN settlement P2P REAL: listing menaruh kartu penjual ke escrow,
   // dan saat terjual escrow memindah kartu ke pembeli + saldo penjual dikredit. Default MATI:
   // listing user tetap langsung ACTIVE (tanpa escrow) & order P2P di-refund manual. Nyalakan HANYA

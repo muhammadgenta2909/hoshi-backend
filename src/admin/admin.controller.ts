@@ -73,6 +73,11 @@ export class AdminController {
     // simulated = USDC/SOL yang dikembalikan itu MOCK (staging) — UI wajib menandainya & TIDAK
     // menampilkan angka $ palsu sbg saldo asli. IDRX tetap nilai asli.
     const simulated = this.gacha.treasuryIsSimulated();
+    // Escrow SOL dibaca SERVER-SIDE (RPC backend, connection yang sama dengan saldo treasury),
+    // bukan lagi via RPC browser yang rapuh & sering menampilkan "—". escrowConfigured=false &
+    // escrowSol=null bila ESCROW_ADDRESS tidak di-set; escrowSol=null (tanpa menjatuhkan endpoint)
+    // bila alamatnya di-set tapi RPC gagal.
+    const escrow = await this.gacha.escrowSolBalance();
     if (!bal) {
       return {
         configured: false,
@@ -81,6 +86,8 @@ export class AdminController {
         idrx: null,
         status: 'unknown' as const,
         simulated,
+        escrowSol: escrow.sol,
+        escrowConfigured: escrow.configured,
       };
     }
     const usdc = bal.usdcBaseUnits / 1_000_000; // 6 desimal
@@ -90,7 +97,16 @@ export class AdminController {
     // yang sebenarnya; ini cuma isyarat "kapan isi ulang".
     const status: 'healthy' | 'low' | 'critical' =
       usdc < 25 || sol < 0.01 ? 'critical' : usdc < 75 ? 'low' : 'healthy';
-    return { configured: true, usdc, sol, idrx, status, simulated };
+    return {
+      configured: true,
+      usdc,
+      sol,
+      idrx,
+      status,
+      simulated,
+      escrowSol: escrow.sol,
+      escrowConfigured: escrow.configured,
+    };
   }
 
   @Post('login')
