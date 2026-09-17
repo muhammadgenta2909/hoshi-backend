@@ -6,6 +6,7 @@ import { CcCardFactsService } from './cc-card-facts.service';
 import { CcGachaClient } from './cc-gacha.client';
 import { CcMarketClient } from './cc-market.client';
 import { CcShippingClient } from './cc-shipping.client';
+import { CcShippingMockController } from './cc-shipping-mock.controller';
 import { CcShippingService } from './cc-shipping.service';
 import { GachaController } from './gacha.controller';
 import { GachaService } from './gacha.service';
@@ -51,8 +52,12 @@ import { TreasuryService } from './treasury.service';
  * (katalog publik mereka) harus tetap tinggal di modul ini. Yang menyeberang
  * hanyalah jawabannya.
  */
+// CcShippingMockController: mock CC Vault Shipping yang dilayani backend ini sendiri, supaya
+// staging (Render — tidak bisa menjangkau localhost) tetap bisa di-dry-run lewat browser. Ia
+// menggerbangi dirinya sendiri di SETIAP endpoint (CC_SHIPPING_MOCK=1 DAN bukan produksi) dan
+// tidak punya provider, tidak menyentuh Prisma, treasury, maupun uang.
 @Module({
-  controllers: [GachaController, CcBuyController],
+  controllers: [GachaController, CcBuyController, CcShippingMockController],
   providers: [
     CcGachaClient,
     CcMarketClient,

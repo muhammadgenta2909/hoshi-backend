@@ -13,7 +13,7 @@
     "start:dev": "nest start --watch",
     "start:debug": "nest start --debug --watch",
     "start:prod": "node dist/main",
-    "mock:cc-shipping": "node mock-cc-shipping/server.mjs",
+    "mock:cc-shipping": "ts-node mock-cc-shipping/standalone.ts",
     "mock:cc-shipping:smoke": "node mock-cc-shipping/smoke.mjs",
     "lint": "eslint \"{src,apps,libs,test}/**/*.ts\" --fix",
     "test": "jest",
@@ -99,6 +99,10 @@
       "**/*.(t|j)s"
     ],
     "coverageDirectory": "../coverage",
-    "testEnvironment": "node"
+    "testEnvironment": "node",
+    "transformIgnorePatterns": [
+      "/node_modules/(?!(rpc-websockets|uuid)/)",
+      "\\.pnp\\.[^\\\\/]+$"
+    ]
   }
 }

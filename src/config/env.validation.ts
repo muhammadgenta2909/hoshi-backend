@@ -8,6 +8,9 @@ import {
   MinLength,
   validateSync,
 } from 'class-validator';
+// Konstanta-saja, TANPA import lain (lihat cc-shipping-mock.mount.ts): validasi env jalan paling
+// awal saat boot dan tidak boleh menarik Nest/@solana/web3.js hanya untuk sebuah string.
+import { CC_SHIPPING_MOCK_MOUNT } from '../collectorcrypt/cc-shipping-mock.mount';
 
 /**
  * Skema validasi environment. Dipanggil ConfigModule saat boot — kalau ada yang
@@ -277,6 +280,18 @@ class EnvironmentVariables {
   @IsString()
   COLLECTORCRYPT_SHIPPING_BASE_URL?: string;
 
+  // CC SHIPPING MOCK (staging/devnet). "1" MENYALAKAN mock CC Vault Shipping di dalam backend ini
+  // sendiri, di /api/cc-shipping-mock — supaya alur kirim kartu fisik bisa ditelusuri lewat browser
+  // TANPA kredensial CC dan tanpa uang asli (Render tidak bisa menjangkau localhost:4010, jadi mock
+  // proses-terpisah tidak menolong di staging). Arahkan COLLECTORCRYPT_SHIPPING_BASE_URL ke
+  // <URL backend publik>/api/cc-shipping-mock untuk memakainya.
+  // HANYA berlaku bila deployment tidak terlihat produksi (detectProductionSignal) — sama seperti
+  // IDRX_MOCK/CC_MOCK. BEDANYA: flag ini juga masuk interlock cutover mainnet di bawah, jadi
+  // SOLANA_CLUSTER=mainnet-beta + flag ini menyala = backend MENOLAK START. Biarkan kosong di produksi.
+  @IsOptional()
+  @IsString()
+  CC_SHIPPING_MOCK?: string;
+
   // Opsional — User-Agent yang dikirim ke CC Shipping (CC menolak sebagian request tanpa UA).
   // Client punya fallback non-kosong bila ini tidak di-set.
   @IsOptional()
@@ -392,6 +407,30 @@ function assertMainnetConsistency(config: Record<string, unknown>): void {
   if (shipBase.includes('dev-api.collectorcrypt.com')) {
     problems.push(
       `COLLECTORCRYPT_SHIPPING_BASE_URL masih dev-api (${str('COLLECTORCRYPT_SHIPPING_BASE_URL')}) di mainnet — pakai https://api.collectorcrypt.com.`,
+    );
+  }
+
+  // MOCK CC SHIPPING DI MAINNET — dua kesalahan yang berbeda, dua-duanya ditolak.
+  //
+  // Kenapa flag ini masuk interlock padahal IDRX_MOCK/CC_MOCK tidak: dua mock itu cuma MENGGANTI
+  // jawaban di dalam proses, jadi kalau kepencet di mainnet double-gate-nya diam-diam
+  // mengabaikannya dan jalur asli tetap jalan. Yang ini dituju lewat sebuah BASE URL. Kalau
+  // flag-nya menyala di mainnet, double-gate membuat /cc-shipping-mock menjawab 404 — dan yang
+  // kelihatan oleh operator bukan "mock mati", melainkan setiap panggilan shipping gagal 404
+  // sesudah treasury mendanai USDC ASLI. Gagal saat BOOT jauh lebih murah daripada gagal di
+  // tengah jalur uang, jadi ketidakcocokan ini dibuat mustahil, bukan sekadar tidak berbahaya.
+  if (str('CC_SHIPPING_MOCK') === '1') {
+    problems.push(
+      'CC_SHIPPING_MOCK=1 (mock CC Vault Shipping) menyala di mainnet — kosongkan variabelnya. ' +
+        'Mock ini hanya untuk staging/devnet dan TIDAK PERNAH boleh melayani jalur uang asli.',
+    );
+  }
+  // Belah yang kedua: flag sudah dimatikan tapi base URL-nya masih menunjuk mock. Tanpa cek ini
+  // backend start dengan senang hati lalu menembak endpoint yang dijamin 404 — kegagalan yang
+  // muncul PERSIS setelah dana keluar.
+  if (shipBase.includes(`/${CC_SHIPPING_MOCK_MOUNT}`)) {
+    problems.push(
+      `COLLECTORCRYPT_SHIPPING_BASE_URL masih menunjuk mock internal (${str('COLLECTORCRYPT_SHIPPING_BASE_URL')}) di mainnet — pakai https://api.collectorcrypt.com.`,
     );
   }
 

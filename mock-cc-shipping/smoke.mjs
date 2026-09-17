@@ -1,12 +1,20 @@
 /**
  * Smoke test for the mock CollectorCrypt Vault Shipping API.
  *
- *   node mock-cc-shipping/server.mjs &      # terminal 1
- *   node mock-cc-shipping/smoke.mjs         # terminal 2
+ * Against the STANDALONE server:
+ *   npm run mock:cc-shipping        # terminal 1  (= ts-node mock-cc-shipping/standalone.ts)
+ *   npm run mock:cc-shipping:smoke  # terminal 2
+ *
+ * Against the mock SERVED BY THE BACKEND (CC_SHIPPING_MOCK=1 on a devnet deploy):
+ *   MOCK_BASE_URL=https://<backend-host>/api/cc-shipping-mock npm run mock:cc-shipping:smoke
+ *
+ * Both hit the SAME contract — src/collectorcrypt/cc-shipping-mock.core.ts — so this file is the
+ * regression net for the mock wherever it is served. There is no second copy to drift from.
  *
  * It walks the whole documented happy path (SIWS sign-in with a REAL ed25519 signature ->
  * address -> estimate -> prepare -> burn -> track) and asserts every documented error case.
- * Zero dependencies, like the server.
+ * Zero dependencies (the transactions are treated as opaque strings here; that they are real,
+ * signable Solana transactions is proved in src/collectorcrypt/cc-shipping-mock.spec.ts).
  */
 import crypto from 'node:crypto';
 

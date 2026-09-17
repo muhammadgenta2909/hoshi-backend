@@ -30,7 +30,16 @@ const V0_SIGNED =
   'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQICAA' +
   'EMAgAAAAEAAAAAAAAAAA==';
 
-/** Blob "transaksi" mock CC: JSON base64 — SENGAJA bukan wire-format Solana. */
+/**
+ * Base64 dari JSON — SENGAJA bukan wire-format Solana, untuk menguji jalur FAIL-OPEN
+ * ("tidak terverifikasi", bukan "tidak cocok").
+ *
+ * CATATAN SEJARAH, supaya namanya tidak menyesatkan: bentuk inilah yang DULU dikembalikan mock CC
+ * sebagai `transactions`, dan itu berarti penjaga batch-basi selalu dilewati saat dry-run. Mock-nya
+ * sekarang menerbitkan transaksi Solana ASLI (cc-shipping-mock.tx.ts) justru supaya penjaga itu
+ * benar-benar teruji — lihat cc-shipping-mock.spec.ts. Di sini ia tinggal sebagai fixture "bukan
+ * transaksi": entri sembarangan dari klien yang rusak harus membuat identitas null, bukan mismatch.
+ */
 const MOCK_BLOB = Buffer.from(
   JSON.stringify({
     m: 'cc-mock-tx',
