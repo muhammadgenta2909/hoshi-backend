@@ -35,6 +35,12 @@ import {
   EscrowTransferIndeterminateError,
 } from '../escrow/escrow.service';
 import { BalanceService } from '../balance/balance.service';
+import {
+  assertP2pSaleAvailable,
+  isEscrowBackedUserListing,
+  p2pModeOf,
+  type P2pMode,
+} from '../marketplace/p2p.gate';
 import { PrismaService } from '../prisma/prisma.service';
 import { CreatePackOrderDto } from './dto/create-pack-order.dto';
 import { IdrxClient } from './idrx.client';
@@ -517,6 +523,25 @@ export class PaymentsService {
         'Tidak bisa membeli kartu yang Anda jual sendiri.',
       );
     }
+    // ╔══════════════════════════════════════════════════════════════════════════════════════╗
+    // ║ A — GERBANG P2P, DI DEPAN. Ini perbaikan inti pass ini.                             ║
+    // ╚══════════════════════════════════════════════════════════════════════════════════════╝
+    // `fulfilUserListing` sudah memeriksa HOSHI_P2P_ENABLED — TAPI ia berjalan SESUDAH pembeli
+    // membayar. Tanpa pemeriksaan DI SINI, urutannya adalah: invoice terbit → Rupiah SUNGGUHAN
+    // mendarat di treasury → settlement menolak → REFUND_DUE → refund MANUAL, dan tidak ada
+    // perkakas refund di repo ini. Jalur ongkir kirim-fisik sudah melakukannya dengan benar
+    // (ccShipping.assertEnabled() di baris pertama createShippingOrder); ini pola yang sama.
+    //
+    // POSISINYA PENTING: SEBELUM cabang idempoten di bawah. Kalau ditaruh sesudahnya, order
+    // PENDING yang lahir ketika fitur masih menyala akan tetap dikembalikan (beserta paymentUrl
+    // IDRX-nya yang masih hidup) sesudah fitur dimatikan — persis kebocoran yang sama.
+    if (isUserListing) {
+      assertP2pSaleAvailable(this.p2pMode(), {
+        id: listing.id,
+        ccNftAddress: listing.ccNftAddress,
+        escrowedAt: listing.escrowedAt,
+      });
+    }
     const isCcCatalog =
       listing.source === 'COLLECTORCRYPT' &&
       listing.sellerId == null &&
@@ -787,6 +812,15 @@ export class PaymentsService {
     if (listing.sellerId === user.id) {
       throw new BadRequestException('Tidak bisa membeli kartu yang Anda jual sendiri.');
     }
+    // A — gerbang yang SAMA, jalur bayar-offer. Ini rail kedua menuju uang pembeli: "lanjut ke
+    // pembayaran" atas offer yang sudah diterima penjual. Ia SELALU menyangkut listing user
+    // (`sellerId == null` sudah ditolak di atas), jadi tidak bersyarat. SEBELUM cabang idempoten,
+    // dengan alasan yang sama seperti di createListingOrder.
+    assertP2pSaleAvailable(this.p2pMode(), {
+      id: listing.id,
+      ccNftAddress: listing.ccNftAddress,
+      escrowedAt: listing.escrowedAt,
+    });
 
     // IDEMPOTEN per OFFER (bukan per listing): spam "Bayar" tidak menumpuk order/mint-request.
     // WAJIB di-scope ke offerId: kalau di-scope (user,listing) saja, order "beli-langsung" (harga
@@ -2190,15 +2224,44 @@ export class PaymentsService {
       );
     }
 
-    const mock = this.ccMockEnabled();
-    const armed =
-      (this.config.get<string>('HOSHI_P2P_ENABLED') ?? '')
-        .trim()
-        .toLowerCase() === 'true';
-    if (!mock && !armed) {
+    const mode = this.p2pMode();
+    const mock = mode === 'MOCK';
+    if (mode === 'OFF') {
       return this.failToRefund(
         order,
         'Jual-beli antar user belum diaktifkan (HOSHI_P2P_ENABLED=false) — pembayaran perlu di-refund manual.',
+      );
+    }
+
+    // B — GERBANG "BISA DISELESAIKAN?", DIJALANKAN SEBELUM SATU BARIS PUN DIKLAIM.
+    //
+    // Predikatnya BUKAN salinan lokal lagi: `isEscrowBackedUserListing` adalah fungsi yang SAMA
+    // yang dipakai gerbang penerbitan tagihan, feed publik, dashboard admin, dan serializer.
+    // Salinan lokal yang lama berbunyi `listing.ccNftAddress && listing.escrowedAt == null` —
+    // yaitu ia MELEWATKAN listing user ber-ccNftAddress NULL sepenuhnya. Baris seperti itu lolos
+    // sampai ke klaim ACTIVE→SOLD di bawah, menang klaim, lalu ditolak TANPA rollback: pembeli
+    // kehilangan Rupiah, penjual tidak dikredit, dan listing tertinggal SOLD atas nama pembeli.
+    //
+    // DUA SYARAT, keduanya wajib, karena settlement di bawah butuh keduanya:
+    //   • ccNftAddress — ADA aset yang bisa diserahkan escrow;
+    //   • escrowedAt   — escrow TERBUKTI memegangnya (FAKTA tersimpan, bukan flag saat ini).
+    //
+    // Menolak DI SINI (bukan sesudah klaim, bukan sesudah 30 detik polling RPC) berarti:
+    // listing tidak pernah menyentuh SOLD, offer tidak pernah diklaim, dan pesan REFUND_DUE-nya
+    // menyebut SEBAB yang sebenarnya, bukan gejalanya.
+    if (mode === 'ARMED' && !isEscrowBackedUserListing(listing)) {
+      return this.failToRefund(
+        order,
+        listing.ccNftAddress == null
+          ? `Listing ${listing.id} TIDAK PUNYA aset on-chain (ccNftAddress null) — ia dibuat lewat ` +
+              `POST /marketplace tanpa fromPackMemo, jadi tidak ada kartu yang bisa diserahkan escrow ` +
+              `dan TIDAK PERNAH ada jalur settlement untuknya. NOL kartu bergerak, listing TIDAK ` +
+              `diklaim SOLD; Rupiah pembeli aman di-refund. Penjual ${sellerId} harus membatalkan ` +
+              'listing ini (tidak bisa dipulihkan dengan relist — tak ada kartu untuk dititipkan).'
+          : `Listing ${listing.id} TIDAK PERNAH dititipkan ke escrow (escrowedAt null) — ia dibuat ` +
+              `sebelum HOSHI_P2P_ENABLED dinyalakan, jadi escrow tak memegang kartu ${listing.ccNftAddress} ` +
+              `untuk diserahkan. NOL kartu bergerak; Rupiah pembeli aman di-refund. Penjual ${sellerId} ` +
+              'harus memajang ulang (relist) supaya kartunya dititipkan lebih dulu.',
       );
     }
 
@@ -2283,6 +2346,21 @@ export class PaymentsService {
       return 'FULFILLED';
     }
 
+    // ALAMAT ASET DIBACA SEBELUM KLAIM, BUKAN SESUDAH. Gerbang di atas sudah menjaminnya untuk
+    // mode ARMED; ini pagar kedua yang sengaja tetap ada, dan LETAKNYA yang penting: versi lama
+    // memeriksa hal yang sama SESUDAH klaim ACTIVE→SOLD menang, lalu `return failToRefund` TANPA
+    // mengembalikan listing ke ACTIVE — satu-satunya early-return di fungsi ini yang menyisakan
+    // listing SOLD atas nama pembeli padahal NOL kartu berpindah. Menolak sebelum klaim membuat
+    // pertanyaan "perlu rollback atau tidak" tidak pernah muncul.
+    const assetAddress = listing.ccNftAddress;
+    if (!assetAddress) {
+      return this.failToRefund(
+        order,
+        `Listing ${listing.id} tak punya alamat NFT (escrow) — refund manual (belum diklaim, ` +
+          'listing tetap ACTIVE).',
+      );
+    }
+
     // REAL (armed): klaim ACTIVE→SOLD DULU (gerbang konkurensi) SEBELUM transfer on-chain — dua
     // order satu kartu → satu menang; kalah klaim → refund tanpa transfer.
     const claimed = await this.prisma.listing.updateMany({
@@ -2295,17 +2373,13 @@ export class PaymentsService {
         `Listing ${listing.id} sudah terjual lebih dulu — refund manual (belum settle).`,
       );
     }
-    // REAL (armed): escrow benar-benar kirim kartu ke pembeli.
-    if (!listing.ccNftAddress) {
-      return this.failToRefund(
-        order,
-        `Listing ${listing.id} tak punya alamat NFT (escrow) — refund manual.`,
-      );
-    }
+    // SESUDAH BARIS INI listing SUDAH diklaim SOLD atas nama pembeli. Setiap keluar dari sini
+    // WAJIB memilih SECARA SADAR antara rollback (pra-kirim: kartu belum bergerak) dan TIDAK
+    // rollback (pasca-kirim: kartu mungkin sudah pindah) — tidak ada pilihan ketiga.
     let transferSig: string;
     try {
       transferSig = await this.escrow.transferCoreAssetTo({
-        assetAddress: listing.ccNftAddress,
+        assetAddress,
         newOwner: user.walletAddress,
       });
     } catch (err) {
@@ -2371,6 +2445,17 @@ export class PaymentsService {
       this.config.get<string>('CC_MOCK') === '1' &&
       detectProductionSignal() === null
     );
+  }
+
+  /**
+   * Mode settlement P2P yang BERLAKU SEKARANG — MOCK / ARMED / OFF. Sumbernya SATU fungsi yang
+   * juga dipakai MarketplaceService (src/marketplace/p2p.gate.ts), supaya keputusan "listing ini
+   * butuh escrow atau tidak" saat DIBUAT tidak bisa menyimpang dari keputusan "settlement mana
+   * yang dijalankan" saat DIBAYAR. Nilainya identik dengan pasangan `ccMockEnabled()` +
+   * pembacaan HOSHI_P2P_ENABLED yang dipakai `fulfilUserListing` sebelum pass ini.
+   */
+  private p2pMode(): P2pMode {
+    return p2pModeOf(this.config);
   }
 
   /* ─────────────────────────── Reconciler ─────────────────────────── */

@@ -186,6 +186,9 @@ const adminService = (world: World) =>
     {} as any,
     {} as any,
     {} as any,
+    // D — EscrowService. File ini hanya menelusuri transisi status redemption; escrow tidak
+    // pernah dipanggil dari jalur itu.
+    {} as any,
   );
 
 /** CcShippingService cukup butuh config gate + klien CC; treasury tak tersentuh di refreshStatus. */

@@ -36,6 +36,7 @@ import { AdminUpdateListingDto } from './dto/admin-update-listing.dto';
 import { SetListingStatusDto } from './dto/set-listing-status.dto';
 import { UpdateRedemptionStatusDto } from './dto/update-redemption-status.dto';
 import { CancelAwaitingPaymentDto } from './dto/cancel-awaiting-payment.dto';
+import { RecoverEscrowDto } from './dto/recover-escrow.dto';
 import { RecoverBurnSubmittedDto } from './dto/recover-burn-submitted.dto';
 import { SettleRefundDueDto } from './dto/settle-refund-due.dto';
 import { CurrentUser } from '../auth/current-user.decorator';
@@ -48,6 +49,7 @@ import {
 import { ImportListingsDto } from './dto/import-listings.dto';
 import { UpdateVaultItemDto } from './dto/update-vault-item.dto';
 import {
+  QueryAdminEscrowDto,
   QueryAdminActivityDto,
   QueryAdminCardsDto,
   QueryAdminListingsDto,
@@ -327,6 +329,54 @@ export class AdminController {
     @CurrentUser() user: AuthUser,
   ) {
     return this.admin.cancelAwaitingPayment(id, dto.note, user);
+  }
+
+  /* ───────────────── D (checklist 4.6) — ESCROW: LIHAT & PULIHKAN ───────────────── */
+
+  @Get('escrow')
+  @ApiBearerAuth()
+  @UseGuards(AdminGuard)
+  @ApiOperation({
+    summary:
+      'Kartu yang SEDANG dipegang wallet escrow + kartu yang tertinggal di dalamnya + listing ' +
+      'yang akan jadi tak-bisa-dibeli saat HOSHI_P2P_ENABLED dinyalakan. READ-ONLY.',
+    description:
+      'Sebelum ini tidak ada permukaan apa pun yang menunjukkan isi escrow: kegagalan ' +
+      'mengembalikan kartu ke penjual hanya menulis "cek on-chain dan kembalikan manual" ke ' +
+      'log, dan log dirotasi. "verify=true" MEMVERIFIKASI kepemilikan on-chain untuk baris yang ' +
+      'mengaku ber-escrow (N panggilan RPC — jangan dipakai untuk polling dashboard). Tanpa ' +
+      'verify, kolom escrowOwnsOnChain bernilai null yang berarti TIDAK DIPERIKSA, bukan ' +
+      '"tidak dipegang".',
+  })
+  escrow(@Query() query: QueryAdminEscrowDto) {
+    return this.admin.escrowOverview({
+      verify: query.verify === 'true',
+      limit: query.limit,
+    });
+  }
+
+  @Post('escrow/:listingId/return')
+  @ApiBearerAuth()
+  @UseGuards(AdminGuard)
+  @ApiOperation({
+    summary:
+      'PEMULIHAN MANUAL: kembalikan kartu dari wallet escrow ke PENJUALNYA (admin). Hanya ' +
+      'listing CANCELLED atau PENDING_ESCROW, hanya bila escrow TERBUKTI memegangnya on-chain.',
+    description:
+      'TIDAK ADA parameter tujuan: wallet penerima SELALU diturunkan dari baris penjual listing ' +
+      '— kalau alamat boleh datang dari body, ini bukan pemulihan melainkan pintu belakang ' +
+      'pengiriman aset. Listing ACTIVE ditolak (batalkan dulu; cancel menutup jendela beli ' +
+      'secara atomik sebelum menyentuh escrow). Listing SOLD ditolak KERAS: kartunya sudah/ ' +
+      'mungkin sah milik pembeli. Wajib menyertakan alasan, disimpan permanen di ' +
+      'escrow_recoveries bersama identitas admin dan hasilnya (termasuk hasil yang TIDAK ' +
+      'DIKETAHUI, yang TIDAK membersihkan penanda escrow).',
+  })
+  returnEscrowToSeller(
+    @Param('listingId') listingId: string,
+    @Body() dto: RecoverEscrowDto,
+    @CurrentUser() user: AuthUser,
+  ) {
+    return this.admin.recoverEscrowToSeller(listingId, dto.reason, user);
   }
 
   @Get('listings')

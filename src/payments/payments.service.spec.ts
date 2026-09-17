@@ -61,7 +61,7 @@ describe('PaymentsService', () => {
     user: { findUnique: jest.Mock };
     ccPackPurchase: { aggregate: jest.Mock };
     listing: { findUnique: jest.Mock; updateMany: jest.Mock };
-    offer: { updateMany: jest.Mock };
+    offer: { updateMany: jest.Mock; findUnique: jest.Mock };
     activity: { create: jest.Mock };
     $transaction: jest.Mock;
   };
@@ -302,7 +302,11 @@ describe('PaymentsService', () => {
       },
       // Gerbang offer di settlement P2P: klaim ACCEPTED→PAID. Default MENANG (count 1); test
       // "offer basi" menimpanya dengan count 0.
-      offer: { updateMany: jest.fn().mockResolvedValue({ count: 1 }) },
+      offer: {
+        updateMany: jest.fn().mockResolvedValue({ count: 1 }),
+        // createOfferOrder (rail "lanjut bayar" atas offer yang sudah diterima penjual).
+        findUnique: jest.fn(),
+      },
       // Feed aktivitas (SALE_CARD) — ditulis mis. saat settle inventaris Hoshi.
       activity: { create: jest.fn().mockResolvedValue({}) },
       $transaction: jest.fn((cb: (tx: typeof prisma) => unknown) => cb(prisma)),
@@ -567,9 +571,15 @@ describe('PaymentsService', () => {
     });
 
     it('MENERIMA user listing (sellerId terisi, penjual lain) → order MARKETPLACE, priceUsdc 0', async () => {
+      // A — syarat baru: rail P2P harus BISA menyelesaikannya. Di sini dipenuhi dengan cara yang
+      // paling jujur: armed DAN kartunya benar-benar ada di escrow (escrowedAt terisi). Dulu test
+      // ini lulus dengan rail MATI — dan itu persis bug-nya: invoice terbit untuk penjualan yang
+      // `fulfilUserListing` pasti tolak, sesudah Rupiah pembeli mendarat.
+      configValues.HOSHI_P2P_ENABLED = 'true';
       prisma.listing.findUnique.mockResolvedValue({
         ...catalogListing,
         sellerId: 'user-2', // penjual lain, bukan pembeli user-1
+        escrowedAt: new Date('2026-07-01T00:00:00.000Z'),
       });
 
       await service.createListingOrder(catalogListing.id, user);
@@ -584,6 +594,133 @@ describe('PaymentsService', () => {
           }) as unknown,
         }),
       );
+    });
+
+    /**
+     * ╔════════════════════════════════════════════════════════════════════════════════════════╗
+     * ║ A — UANG DITOLAK SEBELUM DATANG, BUKAN SESUDAH.                                       ║
+     * ╚════════════════════════════════════════════════════════════════════════════════════════╝
+     * Bukti yang paling menentukan di grup ini adalah `idrx.mintRequest` TIDAK dipanggil:
+     * mint-request adalah momen sebuah tagihan Rupiah LAHIR. Selama ia tidak pernah terbit,
+     * tidak ada halaman bayar, tidak ada uang yang mendarat, dan tidak ada utang refund.
+     */
+    describe('gerbang P2P (A) — tagihan untuk listing USER ditolak DI DEPAN', () => {
+      const userListingRow = {
+        ...catalogListing,
+        id: 'listing-user-gate',
+        sellerId: 'user-2',
+        ccNftAddress: 'UserNftAddrBase58',
+        ccPriceUsd: null as number | null,
+      };
+
+      it('P2P MATI → 503 P2P_DISABLED, NOL mint-request, NOL order', async () => {
+        // config default: CC_MOCK unset + HOSHI_P2P_ENABLED unset → mode OFF.
+        prisma.listing.findUnique.mockResolvedValue({
+          ...userListingRow,
+          escrowedAt: null,
+        });
+
+        await expect(
+          service.createListingOrder(userListingRow.id, user),
+        ).rejects.toMatchObject({
+          response: {
+            code: 'P2P_DISABLED',
+            stage: 'NO_EFFECT',
+            statusCode: 503,
+          },
+        });
+
+        expect(idrx.mintRequest).not.toHaveBeenCalled();
+        expect(prisma.paymentOrder.create).not.toHaveBeenCalled();
+      });
+
+      it('P2P MATI → order PENDING lama TIDAK dipakai ulang (gerbang berdiri SEBELUM idempotensi)', async () => {
+        // Kalau gerbang ditaruh SESUDAH cabang idempoten, order yang lahir saat fitur masih
+        // menyala akan tetap dikembalikan — beserta paymentUrl IDRX-nya yang masih hidup.
+        prisma.listing.findUnique.mockResolvedValue({
+          ...userListingRow,
+          escrowedAt: null,
+        });
+        prisma.paymentOrder.findFirst.mockResolvedValue({
+          ...baseOrder,
+          listingId: userListingRow.id,
+          status: PaymentStatus.PENDING,
+        });
+
+        await expect(
+          service.createListingOrder(userListingRow.id, user),
+        ).rejects.toMatchObject({ response: { code: 'P2P_DISABLED' } });
+        expect(idrx.mintRequest).not.toHaveBeenCalled();
+      });
+
+      it('B — ARMED tapi listing TIDAK ber-escrow → 409 P2P_LISTING_NOT_ESCROWED, NOL mint-request', async () => {
+        configValues.HOSHI_P2P_ENABLED = 'true';
+        prisma.listing.findUnique.mockResolvedValue({
+          ...userListingRow,
+          escrowedAt: null, // dibuat sebelum arming → escrow tak pernah memegang kartunya
+        });
+
+        await expect(
+          service.createListingOrder(userListingRow.id, user),
+        ).rejects.toMatchObject({
+          response: {
+            code: 'P2P_LISTING_NOT_ESCROWED',
+            stage: 'NO_EFFECT',
+            statusCode: 409,
+          },
+        });
+
+        expect(idrx.mintRequest).not.toHaveBeenCalled();
+        expect(prisma.paymentOrder.create).not.toHaveBeenCalled();
+      });
+
+      it('KATALOG CC (sellerId null) TIDAK ikut tergerbang — jalur reseller punya gerbangnya sendiri', async () => {
+        // Regresi penting: gerbang P2P tidak boleh menutup rail reseller yang memang hidup.
+        prisma.listing.findUnique.mockResolvedValue(catalogListing);
+
+        await service.createListingOrder(catalogListing.id, user);
+
+        expect(idrx.mintRequest).toHaveBeenCalledTimes(1);
+      });
+
+      it('jalur bayar-OFFER juga digerbang: P2P MATI → NOL mint-request', async () => {
+        prisma.offer.findUnique.mockResolvedValue({
+          id: 'offer-1',
+          buyerId: user.id,
+          status: 'ACCEPTED',
+          amount: 500_000,
+          listing: {
+            ...userListingRow,
+            escrowedAt: null,
+          },
+        });
+
+        await expect(
+          service.createOfferOrder('offer-1', user),
+        ).rejects.toMatchObject({ response: { code: 'P2P_DISABLED' } });
+
+        expect(idrx.mintRequest).not.toHaveBeenCalled();
+        expect(prisma.paymentOrder.create).not.toHaveBeenCalled();
+      });
+
+      it('jalur bayar-OFFER: ARMED tapi tanpa escrow → 409 P2P_LISTING_NOT_ESCROWED, NOL mint-request', async () => {
+        configValues.HOSHI_P2P_ENABLED = 'true';
+        prisma.offer.findUnique.mockResolvedValue({
+          id: 'offer-1',
+          buyerId: user.id,
+          status: 'ACCEPTED',
+          amount: 500_000,
+          listing: { ...userListingRow, escrowedAt: null },
+        });
+
+        await expect(
+          service.createOfferOrder('offer-1', user),
+        ).rejects.toMatchObject({
+          response: { code: 'P2P_LISTING_NOT_ESCROWED' },
+        });
+
+        expect(idrx.mintRequest).not.toHaveBeenCalled();
+      });
     });
 
     it('IDEMPOTEN: spam beli → order PENDING yang sama dikembalikan, tak bikin order/mint baru', async () => {
@@ -899,6 +1036,11 @@ describe('PaymentsService', () => {
       ccPriceUsd: null as number | null,
       priceIdrx: 1_000_000, // Rp 1.000.000
       status: 'ACTIVE',
+      // B — FAKTA "kartu ADA di escrow". Di jalur ARMED real, ini SATU-SATUNYA keadaan di mana
+      // settlement boleh berjalan: escrow harus benar-benar memegang kartunya untuk bisa
+      // menyerahkannya. Listing tanpa kolom ini (dibuat sebelum arming) diuji terpisah di
+      // "ARMED real: listing TANPA escrow ... → REFUND_DUE" di bawah.
+      escrowedAt: new Date('2026-07-01T00:00:00.000Z'),
     };
     const userOrder: PaymentOrder = {
       ...baseOrder,
@@ -1014,6 +1156,81 @@ describe('PaymentsService', () => {
           data: expect.objectContaining({ status: 'ACTIVE' }) as unknown,
         }),
       );
+    });
+
+    it('ARMED real: listing TANPA escrow (dibuat sebelum arming) → REFUND_DUE, escrow TAK disentuh, listing TIDAK jadi SOLD', async () => {
+      // B — perangkap refund yang ditutup pass ini. Sebelum arming, SETIAP listing user ACTIVE
+      // punya escrowedAt = null (listingNeedsEscrow hanya meminta escrow saat armed). Di hari
+      // flag dinyalakan, baris seperti ini masih terlihat & masih bisa dibayar — dan settlement
+      // akan mencoba mentransfer dari escrow yang tidak pernah memegang kartunya.
+      configValues.HOSHI_P2P_ENABLED = 'true';
+      prisma.paymentOrder.findUnique.mockResolvedValue(userOrder);
+      prisma.listing.findUnique.mockResolvedValue({
+        ...userListing,
+        escrowedAt: null,
+      });
+
+      const outcome = await service.handleCallback({
+        merchantOrderId: MERCHANT_ORDER_ID,
+      });
+
+      expect(outcome).toBe('REFUND_DUE');
+      // NOL kartu bergerak: escrow tidak dipanggil sama sekali...
+      expect(escrow.transferCoreAssetTo).not.toHaveBeenCalled();
+      // ...penjual tidak dikredit...
+      expect(balance.credit).not.toHaveBeenCalled();
+      // ...dan listing TIDAK pernah diklaim SOLD (tak ada flip ACTIVE→SOLD→ACTIVE).
+      expect(prisma.listing.updateMany).not.toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ status: 'SOLD' }) as unknown,
+        }),
+      );
+    });
+
+    /**
+     * F1 — POPULASI YANG DULU MENGAMBIL UANG LEBIH DULU, BARU MENOLAK.
+     *
+     * Fixture `userListing` di file ini SELALU punya `ccNftAddress`, dan itulah sebabnya
+     * lubangnya tidak pernah tertangkap. Listing user TANPA aset on-chain dibuat oleh
+     * `POST /marketplace` tanpa fromPackMemo — nol prasyarat selain login. Gerbang lama
+     * (`ccNftAddress && escrowedAt == null`) MELEWATKANNYA, klaim ACTIVE→SOLD menang,
+     * lalu `failToRefund` mengembalikan tanpa rollback: pembeli kehilangan Rupiah,
+     * listing tertinggal SOLD atas namanya, penjual tak dibayar.
+     */
+    const userListingNoAsset = { ...userListing, ccNftAddress: null };
+
+    it('ARMED real: listing user TANPA aset on-chain → REFUND_DUE dan listing TIDAK PERNAH diklaim SOLD', async () => {
+      configValues.HOSHI_P2P_ENABLED = 'true';
+      prisma.paymentOrder.findUnique.mockResolvedValue(userOrder);
+      prisma.listing.findUnique.mockResolvedValue(userListingNoAsset);
+
+      const outcome = await service.handleCallback({
+        merchantOrderId: MERCHANT_ORDER_ID,
+      });
+
+      expect(outcome).toBe('REFUND_DUE');
+      expect(escrow.transferCoreAssetTo).not.toHaveBeenCalled();
+      expect(balance.credit).not.toHaveBeenCalled();
+      // INTI BUG-NYA: tidak boleh ada satu pun tulisan yang menandai listing SOLD —
+      // bukan "ditandai lalu dikembalikan", tapi TIDAK PERNAH ditandai.
+      expect(prisma.listing.updateMany).not.toHaveBeenCalled();
+    });
+
+    it('ARMED real: listing user TANPA aset on-chain → pesan REFUND_DUE menyebut sebab & pemulihan yang BENAR', async () => {
+      configValues.HOSHI_P2P_ENABLED = 'true';
+      prisma.paymentOrder.findUnique.mockResolvedValue(userOrder);
+      prisma.listing.findUnique.mockResolvedValue(userListingNoAsset);
+
+      await service.handleCallback({ merchantOrderId: MERCHANT_ORDER_ID });
+
+      const refundWrite = prisma.paymentOrder.updateMany.mock.calls
+        .map((c: unknown[]) => c[0] as { data?: { error?: string } })
+        .find((a) => typeof a?.data?.error === 'string');
+      const message = String(refundWrite?.data?.error ?? '');
+      expect(message).toContain('TIDAK PUNYA aset on-chain');
+      // JANGAN menyuruh relist: tidak ada kartu untuk dititipkan, jadi relist akan
+      // mengulang kegagalan yang sama. Operator harus membaca tindakan yang benar.
+      expect(message).toContain('membatalkan');
     });
 
     it('ARMED real: kalah klaim konkurensi → REFUND_DUE, escrow & kredit tak dipanggil', async () => {

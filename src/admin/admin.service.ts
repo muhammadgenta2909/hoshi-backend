@@ -15,6 +15,7 @@ import { JwtService } from '@nestjs/jwt';
 import { hash, verify } from '@node-rs/argon2';
 import {
   ActivityType,
+  EscrowRecoveryOutcome,
   ListingSource,
   ListingStatus,
   OfferStatus,
@@ -26,6 +27,14 @@ import {
   WithdrawalStatus,
 } from '@prisma/client';
 import { MarketplaceService } from '../marketplace/marketplace.service';
+import {
+  EscrowService,
+  EscrowTransferIndeterminateError,
+} from '../escrow/escrow.service';
+import {
+  p2pModeOf,
+  unescrowedUserListingWhere,
+} from '../marketplace/p2p.gate';
 import { PrismaService } from '../prisma/prisma.service';
 import { recordShippingRefundDebts } from '../payments/shipping-refund-debt';
 import { appendBoundedNote, NOTE_MAX } from '../common/append-note';
@@ -67,6 +76,9 @@ export class AdminService {
     private readonly jwt: JwtService,
     private readonly config: ConfigService,
     private readonly marketplace: MarketplaceService,
+    // D (checklist 4.6) — dashboard escrow + pemulihan manual. EscrowService satu-satunya yang
+    // boleh menyuruh wallet escrow menandatangani; admin hanya memicunya lewat pintu ini.
+    private readonly escrow: EscrowService,
   ) {}
 
   async login(email: string, password: string) {
@@ -1876,4 +1888,351 @@ export class AdminService {
       },
     };
   }
+
+  /* ═══════════════════════ D (4.6) — ESCROW: LIHAT & PULIHKAN ═══════════════════════ */
+
+  /* (Predikat `held` / `stranded` ada di akhir file — lihat komentarnya: keduanya bersama-sama
+     WAJIB mencakup SETIAP baris yang membawa fakta `escrowedAt`.) */
+
+  /**
+   * APA YANG SEDANG DIPEGANG ESCROW, dan apa yang akan bermasalah saat P2P dinyalakan.
+   *
+   * KENAPA ADA: sampai sekarang TIDAK ADA satu pun permukaan yang menunjukkan kartu mana yang
+   * ada di wallet escrow. Satu-satunya jejaknya adalah baris log `cancel: gagal mengembalikan
+   * kartu ... CEK ON-CHAIN & kembalikan kartu manual` — dan log droplet dirotasi, jadi kartu
+   * penjual bisa tertinggal di escrow tanpa seorang pun tahu.
+   *
+   * READ-ONLY. TIDAK menyentuh on-chain kecuali diminta eksplisit (`verify`), karena
+   * memverifikasi N aset berarti N panggilan RPC dan dashboard tidak boleh jadi sumber badai RPC.
+   *
+   * TIGA daftar, masing-masing menjawab pertanyaan operasional yang berbeda:
+   *   • held      — listing yang FAKTANYA ber-escrow dan masih hidup (ACTIVE): ini normal.
+   *   • stranded  — escrowedAt MASIH ter-set padahal listing sudah TIDAK ACTIVE lagi. Untuk
+   *                 CANCELLED itu berarti pengembalian ke penjual GAGAL → kandidat pemulihan.
+   *                 Predikatnya adalah KOMPLEMEN `held`, bukan daftar status yang disebut satu-
+   *                 satu: bersama-sama keduanya wajib mencakup SETIAP baris ber-escrowedAt, jadi
+   *                 tidak ada kartu yang dipegang escrow yang bisa jatuh di antara dua daftar
+   *                 (lihat escrowHeldWhere/escrowStrandedWhere di akhir file + test-nya).
+   *   • unescrowedActive (B) — RADIUS LEDAKAN hari arming: listing USER ACTIVE yang TIDAK
+   *                 escrow-backed. Predikatnya butuh DUA fakta (ccNftAddress ADA dan
+   *                 escrowedAt ADA) dan hidup di src/marketplace/p2p.gate.ts. Ia mencakup
+   *                 DUA sub-populasi dengan pemulihan yang BERBEDA:
+   *                   – ccNftAddress ADA, escrowedAt NULL → penjual memajang ulang (relist),
+   *                     SATU aksi, dan kartunya masuk escrow;
+   *                   – ccNftAddress NULL → tidak ada kartu on-chain untuk dititipkan sama
+   *                     sekali; relist tidak akan menolong, listing harus DIBATALKAN.
+   *                 Sub-populasi kedua DULU TIDAK TERHITUNG di sini (WHERE-nya menuntut
+   *                 ccNftAddress IS NOT NULL) padahal ia yang paling mudah dibuat — jadi
+   *                 angka ini akan lebih besar dari yang pernah dilihat operator. Itu
+   *                 koreksi, bukan lonjakan.
+   */
+  async escrowOverview(opts: { verify?: boolean; limit?: number } = {}) {
+    const take = Math.min(Math.max(opts.limit ?? 50, 1), 200);
+    const mode = p2pModeOf(this.config);
+
+    const listingSelect = {
+      id: true,
+      name: true,
+      status: true,
+      priceIdrx: true,
+      ccNftAddress: true,
+      escrowedAt: true,
+      listedAt: true,
+      sellerId: true,
+      sellerAddress: true,
+      seller: { select: { id: true, displayName: true, walletAddress: true } },
+    } as const;
+
+    const [heldRows, strandedRows, unescrowedRows, unescrowedCount, recoveries] =
+      await Promise.all([
+        this.prisma.listing.findMany({
+          where: escrowHeldWhere(),
+          select: listingSelect,
+          orderBy: { escrowedAt: 'desc' },
+          take,
+        }),
+        this.prisma.listing.findMany({
+          where: escrowStrandedWhere(),
+          select: listingSelect,
+          orderBy: { escrowedAt: 'desc' },
+          take,
+        }),
+        this.prisma.listing.findMany({
+          where: {
+            status: ListingStatus.ACTIVE,
+            ...unescrowedUserListingWhere(),
+          },
+          select: listingSelect,
+          orderBy: { listedAt: 'desc' },
+          take,
+        }),
+        this.prisma.listing.count({
+          where: {
+            status: ListingStatus.ACTIVE,
+            ...unescrowedUserListingWhere(),
+          },
+        }),
+        this.prisma.escrowRecovery.findMany({
+          orderBy: { createdAt: 'desc' },
+          take: 20,
+        }),
+      ]);
+
+    const shape = (r: (typeof heldRows)[number]) => ({
+      listingId: r.id,
+      name: r.name,
+      status: r.status,
+      priceIdrx: r.priceIdrx,
+      assetAddress: r.ccNftAddress,
+      escrowedAt: r.escrowedAt?.toISOString() ?? null,
+      listedAt: r.listedAt.toISOString(),
+      sellerId: r.sellerId,
+      sellerLabel:
+        r.seller?.displayName?.trim() ||
+        (r.seller ? shortWalletLabel(r.seller.walletAddress) : r.sellerAddress),
+      sellerWallet: r.seller?.walletAddress ?? null,
+      // Diisi HANYA kalau verify=true. null = TIDAK DIPERIKSA, bukan "tidak dipegang" — bedanya
+      // penting: operator tidak boleh menyimpulkan apa pun dari kolom yang tak pernah dibaca.
+      escrowOwnsOnChain: null as boolean | null,
+    });
+
+    const held = heldRows.map(shape);
+    const stranded = strandedRows.map(shape);
+
+    if (opts.verify === true && this.escrow.isConfigured()) {
+      // Hanya daftar yang MENGAKU ber-escrow yang diverifikasi — di situlah klaim DB bisa salah.
+      for (const row of [...held, ...stranded]) {
+        if (!row.assetAddress) continue;
+        row.escrowOwnsOnChain = await this.escrow.ownsAsset(row.assetAddress);
+      }
+    }
+
+    return {
+      escrowConfigured: this.escrow.isConfigured(),
+      escrowAddress: this.escrow.isConfigured() ? this.escrow.publicKey : null,
+      /** MOCK / ARMED / OFF — menjelaskan apakah `unescrowedActive` berbahaya atau tidak. */
+      p2pMode: mode,
+      heldCount: held.length,
+      held,
+      strandedCount: stranded.length,
+      stranded,
+      /**
+       * B — jumlah PENUH (bukan hanya yang ditampilkan). Inilah angka yang harus dilihat product
+       * owner SEBELUM menyalakan HOSHI_P2P_ENABLED: sebanyak ini listing akan langsung hilang
+       * dari feed publik. Pemiliknya perlu diberi tahu — memajang ulang (relist) untuk baris
+       * yang punya `assetAddress`, MEMBATALKAN untuk baris yang `assetAddress`-nya null.
+       * Runbook lengkapnya (termasuk query pra-cek invoice IDRX yang masih hidup) ada di
+       * prisma/migrations/20260919000000_escrow_sponsor_serialization_and_buyability.
+       */
+      unescrowedActiveCount: unescrowedCount,
+      unescrowedActive: unescrowedRows.map(shape),
+      recentRecoveries: recoveries,
+    };
+  }
+
+  /**
+   * PEMULIHAN MANUAL: kembalikan SATU kartu dari wallet escrow ke PENJUALNYA.
+   *
+   * Bentuknya sengaja sama persis dengan tiga rute pemulihan redemption yang sudah ada: satu
+   * transisi saja, TANPA parameter bebas, wajib beralasan, log keras SEBELUM aksinya, dan
+   * tulisan DB berpagar predikat.
+   *
+   * APA YANG DIJAGA, DAN KENAPA:
+   *   • TUJUAN TIDAK BISA DIPILIH. Wallet penerima diturunkan dari baris penjual. Kalau alamat
+   *     boleh datang dari body, ini bukan pemulihan melainkan "kirim aset siapa pun ke mana pun".
+   *   • STATUS DIBATASI ke CANCELLED dan PENDING_ESCROW. ACTIVE ditolak karena listing-nya masih
+   *     bisa dibeli detik ini — jalannya adalah membatalkannya dulu (cancel sudah punya klaim
+   *     atomik yang menutup jendela beli SEBELUM menyentuh escrow). SOLD ditolak KERAS: di sana
+   *     kartunya sudah/mungkin sah milik pembeli, dan "mengembalikannya" = mengambil barang orang.
+   *   • KEPEMILIKAN ON-CHAIN DIPERIKSA DULU. Kita tidak pernah mencoba memindahkan yang tidak
+   *     kita pegang, dan tidak pernah melaporkan sukses yang tidak terjadi.
+   *   • HASIL YANG TIDAK DIKETAHUI DICATAT APA ADANYA. Transfer yang sudah disiarkan tapi
+   *     konfirmasinya hilang TIDAK dianggap gagal: escrowedAt SENGAJA tidak dibersihkan (kalau
+   *     ternyata kartunya sudah pindah, membersihkannya menghapus satu-satunya petunjuk), dan
+   *     barisnya ditulis INDETERMINATE.
+   */
+  async recoverEscrowToSeller(
+    listingId: string,
+    reason: string,
+    admin: { id: string; walletAddress: string },
+  ) {
+    const trimmed = (reason ?? '').trim();
+    if (trimmed.length < 10) {
+      throw new BadRequestException(
+        'Alasan pemulihan wajib diisi (minimal 10 karakter) dan akan disimpan permanen.',
+      );
+    }
+
+    const listing = await this.prisma.listing.findUnique({
+      where: { id: listingId },
+      include: { seller: { select: { id: true, walletAddress: true } } },
+    });
+    if (!listing) throw new NotFoundException('Listing tidak ditemukan.');
+    if (!listing.ccNftAddress) {
+      throw new BadRequestException(
+        'Listing ini tidak punya aset on-chain — tidak ada yang bisa dikembalikan dari escrow.',
+      );
+    }
+    if (
+      listing.status !== ListingStatus.CANCELLED &&
+      listing.status !== ListingStatus.PENDING_ESCROW
+    ) {
+      throw new BadRequestException(
+        'Pemulihan escrow HANYA untuk listing CANCELLED atau PENDING_ESCROW — status sekarang ' +
+          `${listing.status}. Listing ACTIVE: batalkan dulu (cancel menutup jendela beli secara ` +
+          'atomik sebelum menyentuh escrow). Listing SOLD: kartunya sudah/mungkin sah milik ' +
+          'pembeli — selesaikan lewat cek on-chain, JANGAN tarik kembali dari sini.',
+      );
+    }
+    const toWallet = listing.seller?.walletAddress;
+    if (!toWallet) {
+      throw new BadRequestException(
+        'Listing ini tidak punya akun penjual dengan wallet — tidak ada tujuan pengembalian yang sah.',
+      );
+    }
+    if (!this.escrow.isConfigured()) {
+      throw new BadRequestException(
+        'Wallet escrow belum dikonfigurasi di deployment ini (HOSHI_ESCROW_SECRET_KEY).',
+      );
+    }
+
+    // JANGAN PERNAH memindahkan yang tidak kita pegang. Ini juga yang membuat aksi ini idempoten
+    // dalam praktik: dijalankan dua kali, yang kedua ditolak karena escrow sudah tidak memegangnya.
+    const owned = await this.escrow.ownsAsset(listing.ccNftAddress);
+    if (!owned) {
+      throw new ConflictException(
+        `Wallet escrow TIDAK memegang kartu ${listing.ccNftAddress} on-chain — tidak ada yang ` +
+          'dikembalikan. Kartunya mungkin sudah kembali ke penjual atau sudah diserahkan ke ' +
+          'pembeli; periksa explorer sebelum melakukan apa pun.',
+      );
+    }
+
+    const stamp = new Date().toISOString();
+    // Log KERAS DULU — supaya jejaknya ada bahkan kalau tulisan DB setelah ini gagal.
+    this.logger.error(
+      `PEMULIHAN ESCROW MANUAL ${stamp}: kartu ${listing.ccNftAddress} (listing ${listing.id} ` +
+        `"${listing.name}", status ${listing.status}) dikembalikan ke penjual ` +
+        `${listing.sellerId ?? 'tidak diketahui'} (${toWallet}) oleh admin ${admin.id} ` +
+        `(${admin.walletAddress}). Alasan operator: ${trimmed}`,
+    );
+
+    let signature: string;
+    try {
+      signature = await this.escrow.transferCoreAssetTo({
+        assetAddress: listing.ccNftAddress,
+        newOwner: toWallet,
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (err instanceof EscrowTransferIndeterminateError) {
+        // Kartu MUNGKIN sudah pindah. Catat apa adanya; JANGAN bersihkan escrowedAt (itu satu-
+        // satunya penanda bahwa kartu ini pernah ada di escrow) dan JANGAN ulangi tanpa cek.
+        await this.prisma.escrowRecovery.create({
+          data: {
+            listingId: listing.id,
+            assetAddress: listing.ccNftAddress,
+            sellerId: listing.sellerId,
+            toWallet,
+            adminId: admin.id,
+            adminWallet: admin.walletAddress,
+            reason: trimmed,
+            outcome: EscrowRecoveryOutcome.INDETERMINATE,
+          },
+        });
+        this.logger.error(
+          `PEMULIHAN ESCROW INDETERMINATE: transfer ${listing.ccNftAddress} → ${toWallet} ` +
+            `disiarkan tapi konfirmasi gagal (${message}). Kartu MUNGKIN sudah pindah — CEK ` +
+            'ON-CHAIN sebelum mengulang. escrowedAt SENGAJA tidak dibersihkan.',
+        );
+        throw new ConflictException(
+          'Transfer sudah disiarkan tapi konfirmasinya tidak diterima — kartu MUNGKIN sudah ' +
+            'kembali ke penjual. JANGAN ulangi sebelum memeriksa kepemilikan on-chain. ' +
+            'Kejadian ini sudah dicatat di escrow_recoveries.',
+        );
+      }
+      // Pra-kirim (mis. escrow kehilangan kepemilikan di antara cek dan kirim) → nol yang pindah.
+      this.logger.error(
+        `PEMULIHAN ESCROW GAGAL PRA-KIRIM untuk ${listing.ccNftAddress}: ${message}. Nol aset ` +
+          'berpindah; aman dicoba lagi.',
+      );
+      throw new ConflictException(
+        `Pengembalian kartu gagal sebelum terkirim: ${message}. Tidak ada aset yang berpindah — ` +
+          'aman dicoba lagi.',
+      );
+    }
+
+    // Kartu TERBUKTI kembali. Bersihkan penanda escrow dengan tulisan BERPAGAR, dan untuk baris
+    // PENDING_ESCROW tutup juga listing-nya: kartunya sudah tidak ada di escrow, jadi membiarkan
+    // ia "menunggu escrow" hanya akan mengundang penjual menandatangani penitipan yang tak cocok.
+    await this.prisma.listing.updateMany({
+      where: { id: listing.id, status: listing.status },
+      data: {
+        escrowedAt: null,
+        ...(listing.status === ListingStatus.PENDING_ESCROW
+          ? { status: ListingStatus.CANCELLED }
+          : {}),
+      },
+    });
+
+    const recovery = await this.prisma.escrowRecovery.create({
+      data: {
+        listingId: listing.id,
+        assetAddress: listing.ccNftAddress,
+        sellerId: listing.sellerId,
+        toWallet,
+        adminId: admin.id,
+        adminWallet: admin.walletAddress,
+        reason: trimmed,
+        outcome: EscrowRecoveryOutcome.RETURNED,
+        signature,
+      },
+    });
+
+    this.logger.warn(
+      `PEMULIHAN ESCROW SELESAI: ${listing.ccNftAddress} kembali ke ${toWallet} (sig ${signature}).`,
+    );
+
+    return {
+      recovery,
+      warning:
+        'Kartu sudah dikembalikan ke wallet penjual dan penanda escrow dibersihkan. Beri tahu ' +
+        'penjual bahwa kartunya kembali di wallet-nya dan bisa dipajang ulang kapan saja.',
+    };
+  }
+}
+
+/* ═════════════ PREDIKAT DAFTAR ESCROW — `held` DAN `stranded` HARUS MENUTUP SEMUANYA ═════════════ */
+
+/**
+ * ╔══════════════════════════════════════════════════════════════════════════════════════════╗
+ * ║ INVARIAN: SETIAP baris yang membawa fakta `escrowedAt` HARUS muncul di `held` ATAU        ║
+ * ║ `stranded`. Tidak ada baris ber-escrow yang boleh jatuh di antara keduanya.               ║
+ * ╚══════════════════════════════════════════════════════════════════════════════════════════╝
+ *
+ * `escrowedAt` adalah FAKTA "wallet escrow memegang kartu ini" — dan untuk kartu yang tertinggal
+ * di escrow, ia satu-satunya petunjuk yang kita punya. Kalau sebuah baris membawa fakta itu tapi
+ * tidak muncul di daftar mana pun, kartunya tidak lenyap dari blockchain; ia lenyap dari
+ * PANDANGAN OPERATOR, yang justru lebih buruk: tidak ada yang tahu ada yang perlu dipulihkan.
+ *
+ * Versi sebelumnya membentuk `stranded` dengan daftar status yang DISEBUT SATU-SATU
+ * (`CANCELLED, SOLD`). Daftar seperti itu diam-diam menjadi tidak lengkap setiap kali ada status
+ * baru — dan sudah tidak lengkap sekarang: baris PENDING_ESCROW yang ber-`escrowedAt` (mis.
+ * pemulihan admin yang hasilnya INDETERMINATE, yang SENGAJA tidak membersihkan penanda) tidak
+ * muncul di satu pun dari ketiga daftar.
+ *
+ * Karena itu `stranded` sekarang dinyatakan sebagai KOMPLEMEN dari `held`: "ber-escrow dan TIDAK
+ * ACTIVE". Dua predikat yang saling melengkapi tidak bisa punya celah — termasuk untuk status
+ * yang belum ada saat baris ini ditulis. Ada test yang menjalankan SETIAP nilai ListingStatus
+ * lewat keduanya dan gagal kalau ada satu saja yang lolos dari dua-duanya.
+ *
+ * (`unescrowedActive` — daftar ketiga — menjawab pertanyaan yang BERLAWANAN: baris yang
+ * SEHARUSNYA ber-escrow tapi tidak. Ia tidak ikut menutupi invarian ini dan memang tidak bisa.)
+ */
+export function escrowHeldWhere(): Prisma.ListingWhereInput {
+  return { escrowedAt: { not: null }, status: ListingStatus.ACTIVE };
+}
+
+/** Komplemen `escrowHeldWhere` di antara baris ber-`escrowedAt`. Lihat invarian di atas. */
+export function escrowStrandedWhere(): Prisma.ListingWhereInput {
+  return { escrowedAt: { not: null }, status: { not: ListingStatus.ACTIVE } };
 }

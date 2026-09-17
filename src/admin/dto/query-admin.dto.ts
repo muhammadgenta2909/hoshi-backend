@@ -100,3 +100,30 @@ export class QueryAdminActivityDto {
   @IsString()
   search?: string;
 }
+
+/**
+ * Query GET /admin/escrow (D / checklist 4.6).
+ *
+ * `verify` SENGAJA opt-in dan SENGAJA string: memverifikasi kepemilikan on-chain berarti satu
+ * panggilan RPC per kartu, jadi ia tidak boleh jadi default sebuah dashboard yang di-refresh
+ * terus-menerus. Tanpa verify, kolom `escrowOwnsOnChain` bernilai null — yang berarti TIDAK
+ * DIPERIKSA, bukan "tidak dipegang".
+ */
+export class QueryAdminEscrowDto {
+  @ApiPropertyOptional({
+    description:
+      'Kirim "true" untuk MEMVERIFIKASI kepemilikan on-chain tiap kartu yang mengaku ber-escrow ' +
+      '(satu panggilan RPC per kartu). Default: tidak diverifikasi.',
+  })
+  @IsOptional()
+  @IsString()
+  verify?: string;
+
+  @ApiPropertyOptional({ default: 50, maximum: 200 })
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(200)
+  limit?: number;
+}

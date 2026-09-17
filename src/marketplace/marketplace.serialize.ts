@@ -1,4 +1,5 @@
 import { Activity, Listing, Nft, Offer, Prisma, User } from '@prisma/client';
+import { isEscrowBackedUserListing } from './p2p.gate';
 
 /**
  * Bentuk yang dikirim ke frontend, cocok 1:1 dengan tipe `Listing` di
@@ -73,7 +74,24 @@ function changePct(history: number[]): number {
   return Math.round(((last - first) / first) * 1000) / 10;
 }
 
-export function toListingDto(row: ListingRow) {
+/**
+ * Konteks yang TIDAK bisa dibaca dari baris listing itu sendiri. Satu-satunya isinya sekarang
+ * adalah "jalur escrow real sedang berlaku", dan ia sengaja DIOPER, bukan dibaca dari env di
+ * dalam serializer: serializer ini dipakai admin, feed publik, dan halaman pemilik, dan tiap
+ * pemanggil harus terlihat memutuskan sendiri konteks mana yang benar untuknya.
+ */
+export interface ListingDtoOpts {
+  /**
+   * true = HOSHI_P2P_ENABLED menyala (bukan mock) → penjualan antar user diselesaikan lewat
+   * escrow sungguhan. Default false, yang berarti `needsEscrowDeposit` selalu false — nilai
+   * yang benar untuk mode mock/unarmed, di mana listing tanpa escrow memang sah.
+   */
+  p2pEscrowRequired?: boolean;
+}
+
+export function toListingDto(row: ListingRow, opts: ListingDtoOpts = {}) {
+  // FAKTA, bukan flag: escrow TERBUKTI memegang kartu ini (lihat migration 20260918000100).
+  const escrowed = row.escrowedAt != null;
   return {
     id: row.id,
     kind: 'card' as const,
@@ -116,6 +134,31 @@ export function toListingDto(row: ListingRow) {
     // Frontend memakainya untuk mencocokkan kartu vault ↔ listing-nya SEBELUM terjual
     // (relasi `nft` baru terisi saat mint pembelian, jadi tidak bisa dipakai di sini).
     ccNftAddress: row.ccNftAddress ?? null,
+    // ── Flow B (jual-beli antar user) ─────────────────────────────────────────
+    // true = wallet escrow Hoshi TERBUKTI memegang kartu ini. Diturunkan dari kolom escrowedAt,
+    // yaitu FAKTA historis — BUKAN dari pembacaan HOSHI_P2P_ENABLED saat request ini terjadi.
+    escrowed,
+    // true = listing ini TIDAK BISA DIBELI sekarang: jalur escrow real berlaku, ini listing
+    // milik seorang USER, tapi ia tidak escrow-backed — entah kartunya tidak pernah dititipkan
+    // ke escrow (dibuat sebelum fiturnya dinyalakan), entah ia tidak punya aset on-chain sama
+    // sekali (dibuat lewat POST /marketplace tanpa fromPackMemo, jadi tidak ada yang bisa
+    // dititipkan). PEMILIK harus bertindak; PEMBELI tidak boleh ditawari tombol beli. Server
+    // menolaknya di semua jalur penerbitan tagihan apa pun yang dilakukan UI — field ini supaya
+    // UI tidak perlu menawarkan tombol yang pasti gagal.
+    //
+    // PEMULIHANNYA BEDA untuk dua sub-kasus, dan UI bisa membedakannya dari `ccNftAddress` yang
+    // ada di DTO ini juga: ada ⇒ satu aksi `POST /marketplace/:id/relist` (→ PENDING_ESCROW,
+    // lalu tanda tangan escrow); null ⇒ tidak ada kartu on-chain untuk dititipkan, satu-satunya
+    // jalan adalah membatalkan listing-nya.
+    //
+    // Predikatnya SATU fungsi bersama dengan gerbang, feed publik, dashboard admin dan
+    // settlement (src/marketplace/p2p.gate.ts). Dulu ia ditulis ulang di sini DAN MELESET: ia
+    // menuntut `ccNftAddress != null`, sehingga populasi yang paling mudah dibuat tidak pernah
+    // ditandai kepada pemiliknya.
+    needsEscrowDeposit:
+      opts.p2pEscrowRequired === true &&
+      row.sellerId != null &&
+      !isEscrowBackedUserListing(row),
     nft: row.nft ? toNftDto(row.nft) : null,
   };
 }
@@ -127,8 +170,12 @@ export type ListingDto = ReturnType<typeof toListingDto>;
  * certificate, vault location, history, offers, card number, dan variant harus
  * berasal dari DB/API create, bukan generator serializer.
  */
-export function toCardDetailDto(row: ListingRow, related: ListingRow[]) {
-  const listing = toListingDto(row);
+export function toCardDetailDto(
+  row: ListingRow,
+  related: ListingRow[],
+  opts: ListingDtoOpts = {},
+) {
+  const listing = toListingDto(row, opts);
   const languageLong = row.language === 'Japan' ? 'Japanese' : row.language;
   const languageTag =
     row.language === 'Japan' ? 'JAPAN' : row.language.toUpperCase();
@@ -175,7 +222,10 @@ export function toCardDetailDto(row: ListingRow, related: ListingRow[]) {
     offers: readOffers(row.offerRecords ?? []),
     details,
     collectionLabel: row.set,
-    related: related.map(toListingDto),
+    // WAJIB lambda, BUKAN `related.map(toListingDto)`: Array.map mengoper (nilai, INDEX, array),
+    // jadi bentuk pendeknya akan menyuntikkan index numerik sebagai `opts` dan mematikan
+    // penandaan needsEscrowDeposit tanpa satu pun error TypeScript.
+    related: related.map((r) => toListingDto(r, opts)),
   };
 }
 

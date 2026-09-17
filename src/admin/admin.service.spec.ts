@@ -8,6 +8,7 @@ import type { ConfigService } from '@nestjs/config';
 import type { JwtService } from '@nestjs/jwt';
 import { PaymentStatus, RedemptionStatus } from '@prisma/client';
 import type { MarketplaceService } from '../marketplace/marketplace.service';
+import type { EscrowService } from '../escrow/escrow.service';
 import type { PrismaService } from '../prisma/prisma.service';
 import { AdminGuard } from '../auth/admin.guard';
 import { AdminService } from './admin.service';
@@ -77,6 +78,10 @@ describe('AdminService.recoverBurnSubmittedToFunded (B3)', () => {
       {} as unknown as JwtService,
       {} as unknown as ConfigService,
       {} as unknown as MarketplaceService,
+      // D — EscrowService. Test di file ini tidak menyentuh escrow sama sekali (jalur redemption
+      // & listing), jadi stub kosong sudah benar: kalau suatu saat ada yang memanggilnya ia akan
+      // meledak keras alih-alih diam-diam berhasil.
+      {} as unknown as EscrowService,
     );
     return { service, prisma };
   };
@@ -317,6 +322,10 @@ describe('AdminService.settleReadyToFundAsRefundDue (B1#4)', () => {
       {} as unknown as JwtService,
       {} as unknown as ConfigService,
       {} as unknown as MarketplaceService,
+      // D — EscrowService. Test di file ini tidak menyentuh escrow sama sekali (jalur redemption
+      // & listing), jadi stub kosong sudah benar: kalau suatu saat ada yang memanggilnya ia akan
+      // meledak keras alih-alih diam-diam berhasil.
+      {} as unknown as EscrowService,
     );
     return { service, prisma };
   };
@@ -536,6 +545,10 @@ describe('AdminService.cancelAwaitingPayment (B1 — last-resort exit)', () => {
       {} as unknown as JwtService,
       {} as unknown as ConfigService,
       {} as unknown as MarketplaceService,
+      // D — EscrowService. Test di file ini tidak menyentuh escrow sama sekali (jalur redemption
+      // & listing), jadi stub kosong sudah benar: kalau suatu saat ada yang memanggilnya ia akan
+      // meledak keras alih-alih diam-diam berhasil.
+      {} as unknown as EscrowService,
     );
     return { service, prisma };
   };

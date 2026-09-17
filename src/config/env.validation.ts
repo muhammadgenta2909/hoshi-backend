@@ -11,6 +11,9 @@ import {
 // Konstanta-saja, TANPA import lain (lihat cc-shipping-mock.mount.ts): validasi env jalan paling
 // awal saat boot dan tidak boleh menarik Nest/@solana/web3.js hanya untuk sebuah string.
 import { CC_SHIPPING_MOCK_MOUNT } from '../collectorcrypt/cc-shipping-mock.mount';
+// Idem — file tanpa import sama sekali, SENGAJA, supaya aturan baca plafon sponsor gas yang
+// dipakai saat boot adalah aturan yang SAMA dengan yang dipakai saat memutuskan sponsor.
+import { sponsorCapEnvProblems } from '../escrow/sponsor-cap-env';
 
 /**
  * Skema validasi environment. Dipanggil ConfigModule saat boot — kalau ada yang
@@ -258,6 +261,61 @@ class EnvironmentVariables {
   @IsString()
   HOSHI_P2P_ENABLED?: string;
 
+  // ── C: SPONSOR GAS PENITIPAN ESCROW ──────────────────────────────────────
+  // Opsional — "false" MEMATIKAN sponsor gas, sehingga PENJUAL kembali membayar fee transaksi
+  // penitipan kartu ke escrow. Default NYALA, dan itu disengaja: dengan sponsor mati, penjual
+  // yang masuk lewat Google (wallet Privy embedded, saldo SOL NOL) SAMA SEKALI tidak bisa
+  // menitipkan kartu — jadi tidak bisa menjual. Sponsor memisahkan FEE PAYER (escrow) dari
+  // AUTHORITY (penjual): kartu tetap tidak bisa berpindah tanpa tanda tangan penjual.
+  // Ini TIDAK menyalakan apa pun sendiri — seluruh jalur escrow tetap mati sampai
+  // HOSHI_P2P_ENABLED=true. Plafonnya: empat env di bawah (lihat src/escrow/escrow-fee-sponsor.ts).
+  //
+  // CATATAN: mematikannya BUKAN satu-satunya cara penjual membayar gasnya sendiri. Kalau
+  // sponsor menyala tapi tidak bisa berjalan (kuota penuh / saldo escrow tipis / fee tak
+  // terbaca), penjual yang saldonya cukup otomatis dapat transaksi penjual-bayar. Flag ini
+  // untuk mematikan sponsor SECARA SADAR & menyeluruh, bukan sebagai penanganan kegagalan.
+  @IsOptional()
+  @IsString()
+  HOSHI_ESCROW_SPONSOR_FEE?: string;
+
+  // ATURAN BACA KEEMPAT PLAFON DI BAWAH (src/escrow/sponsor-cap-env.ts, dipakai saat boot DAN
+  // saat memutuskan sponsor — satu aturan, bukan dua salinan):
+  //   • tidak di-set / kosong → default bawaan;
+  //   • "0" → NOL, dan itu disengaja: inilah rem tangan operator di tengah insiden (plafon nol =
+  //     tidak ada transaksi yang disponsori) tanpa perlu deploy. Dulu "0" diam-diam jadi default,
+  //     jadi operator yang meminta NOL justru mendapat 0,02 SOL/hari;
+  //   • apa pun yang lain ("off", "-1", "1e5", "5.5") → BACKEND MENOLAK START. Batas belanja yang
+  //     salah ketik tidak boleh diam-diam kembali ke default.
+  // (Mematikan sponsor SELURUHNYA tetap lewat HOSHI_ESCROW_SPONSOR_FEE=false di atas.)
+
+  // Opsional — plafon fee untuk SATU transaksi penitipan (lamports). Default 50.000 (≈10× fee
+  // transfer Core normal). Fee sesungguhnya dibaca dari getFeeForMessage, bukan ditebak; env ini
+  // hanya batas atas yang membuat satu transaksi tak wajar ditolak SEBELUM ditandatangani.
+  @IsOptional()
+  @IsString()
+  HOSHI_ESCROW_SPONSOR_MAX_FEE_LAMPORTS?: string;
+
+  // Opsional — plafon GLOBAL 24 jam untuk sponsor gas (lamports). Default 20.000.000 (0,02 SOL
+  // ≈ 4.000 penitipan/hari). Dihitung dari tabel escrow_fee_sponsorships (yang DITERBITKAN),
+  // bukan dari penghitung di memori — supaya selamat dari restart & multi-instance.
+  @IsOptional()
+  @IsString()
+  HOSHI_ESCROW_SPONSOR_DAILY_CAP_LAMPORTS?: string;
+
+  // Opsional — plafon 24 jam PER PENJUAL (jumlah transaksi). Default 20. Ini rem anti-Sybil yang
+  // sesungguhnya: plafon global saja bisa dihabiskan satu akun, dan throttle per-IP tak menolong
+  // karena identitas di sistem ini gratis.
+  @IsOptional()
+  @IsString()
+  HOSHI_ESCROW_SPONSOR_MAX_PER_SELLER_24H?: string;
+
+  // Opsional — SOL yang WAJIB TERSISA di wallet escrow sesudah menanggung satu fee (lamports).
+  // Default 10.000.000 (0,01 SOL). Bukan cadangan sopan-santun: escrow yang kehabisan SOL tidak
+  // bisa lagi MENYERAHKAN kartu ke pembeli atau MENGEMBALIKANNYA ke penjual.
+  @IsOptional()
+  @IsString()
+  HOSHI_ESCROW_SPONSOR_RESERVE_LAMPORTS?: string;
+
   // Opsional — komisi Hoshi untuk penjualan P2P dalam basis point ("500" = 5%), diambil dari sisi
   // PENJUAL (pembeli tetap bayar harga + fee QRIS). Default 500. PaymentsService meng-clamp 0..100%.
   // String (bukan @IsInt), sama seperti HOSHI_PACK_MARGIN_BPS, agar salah ketik tak jadi angka diam2.
@@ -455,6 +513,35 @@ export function validateEnv(config: Record<string, unknown>) {
           .join('\n'),
     );
   }
+  assertSponsorCapsReadable(config);
   assertMainnetConsistency(config);
   return validated;
+}
+
+/**
+ * PLAFON SPONSOR GAS YANG TIDAK BISA DIBACA = BACKEND MENOLAK START.
+ *
+ * Keempat env ini adalah BATAS BELANJA, dan sebelum ini nilai yang tidak terbaca — termasuk "0",
+ * "-1", dan "off" — diam-diam berubah menjadi default bawaan. Untuk sebuah batas belanja itu arah
+ * yang salah: operator yang mengetik `HOSHI_ESCROW_SPONSOR_DAILY_CAP_LAMPORTS=0` untuk menghentikan
+ * sponsor di tengah insiden justru mendapat 0,02 SOL/hari. Sekarang "0" berarti NOL (lihat
+ * src/escrow/sponsor-cap-env.ts) dan yang benar-benar tidak terbaca ditolak DI SINI.
+ *
+ * KENAPA MENOLAK START, bukan melempar saat dipakai seperti plafon treasury: plafon ini dibaca di
+ * jalur yang punya JALAN MUNDUR ("penjual bayar gas"), jadi melempar saat dipakai akan ikut
+ * mematikan jalan mundur itu untuk penjual yang tidak ada urusannya dengan salah ketik kita —
+ * sementara diam-diam memakai default berarti membelanjakan SOL dengan batas yang tidak pernah
+ * diminta siapa pun. Gagal saat boot tidak punya dua kerugian itu, dan alasannya sama dengan
+ * interlock cutover mainnet di bawah: gagal saat BOOT jauh lebih murah daripada gagal — atau
+ * membelanjakan — di tengah jalur uang.
+ */
+function assertSponsorCapsReadable(config: Record<string, unknown>): void {
+  const problems = sponsorCapEnvProblems(config);
+  if (problems.length > 0) {
+    throw new Error(
+      'Plafon sponsor gas escrow tidak bisa dibaca — backend menolak start supaya batas belanja ' +
+        'tidak diam-diam kembali ke default:\n' +
+        problems.map((p) => `  • ${p}`).join('\n'),
+    );
+  }
 }

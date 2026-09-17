@@ -1,0 +1,48 @@
+-- ══════════════════════════════════════════════════════════════════════════════════════════════
+--  FAKTA `escrowedAt` HANYA BOLEH DIHAPUS OLEH PENULIS YANG PUNYA BUKTI — dan populasi buntu
+--  tidak boleh lahir lagi sesudah arming.
+--
+--  Migration ini TIDAK MENGUBAH SATU BARIS DATA PUN dan tidak menambah objek apa pun: ia hanya
+--  memperbarui COMMENT kolom supaya aturan yang sekarang ditegakkan kode juga terbaca dari
+--  database. Aman dijalankan kapan saja.
+--
+--  ═══ 1. APA YANG SALAH ═══
+--  `escrowedAt` adalah FAKTA "wallet escrow memegang kartu ini". Untuk kartu yang TERTINGGAL di
+--  escrow ia juga satu-satunya petunjuk yang kita punya: ketika `cancel` GAGAL mengembalikan
+--  kartu ke penjual, barisnya SENGAJA ditinggalkan CANCELLED dengan `escrowedAt` masih ter-set,
+--  dan dari situlah daftar `stranded` di dashboard admin dibentuk.
+--
+--  Memajang ulang (relist, dan jalur `POST /marketplace` yang menemukan baris lama) dulu menulis
+--  `escrowedAt = NULL` begitu saja, dengan alasan "kartu ada di wallet pemilik saat relist" —
+--  benar untuk jalur normal, TAPI TIDAK untuk baris stranded, yang justru ada karena kartunya
+--  TIDAK kembali. Akibatnya satu aksi penjual yang paling biasa menghapus bukti terakhir bahwa
+--  ada kartu nyata di dalam wallet escrow, dan baris itu lenyap dari KETIGA daftar operator
+--  (held / stranded / unescrowedActive) sekaligus. Kartunya tidak hilang dari blockchain — ia
+--  hilang dari pandangan, yang lebih buruk: tidak ada lagi yang tahu ada yang perlu dipulihkan.
+--
+--  ═══ 2. ATURAN YANG SEKARANG BERLAKU ═══
+--  Yang boleh menulis `escrowedAt = NULL` hanyalah penulis yang PUNYA BUKTI kartunya sudah
+--  keluar dari escrow:
+--    • cancel — sesudah transfer balik ke penjual TERKONFIRMASI;
+--    • recoverEscrowToSeller (admin) — idem, dan SENGAJA tidak menghapus saat INDETERMINATE;
+--    • relist / create-yang-menemukan-baris-lama — hanya sesudah membaca kepemilikan on-chain
+--      dan mendapat jawaban TEGAS "escrow tidak memegangnya". Jawaban "tidak terbaca"
+--      diperlakukan sama dengan "masih dipegang": DITOLAK (fail-closed).
+--  Sebaliknya, `cancel` yang MENEMUKAN (lewat pembacaan on-chain) bahwa escrow memegang kartu
+--  yang barisnya belum mencatatnya, MENCATATNYA DULU sebelum mencoba mengembalikan — supaya
+--  pengembalian yang gagal tetap meninggalkan baris yang terlihat di daftar `stranded`.
+--
+--  Daftar `stranded` sendiri sekarang dinyatakan sebagai KOMPLEMEN `held` ("ber-escrowedAt dan
+--  TIDAK ACTIVE"), bukan daftar status yang disebut satu-satu: dua predikat yang saling
+--  melengkapi tidak bisa punya celah, termasuk untuk status yang belum ada saat ini ditulis.
+--
+--  ═══ 3. POPULASI BUNTU TIDAK LAHIR LAGI ═══
+--  Runbook migration 20260919000000 menyuruh operator membersihkan listing USER ber-ccNftAddress
+--  NULL SEBELUM menyalakan HOSHI_P2P_ENABLED. Pembersihan itu sia-sia kalau aplikasinya mengisi
+--  ulang populasi yang sama sesudah arming — dan `POST /marketplace` TANPA fromPackMemo memang
+--  melakukannya. Sekarang jalur itu DITOLAK saat mode ARMED (P2P_LISTING_NOT_ESCROWED, stage
+--  NO_EFFECT, nol baris dibuat), dengan pesan yang menyuruh penjual memajang kartunya dari Vault
+--  (hasil pull) — yaitu satu-satunya listing user yang punya aset on-chain untuk dititipkan.
+--  Mode MOCK dan OFF TIDAK berubah sedikit pun: di sana listing user tanpa aset on-chain SAH.
+COMMENT ON COLUMN "listings"."escrowedAt" IS
+  'FAKTA: wallet escrow Hoshi TERBUKTI memegang kartu ini (di-set submitEscrow setelah kepemilikan dikonfirmasi on-chain). Ini SATU-SATUNYA dasar yang sah untuk setiap keputusan escrow — JANGAN PERNAH menggantinya dengan pembacaan HOSHI_P2P_ENABLED/CC_MOCK saat itu, karena flag bisa berubah di tengah hidup sebuah listing sementara kartunya tidak. NULL = kartu ada di wallet penjual. Konsekuensinya: (a) cancel hanya menarik kartu balik bila ini ter-set — men-disarm P2P sesudah kartu masuk escrow tetap mengembalikan kartu penjual; (b) saat P2P armed, listing user ber-ccNftAddress dengan kolom ini NULL TIDAK BOLEH bisa dibeli (lihat listings_unescrowed_user_idx); (c) KOLOM INI HANYA BOLEH DIKOSONGKAN OLEH PENULIS YANG PUNYA BUKTI kartunya sudah keluar dari escrow (transfer balik terkonfirmasi, atau pembacaan kepemilikan on-chain yang TEGAS menjawab bukan-escrow). Memajang ulang listing BUKAN bukti: baris CANCELLED yang masih membawa kolom ini adalah kartu yang gagal dikembalikan, dan kolom ini satu-satunya petunjuknya (dashboard admin: daftar stranded).';

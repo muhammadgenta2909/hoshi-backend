@@ -1113,3 +1113,106 @@ model TreasurySwapLock {
 
   @@map("treasury_swap_lock")
 }
+
+/// Hasil sebuah PEMULIHAN ESCROW manual oleh admin (D / checklist 4.6).
+enum EscrowRecoveryOutcome {
+  /// Kartu TERBUKTI kembali ke wallet penjual (transfer terkonfirmasi).
+  RETURNED
+  /// Transfer SUDAH disiarkan tapi konfirmasinya hilang — kartu MUNGKIN sudah pindah.
+  /// JANGAN ulangi tanpa cek on-chain. Penanda escrow SENGAJA tidak dibersihkan.
+  INDETERMINATE
+}
+
+/// LEDGER SPONSOR GAS ESCROW (C) — satu baris per transaksi transfer→escrow yang fee-nya
+/// DITANGGUNG wallet escrow Hoshi (fee payer ≠ authority; penjual tetap menandatangani sebagai
+/// pemilik kartu, escrow hanya membayar gas-nya).
+///
+/// KENAPA TABEL, BUKAN PENGHITUNG DI MEMORI: plafonnya harus selamat dari restart dan dari
+/// banyak instance — persis alasan `TreasuryService.fundUsdc` menghitung plafon 24 jam dari
+/// ledger, bukan dari proses. Dan plafon dihitung dari `issuedAt` (KEWAJIBAN yang kami terbitkan),
+/// BUKAN dari `consumedAt`: satu transaksi yang sudah kami tandatangani bisa disiarkan penjual
+/// sendiri kapan saja dalam masa berlaku blockhash-nya, jadi menghitung yang "terpakai" saja
+/// akan MENGECILKAN paparan. Fail-closed.
+model EscrowFeeSponsorship {
+  id String @id @default(cuid())
+
+  /// Listing yang transaksinya disponsori. Bukan relasi: baris ini adalah CATATAN KEUANGAN yang
+  /// harus tetap ada walau listing-nya kelak dihapus.
+  listingId    String
+  sellerId     String
+  assetAddress String
+
+  /// PLAFON fee (lamports) yang kami tanggung untuk transaksi ini — dibaca dari
+  /// `getFeeForMessage` SEBELUM menandatangani, dan ditolak bila melewati plafon per-transaksi.
+  feeLamports Int
+
+  /// IDENTITAS RESERVASI INI: signature transaksi sponsor yang kami tandatangani untuk baris ini.
+  /// Escrow adalah fee payer transaksi itu, jadi tanda tangannya ADALAH ID transaksinya — nama
+  /// yang nanti dikembalikan RPC saat penjual menyiarkannya.
+  ///
+  /// DITULIS DI DALAM transaksi keputusan plafon (tanda tangan dibuat di sana juga), jadi tidak
+  /// ada kewajiban yang pernah terbit tanpa membawa nama transaksi yang akan menagihnya. Inilah
+  /// yang dicocokkan `noteSponsorshipConsumed` — bukan `listingId`, yang bisa menunjuk ke
+  /// reservasi lain (atau ke reservasi yang transaksinya TIDAK PERNAH disiarkan) dan menandai
+  /// baris yang salah sebagai terpakai.
+  ///
+  /// SENGAJA TIDAK @unique: dua permintaan dalam slot blockhash yang sama menghasilkan pesan
+  /// byte-identik, jadi signature-nya identik. Itu DUA kewajiban tercatat untuk SATU transaksi
+  /// (plafon terpakai dua kali — arah yang aman), dan satu broadcast memang menghabiskan
+  /// keduanya. Unique index di sini justru akan menolak reservasi kedua SESUDAH plafonnya
+  /// diputuskan, yaitu setelah titik yang tidak bisa dibatalkan.
+  sponsoredTxSignature String?
+
+  /// Signature transaksi yang BENAR-BENAR disiarkan (diisi saat submitEscrow sukses). Untuk baris
+  /// sponsor nilainya sama dengan `sponsoredTxSignature`; ia tetap kolom tersendiri supaya
+  /// "diterbitkan" dan "terpakai" tidak pernah dibaca dari satu kolom yang sama.
+  /// null = diterbitkan tapi belum (atau tidak pernah) dipakai — tetap dihitung di plafon.
+  signature String? @unique
+
+  issuedAt   DateTime  @default(now())
+  consumedAt DateTime?
+
+  @@index([issuedAt])
+  @@index([sellerId, issuedAt])
+  @@index([listingId])
+  /// Menopang pencocokan "sponsorship MANA yang transaksinya barusan disiarkan".
+  @@index([sponsoredTxSignature])
+  /// Menopang agregat KEWAJIBAN TERUTANG (issued tapi belum consumed) yang dikurangkan dari
+  /// saldo SOL escrow sebelum cadangan diperiksa. Query-nya berjalan DI DALAM transaksi yang
+  /// memegang kunci serialisasi sponsor, jadi ia harus murah: selama ia memegang kunci itu,
+  /// tidak ada keputusan sponsor lain yang bisa jalan.
+  @@index([consumedAt, issuedAt])
+  @@map("escrow_fee_sponsorships")
+}
+
+/// JEJAK AUDIT PEMULIHAN ESCROW (D) — satu baris per aksi admin "kembalikan kartu dari escrow
+/// ke penjual". Listing tidak punya kolom catatan (beda dari CardRedemption.note), jadi tanpa
+/// tabel ini alasan operator hanya hidup di log droplet yang dirotasi.
+///
+/// Baris ini DITULIS SEBELUM transfer disiarkan dan dimutakhirkan sesudahnya, supaya aksi yang
+/// hasilnya tidak diketahui tetap meninggalkan jejak.
+model EscrowRecovery {
+  id String @id @default(cuid())
+
+  listingId    String
+  assetAddress String
+  sellerId     String?
+
+  /// Wallet tujuan — SELALU diturunkan dari penjual baris listing, TIDAK PERNAH dari input admin.
+  toWallet String
+
+  adminId     String
+  adminWallet String
+
+  /// Alasan operator (wajib, minimal 10 karakter). Disimpan permanen.
+  reason String
+
+  outcome   EscrowRecoveryOutcome
+  signature String?
+
+  createdAt DateTime @default(now())
+
+  @@index([listingId])
+  @@index([createdAt])
+  @@map("escrow_recoveries")
+}

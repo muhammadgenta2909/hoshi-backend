@@ -2,6 +2,7 @@ import {
   BadRequestException,
   ConflictException,
   ForbiddenException,
+  HttpStatus,
   Injectable,
   Logger,
   NotFoundException,
@@ -33,9 +34,18 @@ import { QueryListingDto, SortKey } from './dto/query-listing.dto';
 import { RelistListingDto } from './dto/relist-listing.dto';
 import { UpdateListingDto } from './dto/update-listing.dto';
 import { SubmitEscrowDto } from './dto/submit-escrow.dto';
-import { assertDemoOnly, detectProductionSignal } from '../common/demo-mode';
+import { assertDemoOnly } from '../common/demo-mode';
 import { EscrowService } from '../escrow/escrow.service';
 import { MailService } from '../mail/mail.service';
+import {
+  assertEscrowBackedIfRequired,
+  assertP2pSaleAvailable,
+  listingNeedsEscrow as needsEscrowFor,
+  p2pModeOf,
+  unescrowedUserListingWhere,
+  type P2pMode,
+} from './p2p.gate';
+import { P2P_ERROR_CODE, p2pNoEffectError } from './p2p.errors';
 import {
   ActivityDto,
   displayLabel,
@@ -132,28 +142,13 @@ export class MarketplaceService {
   ) {}
 
   /**
-   * MOCK CC aktif: staging/devnet + CC_MOCK=1 + bukan sinyal produksi. HARUS identik dengan
-   * PaymentsService.ccMockEnabled agar listing & settlement sepakat soal mock vs real.
+   * Mode settlement P2P yang BERLAKU SEKARANG — MOCK / ARMED / OFF. Satu-satunya pembacaan flag
+   * di service ini, dan ia dipakai BERSAMA dengan PaymentsService lewat `p2pModeOf` (lihat
+   * src/marketplace/p2p.gate.ts). Dulu predikat ini ditulis DUA KALI — di sini dan di
+   * `fulfilUserListing` — dengan komentar "HARUS identik" sebagai satu-satunya penjaganya.
    */
-  private ccMockEnabled(): boolean {
-    return (
-      this.config.get<string>('CC_MOCK') === '1' &&
-      detectProductionSignal() === null
-    );
-  }
-
-  /**
-   * P2P real menyala: bukan mock DAN HOSHI_P2P_ENABLED=true. HARUS identik dengan cabang REAL
-   * di PaymentsService.fulfilUserListing — kalau settlement akan benar-benar men-transfer kartu
-   * dari escrow (real+armed), maka listing WAJIB menaruh kartu di escrow dulu; selain itu langsung
-   * ACTIVE (mock men-simulasi, unarmed di-refund manual → tak ada transfer nyata yang perlu escrow).
-   */
-  private p2pRealArmed(): boolean {
-    const armed =
-      (this.config.get<string>('HOSHI_P2P_ENABLED') ?? '')
-        .trim()
-        .toLowerCase() === 'true';
-    return !this.ccMockEnabled() && armed;
+  private p2pMode(): P2pMode {
+    return p2pModeOf(this.config);
   }
 
   /**
@@ -162,12 +157,106 @@ export class MarketplaceService {
    * (tanpa ccNftAddress) atau mode mock/unarmed → tidak perlu escrow (langsung ACTIVE).
    */
   private listingNeedsEscrow(ccNftAddress: string | null | undefined): boolean {
-    return !!ccNftAddress && this.p2pRealArmed();
+    return needsEscrowFor(this.p2pMode(), ccNftAddress);
+  }
+
+  /**
+   * ╔════════════════════════════════════════════════════════════════════════════════════════╗
+   * ║ SYARAT UNTUK BOLEH MENGHAPUS FAKTA `escrowedAt`: BUKTI kartunya SUDAH KELUAR DARI ESCROW ║
+   * ╚════════════════════════════════════════════════════════════════════════════════════════╝
+   *
+   * `escrowedAt` BUKAN flag preferensi — ia FAKTA TERSIMPAN "wallet escrow memegang kartu ini",
+   * ditulis submitEscrow hanya setelah kepemilikan escrow terbukti on-chain. Karena itu ia juga
+   * satu-satunya petunjuk yang tersisa saat `cancel` GAGAL mengembalikan kartu: baris itu
+   * ditinggalkan CANCELLED dengan `escrowedAt` MASIH ter-set, dan dari situlah daftar `stranded`
+   * di dashboard admin dibentuk (admin.service.ts: "satu-satunya petunjuk").
+   *
+   * Jadi yang boleh menghapusnya hanyalah penulis yang PUNYA BUKTI kartunya sudah keluar:
+   *   • `cancel` — sesudah transferCoreAssetTo ke penjual TERKONFIRMASI;
+   *   • `recoverEscrowToSeller` (admin) — idem, dan SENGAJA tidak menghapus saat hasilnya
+   *     INDETERMINATE;
+   *   • memajang ulang (relist / create-yang-menemukan-baris-lama) — lewat fungsi INI.
+   *
+   * Memajang ulang sendiri TIDAK membuktikan apa pun. Versi sebelum ini menulis
+   * `escrowedAt: null` begitu saja karena "kartu ada di wallet pemilik saat relist" — benar untuk
+   * jalur normal, TAPI TIDAK untuk baris stranded, yang justru ada karena kartunya TIDAK kembali.
+   * Akibatnya satu aksi penjual yang biasa saja (memajang ulang listing yang dibatalkan)
+   * menghapus satu-satunya jejak kartu yang tertinggal di escrow, dan baris itu lenyap dari
+   * KETIGA daftar operator sekaligus.
+   *
+   * MAKA: kalau baris ini masih membawa faktanya, kami TANYAKAN ke rantai, dan FAIL-CLOSED —
+   * hanya jawaban "escrow TERBUKTI tidak memegangnya" yang mengizinkan fakta itu dihapus.
+   *   • masih dipegang → DITOLAK, barisnya tetap utuh di daftar `stranded`, dan pemiliknya
+   *     diberi tahu jalan keluarnya (support → pemulihan admin → baru dipajang ulang);
+   *   • tidak terbaca  → DITOLAK juga. Menebak di sini berarti menebak dengan kartu orang.
+   *
+   * BIAYANYA NOL untuk jalur normal: baris yang `escrowedAt`-nya memang null (semua listing
+   * mock/unarmed, dan semua kartu yang tidak pernah dititipkan) tidak menyentuh RPC sama sekali.
+   * Ini juga sebabnya properti "relist tidak pernah gagal karena RPC pihak ketiga" tetap utuh —
+   * yang ditanya di sini RPC Solana milik kita sendiri, hanya untuk baris yang MENGAKU di escrow,
+   * dan bukan katalog CollectorCrypt.
+   */
+  private async assertCardLeftEscrow(listing: {
+    id: string;
+    ccNftAddress: string | null;
+    escrowedAt: Date | null;
+  }): Promise<void> {
+    if (listing.escrowedAt == null) return; // tak ada fakta untuk dihapus → tak ada yang dibuktikan
+
+    const held = listing.ccNftAddress
+      ? this.escrow.isConfigured()
+        ? await this.escrow.checkOwnsAsset(listing.ccNftAddress)
+        : null // tak ada wallet escrow di deployment ini → tak ada yang bisa membuktikan apa pun
+      : null; // fakta escrow tanpa aset on-chain: tidak bisa diverifikasi, jadi tidak bisa dihapus
+
+    if (held === false) return; // TERBUKTI keluar dari escrow → pemanggil boleh membersihkan fakta
+
+    if (held === true) {
+      throw p2pNoEffectError(
+        HttpStatus.CONFLICT,
+        P2P_ERROR_CODE.LISTING_ESCROW_HELD,
+        'Kartu ini masih dititipkan di brankas (escrow) Hoshi, jadi belum bisa dipajang ulang: ' +
+          'pemilik on-chain-nya saat ini adalah brankas, bukan wallet Anda. Ini terjadi kalau ' +
+          'pengembalian kartu saat pembatalan sebelumnya gagal. Hubungi support Hoshi dengan ' +
+          'menyebut ID listing ini — kartunya akan dikembalikan ke wallet Anda lebih dulu, ' +
+          'sesudah itu memajang ulang berjalan seperti biasa. Tidak ada yang berubah dan tidak ' +
+          'ada biaya yang keluar.',
+        listing.id,
+      );
+    }
+
+    throw p2pNoEffectError(
+      HttpStatus.SERVICE_UNAVAILABLE,
+      P2P_ERROR_CODE.LISTING_ESCROW_HELD,
+      'Kartu ini tercatat sedang dititipkan di brankas (escrow) Hoshi dan posisinya belum bisa ' +
+        'dipastikan sekarang, jadi listing-nya belum bisa dipajang ulang. Coba lagi sebentar ' +
+        'lagi — tidak ada yang berubah dan tidak ada biaya yang keluar. Kalau terus berulang, ' +
+        'hubungi support Hoshi dengan menyebut ID listing ini.',
+      listing.id,
+    );
+  }
+
+  /**
+   * Konteks serialisasi. `p2pEscrowRequired` = jalur escrow real sedang berlaku, dan itulah
+   * yang membuat `toListingDto` menandai `needsEscrowDeposit` pada listing user yang kartunya
+   * tidak pernah dititipkan. PEMILIK membaca tanda itu sebagai "pajang ulang untuk menitipkan";
+   * surface pembeli memakainya untuk tidak pernah menawarkan tombol beli pada baris seperti itu.
+   */
+  private dtoOpts(): { p2pEscrowRequired: boolean } {
+    return { p2pEscrowRequired: this.p2pMode() === 'ARMED' };
   }
 
   /** Listing ACTIVE + filter + sort. Bentuk cocok dgn lib/market.ts frontend. */
   async list(query: QueryListingDto): Promise<ListingDto[]> {
+    const mode = this.p2pMode();
     const where: Prisma.ListingWhereInput = { status: ListingStatus.ACTIVE };
+    // B — SURFACE PEMBELI. Saat jalur escrow real berlaku, listing USER yang mewakili aset
+    // on-chain TAPI tidak pernah dititipkan ke escrow TIDAK BOLEH tampil di feed publik: escrow
+    // tak memegang apa pun untuk diserahkan, jadi setiap Rupiah yang mendarat untuknya PASTI
+    // berakhir sebagai refund manual. Mereka bukan dihapus dan bukan dibatalkan — pemiliknya
+    // tetap melihatnya di /me/listings (ditandai needsEscrowDeposit) dan bisa memajang ulang.
+    // Predikatnya bersandar pada FAKTA escrowedAt; mode hanya menentukan APAKAH fakta itu wajib.
+    if (mode === 'ARMED') where.NOT = unescrowedUserListingWhere();
     if (query.set) where.set = query.set;
     if (query.grader) where.grader = query.grader;
     if (query.minGrade != null) where.gradeScore = { gte: query.minGrade };
@@ -184,7 +273,9 @@ export class MarketplaceService {
     // (permintaan: tampilkan total asli tanpa pagination). `query.limit` tetap dihormati bila dikirim
     // eksplisit oleh pemanggil; feed marketplace publik tidak mengirimnya → dapat semua.
     const limited = query.limit != null ? rows.slice(0, query.limit) : rows;
-    return limited.map(toListingDto);
+    // Lambda, BUKAN `.map(toListingDto)` — Array.map mengoper index sebagai argumen kedua.
+    const opts = { p2pEscrowRequired: mode === 'ARMED' };
+    return limited.map((r) => toListingDto(r, opts));
   }
 
   /** Listing milik user login (semua status, terbaru dulu). */
@@ -194,7 +285,8 @@ export class MarketplaceService {
       include: { nft: true },
       orderBy: { createdAt: 'desc' },
     });
-    return rows.map(toListingDto);
+    const opts = this.dtoOpts();
+    return rows.map((r) => toListingDto(r, opts));
   }
 
   /**
@@ -208,7 +300,8 @@ export class MarketplaceService {
       include: { nft: true },
       orderBy: { soldAt: 'desc' },
     });
-    return rows.map(toListingDto);
+    const opts = this.dtoOpts();
+    return rows.map((r) => toListingDto(r, opts));
   }
 
   /**
@@ -229,7 +322,7 @@ export class MarketplaceService {
       orderBy: { listedAt: 'desc' },
       take: 4,
     });
-    return toCardDetailDto(row, related);
+    return toCardDetailDto(row, related, this.dtoOpts());
   }
 
   /**
@@ -272,6 +365,9 @@ export class MarketplaceService {
         expectedValueIdrx: true,
         sellerId: true,
         sellerAddress: true,
+        // Fakta gerbang P2P (A/B): dipakai assertP2pSaleAvailable di bawah.
+        ccNftAddress: true,
+        escrowedAt: true,
         // Selain label From/To, kita perlu preferensi notifikasi + email penjual
         // (penerima) untuk memutuskan apakah mengirim email offer.
         seller: {
@@ -299,6 +395,19 @@ export class MarketplaceService {
       throw new BadRequestException(
         'Cannot make an offer on your own listing.',
       );
+    }
+    // A — TOLAK DI TITIK PALING AWAL. Menawar itu sendiri tidak memindahkan uang, tapi ia adalah
+    // langkah PERTAMA dari satu-satunya rantai yang berakhir di tagihan Rupiah (tawar → penjual
+    // menerima → "lanjut bayar"). Membiarkan tawaran masuk untuk kartu yang tidak akan pernah
+    // bisa diserahkan berarti mengundang kedua pihak menempuh rantai itu sampai ke titik bayar.
+    // Hanya listing USER (sellerId terisi) yang lewat gerbang ini — katalog CC & inventaris
+    // Hoshi punya jalur settlement sendiri yang tidak bergantung pada escrow P2P.
+    if (listing.sellerId) {
+      assertP2pSaleAvailable(this.p2pMode(), {
+        id: listing.id,
+        ccNftAddress: listing.ccNftAddress,
+        escrowedAt: listing.escrowedAt,
+      });
     }
 
     const buyerLabel = displayLabel(buyer, shortWallet(buyer.walletAddress));
@@ -508,6 +617,19 @@ export class MarketplaceService {
     if (existing.status !== ListingStatus.ACTIVE) {
       throw new BadRequestException('Listing sudah tidak aktif / terjual.');
     }
+    // A — MENERIMA OFFER MENERBITKAN KEWAJIBAN, JADI IA IKUT DIGERBANG.
+    //
+    // Accept tidak menyentuh uang, tapi ia adalah SATU-SATUNYA hal yang membuka tombol "lanjut
+    // bayar" (createOfferOrder hanya menerima offer berstatus ACCEPTED), dan ia menutup semua
+    // offer saingan. Menerimanya untuk kartu yang tidak bisa diserahkan berarti: penjual diberi
+    // tahu kartunya "terjual", pembeli lain ditolak, dan pembeli yang menang berjalan lurus ke
+    // halaman bayar yang akan menolaknya. Menolak DI SINI membuat penjual tahu duluan, sebelum
+    // ada yang dirugikan — dan penolakannya membawa kode yang sama dengan jalur bayar.
+    assertP2pSaleAvailable(this.p2pMode(), {
+      id: existing.id,
+      ccNftAddress: existing.ccNftAddress,
+      escrowedAt: existing.escrowedAt,
+    });
 
     // Tandai ACCEPTED + tolak SEMUA offer bersaing. TIDAK memindahkan kartu & TIDAK menandai SOLD di
     // sini — listing tetap ACTIVE sampai pembeli bayar (klaim ACTIVE→SOLD di settlement).
@@ -647,7 +769,13 @@ export class MarketplaceService {
     };
   }
 
-  /** User memajang kartu miliknya. sellerId = user login. */
+  /**
+   * User memajang kartu miliknya. sellerId = user login — SEMUA baris yang lahir di sini adalah
+   * listing USER (listing Hoshi & katalog CC ditulis jalur lain: AdminService dan
+   * MarketSyncService, keduanya ber-sellerId null dan tidak lewat sini).
+   *
+   * B — SAAT ARMED, LISTING USER TANPA ASET ON-CHAIN TIDAK BOLEH LAHIR (lihat gerbang di bawah).
+   */
   async create(dto: CreateListingDto, user: AuthUser): Promise<ListingDto> {
     if (dto.cardId) {
       const card = await this.prisma.card.findUnique({
@@ -720,6 +848,13 @@ export class MarketplaceService {
         if (existing.sellerId !== user.id) {
           throw new ForbiddenException('Kartu ini bukan milik Anda.');
         }
+        // FAKTA `escrowedAt` hanya boleh dihapus dengan BUKTI kartunya sudah keluar dari escrow.
+        // Jalur ini memajang ulang baris LAMA — termasuk baris CANCELLED yang kartunya
+        // tertinggal di escrow karena pengembaliannya gagal — jadi ia digerbang persis sama
+        // dengan `relist()`. Tanpa ini, "jual lagi kartu hasil pull saya" menghapus satu-satunya
+        // petunjuk bahwa kartu itu masih ada di brankas.
+        await this.assertCardLeftEscrow(existing);
+
         // Memajang ulang = menerbitkan klaim grade yang sama ke pasar, jadi
         // syaratnya sama ketatnya dengan memajang baru: harus diverifikasi ulang
         // ke CC. Sekaligus memperbaiki baris lama yang dulu tersimpan dengan
@@ -739,7 +874,9 @@ export class MarketplaceService {
             buybackIdrx: dto.buyback ?? 0,
             buyerId: null,
             soldAt: null,
-            // Kartu ada di wallet penjual saat re-list (bukan escrow) → reset penanda escrow lama.
+            // Penanda escrow lama dihapus HANYA karena `assertCardLeftEscrow` di atas sudah
+            // membuktikan escrow tidak memegang kartunya. Baris ini tidak pernah dieksekusi
+            // untuk kartu yang masih (atau mungkin masih) ada di brankas.
             escrowedAt: null,
             // Relist = kesempatan memperbaiki baris lama. Kalau listing ini dulu
             // dibuat dengan grade default form ("PSA 10"), pajang ulang menimpanya
@@ -762,7 +899,7 @@ export class MarketplaceService {
             toLabel: null,
           });
         }
-        return toListingDto(relisted);
+        return toListingDto(relisted, this.dtoOpts());
       }
 
       // Grade kartu ini adalah FAKTA MILIK CC, bukan isian penjual. Klien juga
@@ -782,6 +919,41 @@ export class MarketplaceService {
     if (!gradeData) {
       throw new BadRequestException(
         'Grade kartu wajib diisi (grade, grader, gradeScore).',
+      );
+    }
+
+    // ┌──────────────────────────────────────────────────────────────────────────────────────┐
+    // │ B — SAAT ARMED, LISTING USER TANPA ASET ON-CHAIN DITOLAK DI TITIK LAHIRNYA.          │
+    // └──────────────────────────────────────────────────────────────────────────────────────┘
+    //
+    // Inilah asal populasi buntu yang dihitung `unescrowedActiveCount` dan yang runbook-nya
+    // menyuruh operator bersihkan SEBELUM menyalakan HOSHI_P2P_ENABLED: `POST /marketplace`
+    // TANPA `fromPackMemo` membuat listing USER ber-ccNftAddress NULL. Membersihkannya sebelum
+    // arming tidak ada gunanya kalau aplikasinya mengisinya kembali sesudah arming.
+    //
+    // APA ARTINYA BARIS SEPERTI ITU SAAT ARMED: TIDAK ADA. Settlement real melakukan PERSIS satu
+    // hal on-chain — escrow memindahkan `ccNftAddress` ke pembeli — jadi tanpa aset on-chain
+    // kartunya tidak bisa dititipkan (prepareEscrow menolak), tidak bisa diserahkan
+    // (fulfilUserListing menolak dan me-refund), tidak muncul di feed publik, dan relist tidak
+    // bisa menolongnya. Satu-satunya hal yang pernah terjadi padanya adalah pemiliknya disuruh
+    // membatalkannya. Menolak SEKARANG menghemat perjalanan itu seluruhnya.
+    //
+    // YANG SENGAJA TIDAK IKUT TERKENA:
+    //   • MOCK / OFF — di sana listing user tanpa aset on-chain SAH: settlement mock tidak pernah
+    //     menyentuh on-chain, dan saat OFF tidak ada tagihan P2P yang boleh terbit sama sekali.
+    //     Staging & demo devnet karena itu tidak berubah satu langkah pun.
+    //   • Listing HOSHI & katalog CC — bukan lahir di sini (sellerId-nya null; lihat header).
+    //   • Kartu hasil pull — `ccNftAddress` terisi dari CcPackPurchase.nftAddress di atas.
+    if (this.p2pMode() === 'ARMED' && !ccNftAddress) {
+      throw p2pNoEffectError(
+        HttpStatus.CONFLICT,
+        P2P_ERROR_CODE.LISTING_NOT_ESCROWED,
+        'Selama jual-beli antar pengguna aktif, yang bisa dipajang hanyalah kartu yang punya ' +
+          'aset on-chain — yaitu kartu hasil pull di Vault Anda. Kartu yang diketik manual ' +
+          'tidak punya aset yang bisa dititipkan ke brankas (escrow) Hoshi maupun diserahkan ' +
+          'ke pembeli, jadi listing-nya tidak akan pernah bisa dibeli. Pilih kartunya dari ' +
+          'Vault (hasil pull) untuk memajangnya. Tidak ada listing yang dibuat dan tidak ada ' +
+          'biaya yang keluar.',
       );
     }
 
@@ -844,7 +1016,7 @@ export class MarketplaceService {
       });
     }
 
-    return toListingDto(row);
+    return toListingDto(row, this.dtoOpts());
   }
 
   /**
@@ -885,7 +1057,7 @@ export class MarketplaceService {
       },
       include: { nft: true },
     });
-    return toListingDto(row);
+    return toListingDto(row, this.dtoOpts());
   }
 
   /**
@@ -932,6 +1104,21 @@ export class MarketplaceService {
       throw new BadRequestException(
         'Kartu ini dijual lewat pembayaran Rupiah — gunakan "Beli via Rupiah", bukan jalur ini.',
       );
+    }
+    // B — sisi lain dari gerbang yang sama. Di atas menolak listing yang BER-escrow; ini menolak
+    // listing user yang SEHARUSNYA ber-escrow tapi tidak (dibuat sebelum arming). Tanpa ini,
+    // devnet-armed masih bisa me-mint NFT BARU ke "pembeli" untuk kartu yang aslinya tetap di
+    // wallet penjual — dua aset untuk satu kartu fisik, persis bug yang escrow ada untuk mencegah.
+    // assertDemoOnly di atas menutup mainnet; gerbang ini menutup devnet yang sudah armed.
+    // SENGAJA paruh-B saja (assertEscrowBackedIfRequired, bukan assertP2pSaleAvailable): jalur
+    // ini tidak menerbitkan tagihan, jadi "fitur P2P mati" bukan alasan untuk menolaknya — itu
+    // justru keadaan NORMAL demo devnet yang jalur ini memang ada untuk melayaninya.
+    if (existing.sellerId) {
+      assertEscrowBackedIfRequired(this.p2pMode(), {
+        id: existing.id,
+        ccNftAddress: existing.ccNftAddress,
+        escrowedAt: existing.escrowedAt,
+      });
     }
 
     // Snapshot state pra-beli. Kartu yang di-relist sudah punya buyerId (owner
@@ -997,7 +1184,7 @@ export class MarketplaceService {
       toLabel: displayLabel(user, shortWallet(user.walletAddress)),
     });
 
-    return toListingDto(row);
+    return toListingDto(row, this.dtoOpts());
   }
 
   /**
@@ -1093,6 +1280,31 @@ export class MarketplaceService {
       this.escrow.isConfigured()
     ) {
       returnFromEscrow = await this.escrow.ownsAsset(existing.ccNftAddress);
+      if (returnFromEscrow) {
+        // BARU SAJA DIKETAHUI: escrow memang memegang kartu ini, padahal barisnya belum
+        // mencatatnya. CATAT SEKARANG, sebelum mencoba mengembalikannya — karena kalau
+        // pengembalian di bawah GAGAL, baris ini akan tertinggal CANCELLED tanpa satu pun
+        // jejak bahwa ada kartu di brankas, dan ia tidak akan muncul di daftar `held`,
+        // `stranded`, MAUPUN `unescrowedActive` milik operator. Fakta yang sudah kita ketahui
+        // tidak boleh hanya hidup di variabel lokal yang mati bersama request ini.
+        //
+        // Berpagar `escrowedAt: null` (tidak menimpa stempel asli submitEscrow) dan
+        // BEST-EFFORT: listing sudah aman CANCELLED, jadi kegagalan mencatat tidak boleh
+        // menggagalkan pembatalan — tapi ia di-log keras, karena yang hilang adalah petunjuk.
+        try {
+          await this.prisma.listing.updateMany({
+            where: { id, escrowedAt: null },
+            data: { escrowedAt: new Date() },
+          });
+        } catch (err) {
+          this.logger.error(
+            `cancel: GAGAL mencatat bahwa escrow memegang kartu ${existing.ccNftAddress} ` +
+              `(listing ${id}): ${err instanceof Error ? err.message : String(err)}. Kalau ` +
+              'pengembalian di bawah juga gagal, kartu ini TIDAK akan terlihat di dashboard ' +
+              'escrow — CEK ON-CHAIN.',
+          );
+        }
+      }
     }
     if (returnFromEscrow && existing.ccNftAddress) {
       try {
@@ -1139,14 +1351,42 @@ export class MarketplaceService {
       where: { id },
       include: { nft: true },
     });
-    return toListingDto(row);
+    return toListingDto(row, this.dtoOpts());
   }
 
   /**
-   * Owner menjual ulang kartu miliknya (SOLD/CANCELLED → ACTIVE, atomik).
-   * Kepemilikan = buyerId; sellerId dipindah ke owner supaya listMine & guard
-   * anti-self-buy mengacu ke pemilik saat ini. buyerId/nftId/soldAt DIPERTAHANKAN
-   * (owner masih memegang kartu sampai ada yang membeli).
+   * Owner memajang ulang kartu miliknya. SATU AKSI — ini jalur pemulihan yang ditunjuk
+   * setiap pesan `P2P_LISTING_NOT_ESCROWED` dan runbook operator.
+   *
+   * SIAPA "OWNER"-NYA — ini yang dulu salah, dan salahnya membuat pemulihan yang
+   * didokumentasikan TIDAK PERNAH BERJALAN untuk populasi yang ditujunya:
+   *   • listing yang PERNAH TERJUAL       → pemiliknya `buyerId` (pembeli pegang kartunya);
+   *   • listing yang BELUM PERNAH TERJUAL → `buyerId` MASIH NULL (create() tidak pernah
+   *     mengisinya), jadi pemiliknya `sellerId`.
+   * Versi lama HANYA menerima `buyerId === user.id`, sehingga setiap listing yang dibuat-
+   * dan-belum-pernah-terjual — yaitu SELURUH populasi "belum di-escrow" — dijawab
+   * 400 "Only the owner can list this card." Satu-satunya jalan yang tersisa adalah cancel
+   * lalu `POST /marketplace` dengan fromPackMemo, yang menjalankan ULANG `ccListingAttrs()`
+   * dan bisa gagal 422 karena CC lambat / grade tak didukung — pemulihan yang bisa gagal
+   * karena sebab yang sama sekali tidak berhubungan dengan escrow.
+   *
+   * KENAPA RELIST TIDAK PERNAH MENYENTUH CC: atribut kartu (grade/set/serial) sudah
+   * tersimpan di baris listing dan TIDAK diubah di sini. Relist hanya memindahkan status +
+   * harga. Jadi jalur pemulihan ini tidak bisa gagal karena RPC CollectorCrypt.
+   *
+   * ACTIVE → PENDING_ESCROW DIIZINKAN, tapi HANYA untuk itu (lihat `reEscrowActive` di
+   * bawah): listing user yang saat armed belum escrow-backed memang harus bisa dipulihkan
+   * tanpa dibatalkan dulu. Perubahan harga listing ACTIVE yang sehat tetap lewat PATCH.
+   *
+   * Kepemilikan ditegakkan LAGI di WHERE `updateMany`-nya (atomik, dan tidak pernah lebih
+   * longgar dari pemeriksaan di atasnya). buyerId/nftId/soldAt DIPERTAHANKAN (owner masih
+   * memegang kartu sampai ada yang membeli).
+   *
+   * SATU HAL YANG TIDAK BOLEH DILAKUKAN RELIST: menghapus fakta `escrowedAt` tanpa bukti kartu
+   * itu sudah keluar dari escrow — lihat `assertCardLeftEscrow`. Pelonggaran kepemilikan di atas
+   * membuat baris "stranded" (CANCELLED tapi kartunya gagal dikembalikan dari escrow) ikut
+   * masuk ke jalur ini, dan menghapus faktanya membuat kartu yang benar-benar dipegang escrow
+   * lenyap dari SEMUA daftar operator.
    */
   async relist(
     id: string,
@@ -1155,29 +1395,104 @@ export class MarketplaceService {
   ): Promise<ListingDto> {
     const existing = await this.prisma.listing.findUnique({ where: { id } });
     if (!existing) throw new NotFoundException('Listing tidak ditemukan.');
-    if (existing.buyerId !== user.id) {
+    // Pemilik = pembeli kalau kartunya pernah terjual, penjual kalau belum pernah. TIDAK
+    // lebih longgar dari sebelumnya untuk baris yang pernah terjual: di sana `buyerId`
+    // terisi, jadi cabang pertama yang berlaku dan penjual lama tidak bisa mengambilnya.
+    const ownedByCaller =
+      existing.buyerId != null
+        ? existing.buyerId === user.id
+        : existing.sellerId === user.id;
+    if (!ownedByCaller) {
       throw new BadRequestException('Only the owner can list this card.');
     }
-    if (existing.status === ListingStatus.ACTIVE) {
+
+    // Real P2P armed → kartu harus (kembali) masuk escrow sebelum bisa dibeli →
+    // PENDING_ESCROW. Mock/unarmed → langsung ACTIVE.
+    const pendingEscrow = this.listingNeedsEscrow(existing.ccNftAddress);
+    // SATU-SATUNYA alasan listing ACTIVE boleh di-relist: memindahkannya ke PENDING_ESCROW
+    // supaya kartunya bisa dititipkan. `escrowedAt == null` di sini BUKAN hiasan — tanpa
+    // itu relist bisa menarik listing yang kartunya SUDAH di escrow keluar dari feed, dan
+    // itu bukan pemulihan.
+    const reEscrowActive =
+      existing.status === ListingStatus.ACTIVE &&
+      pendingEscrow &&
+      existing.escrowedAt == null;
+    if (existing.status === ListingStatus.ACTIVE && !reEscrowActive) {
+      // Listing USER tanpa aset on-chain saat armed: tidak ada kartu untuk dititipkan,
+      // jadi relist tidak akan pernah menolongnya. Katakan apa adanya, dengan kode kontrak
+      // yang sama yang dipakai gerbang beli — bukan "already active", yang menyesatkan.
+      if (
+        this.p2pMode() === 'ARMED' &&
+        existing.sellerId != null &&
+        existing.ccNftAddress == null
+      ) {
+        throw p2pNoEffectError(
+          HttpStatus.CONFLICT,
+          P2P_ERROR_CODE.LISTING_NOT_ESCROWED,
+          'Kartu ini tidak punya aset on-chain, jadi tidak bisa dititipkan ke brankas ' +
+            '(escrow) dan tidak bisa dijual lewat jalur jual-beli antar pengguna. Memajang ' +
+            'ulang tidak akan mengubah itu — tarik saja listing ini.',
+          id,
+        );
+      }
       throw new BadRequestException('Listing is already active.');
     }
-    // PENDING_ESCROW BOLEH di-relist ulang: kalau penjual menolak/gagal tanda tangan transfer→escrow,
-    // listing tersangkut PENDING_ESCROW; relist ulang (dari modal yang sama) menerbitkannya kembali &
-    // memicu prompt tanda tangan lagi — tanpa ini kartu hasil-beli jadi tak bisa dijual selamanya.
-    // Kartu ada di wallet pemilik (setelah beli/cancel/reject). Real P2P armed → harus masuk escrow
-    // lagi sebelum bisa dibeli → PENDING_ESCROW. Mock/unarmed → langsung ACTIVE.
-    const pendingEscrow = this.listingNeedsEscrow(existing.ccNftAddress);
+    // ┌──────────────────────────────────────────────────────────────────────────────────────┐
+    // │ SEBELUM APA PUN DITULIS: BOLEHKAH FAKTA `escrowedAt` BARIS INI DIHAPUS?              │
+    // └──────────────────────────────────────────────────────────────────────────────────────┘
+    //
+    // Aturan kepemilikan di atas SENGAJA lebih longgar dari versi lama (`buyerId === user.id`
+    // saja), karena versi lama tidak pernah bisa memulihkan listing yang BELUM PERNAH terjual.
+    // Tapi pelonggaran itu membuka pintu ke satu populasi yang dulu tertutup secara KEBETULAN:
+    // baris CANCELLED yang `escrowedAt`-nya MASIH ter-set — yaitu baris yang `cancel` SENGAJA
+    // tinggalkan ketika pengembalian kartu dari escrow GAGAL, dan yang jadi isi daftar
+    // `stranded` operator. Memajangnya ulang dulu menulis `escrowedAt: null` begitu saja, dan
+    // sesudah itu kartunya — yang on-chain MASIH di wallet escrow — tidak muncul di SATU PUN
+    // dari tiga daftar operator. Aksi penjual yang paling biasa menghapus bukti terakhirnya.
+    //
+    // Letaknya SESUDAH penolakan-penolakan di atas dan SEBELUM tulisan di bawah, dan itu
+    // disengaja: listing ACTIVE yang sehat (kartunya memang di escrow — keadaan NORMAL) sudah
+    // dijawab "sudah aktif, ubah harga lewat PATCH" tanpa menyentuh RPC sama sekali. Yang sampai
+    // ke sini hanyalah baris yang benar-benar akan DITULIS ULANG.
+    //
+    // Yang salah bukan "relist", melainkan MENGHAPUS FAKTA TANPA BUKTI. Lihat
+    // `assertCardLeftEscrow`.
+    await this.assertCardLeftEscrow(existing);
+
+    // PENDING_ESCROW BOLEH di-relist ulang: kalau penjual menolak/gagal tanda tangan
+    // transfer→escrow, listing tersangkut PENDING_ESCROW; relist ulang (dari modal yang
+    // sama) menerbitkannya kembali & memicu prompt tanda tangan lagi — tanpa ini kartu
+    // hasil-beli jadi tak bisa dijual selamanya. Kartu ada di wallet pemilik.
+    //
+    // KLAIM ATOMIK: predikat kepemilikan di WHERE ini adalah predikat yang SAMA dengan
+    // `ownedByCaller` di atas — bukan versi yang lebih longgar. Cabang `buyerId: null`
+    // menuntut sekaligus bahwa baris itu memang BELUM PERNAH TERJUAL, sehingga satu
+    // pembelian yang mendarat di antara pembacaan dan penulisan membuat klaim ini GAGAL
+    // (count 0), bukan menimpanya.
     const relisted = await this.prisma.listing.updateMany({
       where: {
         id,
-        buyerId: user.id,
-        status: {
-          in: [
-            ListingStatus.SOLD,
-            ListingStatus.CANCELLED,
-            ListingStatus.PENDING_ESCROW,
-          ],
-        },
+        ...(existing.buyerId != null
+          ? { buyerId: user.id }
+          : { buyerId: null, sellerId: user.id }),
+        // FAKTA escrow yang keputusan di atas bersandar padanya, dipagar di WHERE: kalau ia
+        // BERUBAH antara pembacaan dan penulisan — submitEscrow menang balapan dan men-stamp
+        // `escrowedAt` — klaim ini GAGAL (count 0), bukan menimpa fakta yang baru saja lahir.
+        // Ini juga yang membuat bukti "kartu sudah keluar dari escrow" tidak bisa basi diam-diam.
+        escrowedAt: existing.escrowedAt ?? null,
+        // ACTIVE hanya lewat jalur re-escrow (dan `reEscrowActive` sendiri menuntut escrowedAt
+        // null, yang dipagar baris di atas).
+        ...(reEscrowActive
+          ? { status: ListingStatus.ACTIVE }
+          : {
+              status: {
+                in: [
+                  ListingStatus.SOLD,
+                  ListingStatus.CANCELLED,
+                  ListingStatus.PENDING_ESCROW,
+                ],
+              },
+            }),
       },
       data: {
         status: pendingEscrow
@@ -1189,9 +1504,13 @@ export class MarketplaceService {
         expectedValueIdrx: dto.expectedValue ?? existing.expectedValueIdrx,
         buybackIdrx: dto.buyback ?? existing.buybackIdrx,
         listedAt: new Date(),
-        // Kartu ADA DI WALLET PEMILIK saat relist (bukan escrow) → hapus penanda escrow lama supaya
-        // cancel berikutnya tak salah mencoba mengembalikan kartu yang tak ada di escrow. Kalau
-        // butuh escrow lagi (PENDING_ESCROW), submitEscrow yang men-set ulang setelah terkonfirmasi.
+        // Penanda escrow lama dihapus supaya cancel berikutnya tak salah mencoba mengembalikan
+        // kartu yang tak ada di escrow; kalau butuh escrow lagi (PENDING_ESCROW), submitEscrow
+        // yang men-set ulang setelah terkonfirmasi.
+        //
+        // Baris ini hanya pernah dieksekusi SESUDAH `assertCardLeftEscrow` di atas membuktikan
+        // escrow tidak memegang kartunya — bukan karena "biasanya kartu ada di wallet pemilik
+        // saat relist". Asumsi itulah yang dulu menghapus satu-satunya petunjuk kartu stranded.
         escrowedAt: null,
       },
     });
@@ -1217,6 +1536,7 @@ export class MarketplaceService {
         where: { id },
         include: { nft: true },
       }),
+      this.dtoOpts(),
     );
   }
 
@@ -1249,9 +1569,14 @@ export class MarketplaceService {
         'Listing tidak punya aset on-chain untuk di-escrow.',
       );
     }
+    // listingId + sellerId dioper untuk LEDGER SPONSOR GAS (C): wallet escrow yang membayar fee
+    // transaksi ini, dan plafon per-penjual / 24 jam dihitung dari ledger itu. Penjual TETAP
+    // authority-nya — kartunya tidak bisa berpindah tanpa tanda tangannya.
     const serializedTransaction = await this.escrow.buildTransferToEscrowTx({
       assetAddress: listing.ccNftAddress,
       ownerWallet: user.walletAddress,
+      listingId: listing.id,
+      sellerId: user.id,
     });
     return { serializedTransaction };
   }
@@ -1287,8 +1612,11 @@ export class MarketplaceService {
     // Idempoten: kalau kartu SUDAH di escrow, jangan siarkan ulang (blockhash pasti kedaluwarsa /
     // "already processed") — cukup aktifkan. Kalau belum, siarkan tx bertanda tangan penjual.
     const alreadyEscrowed = await this.escrow.ownsAsset(listing.ccNftAddress);
+    let escrowSignature: string | null = null;
     if (!alreadyEscrowed) {
-      await this.escrow.broadcastSignedToEscrow(dto.signedTransaction);
+      escrowSignature = await this.escrow.broadcastSignedToEscrow(
+        dto.signedTransaction,
+      );
 
       // WAJIB: verifikasi escrow BENAR-BENAR memegang kartunya sebelum meng-ACTIVE-kan. dto adalah
       // input klien — penjual bisa saja menyiarkan transaksi LAIN yang confirm tapi tak memindah
@@ -1324,6 +1652,29 @@ export class MarketplaceService {
       );
     }
 
+    // Pembukuan sponsor gas (C): tandai kewajiban gas listing ini BENAR-BENAR terpakai.
+    //
+    // Yang dioper adalah SIGNATURE transaksi yang barusan disiarkan, BUKAN listingId: hanya
+    // signature yang bisa menunjuk sponsorship yang SUNGGUH membayarinya. Penitipan yang jatuh
+    // ke jalur mundur "penjual bayar gas" tidak punya baris ledger sama sekali, dan signature-nya
+    // tidak akan cocok dengan baris mana pun → nol yang distempel (dulu ia menstempel sponsorship
+    // menggantung milik listing yang sama, dengan signature yang escrow tak pernah membayarnya).
+    //
+    // BEST-EFFORT dan SENGAJA dibungkus try/catch: kartunya sudah mendarat di escrow dan listing
+    // sudah ACTIVE — kegagalan mencatat tidak boleh membatalkan apa pun. Plafon tidak bergantung
+    // pada baris ini (ia menghitung yang DITERBITKAN), jadi kegagalan di sini tidak melonggarkan
+    // pagar apa pun; yang hilang cuma satu baris di dashboard admin.
+    if (escrowSignature) {
+      try {
+        await this.escrow.noteSponsorshipConsumed(escrowSignature);
+      } catch (err) {
+        this.logger.warn(
+          `submitEscrow: gagal menandai sponsorship listing ${id} terpakai: ` +
+            `${err instanceof Error ? err.message : String(err)} (tidak mempengaruhi escrow).`,
+        );
+      }
+    }
+
     await this.recordActivity({
       type: ActivityType.LISTED_CARD,
       listing,
@@ -1339,6 +1690,7 @@ export class MarketplaceService {
         where: { id },
         include: { nft: true },
       }),
+      this.dtoOpts(),
     );
   }
 
