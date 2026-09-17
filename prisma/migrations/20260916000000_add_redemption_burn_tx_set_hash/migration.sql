@@ -1,0 +1,13 @@
+-- Identitas set transaksi burn TERAKHIR yang diterbitkan untuk satu redemption.
+--
+-- Dipakai CcShippingService.submitBurn untuk menolak batch BASI secara LOKAL, sebelum klaim atomik
+-- FUNDED -> BURN_SUBMITTED dan sebelum CollectorCrypt dipanggil. Tanpa ini, dua modal yang
+-- sama-sama memanggil /re-prepare bisa membuat user menyetujui prompt wallet yang lebih tua; CC
+-- menjawab 403 "The transactions submitted are not the complete set this server issued", 403 itu
+-- TIDAK punya jaminan "nothing was burned" di dokumen CC, jadi barisnya nyangkut di BURN_SUBMITTED
+-- tanpa jalan keluar otomatis.
+--
+-- BACKWARD-COMPATIBLE: kolom NULLABLE tanpa default. Semua baris yang sudah ada tetap NULL, dan
+-- submitBurn memperlakukan NULL sebagai "tidak ada identitas tersimpan" -> pemeriksaan dilewati,
+-- perilakunya PERSIS seperti sebelum kolom ini ada. Tidak ada backfill, tidak ada rewrite tabel.
+ALTER TABLE "card_redemptions" ADD COLUMN "burnTxSetHash" TEXT;

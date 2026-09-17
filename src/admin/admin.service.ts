@@ -27,6 +27,8 @@ import {
 } from '@prisma/client';
 import { MarketplaceService } from '../marketplace/marketplace.service';
 import { PrismaService } from '../prisma/prisma.service';
+import { recordShippingRefundDebts } from '../payments/shipping-refund-debt';
+import { appendBoundedNote, NOTE_MAX } from '../common/append-note';
 import { AdminCreateListingDto } from './dto/admin-create-listing.dto';
 import { AdminUpdateListingDto } from './dto/admin-update-listing.dto';
 import { CreateContactMessageDto } from './dto/contact-message.dto';
@@ -149,9 +151,42 @@ export class AdminService {
    *    boleh cuma RESOLUSI MANUAL: menandai funding yang ditinggalkan user sebagai RECLAIM_DUE
    *    (USDC sudah/mungkin keluar → refundSafe=false, JANGAN refund Rupiah; reclaim USDC on-chain).
    *
-   * Status yang tak ada di peta transisi (READY_TO_FUND, BURN_SUBMITTED, IN_TRANSIT, DELIVERED,
-   * REFUND_DUE, RECLAIM_DUE, SHIP_FAILED_POST_BURN) SENGAJA tak bisa digerakkan admin lewat endpoint
-   * ini — mereka milik alur user-signed / poll CC / penyelesaian refund.
+   * B1 — SETIAP STATUS PEMBLOKIR WAJIB PUNYA JALAN KELUAR. Memblokir tanpa jalan keluar = kunci
+   * kartu PERMANEN, dan tiga status dulu tidak punya satu pun:
+   *   - SHIPPED               -> DELIVERED : penutupan jalur record-only (kartunya sudah sampai).
+   *   - RECLAIM_DUE           -> CANCELED  : ops SUDAH mereklaim/menutup USDC-nya. Kartunya tidak
+   *                                          pernah dibakar, jadi mint-nya memang boleh hidup lagi.
+   *                                          refundSafe TIDAK disentuh (tetap false) — menutup
+   *                                          kasus BUKAN berarti Rupiah jadi bisa di-refund.
+   *   - SHIP_FAILED_POST_BURN -> DELIVERED : kasus support tuntas dan kartunya benar-benar sampai.
+   *   - IN_TRANSIT            -> DELIVERED : B2 — lihat blok di bawah. Satu-satunya sel matriks
+   *                                          yang jalan keluarnya dulu BUKAN milik kita.
+   *
+   * ┌─ B2 — SEBUAH STATUS TIDAK BOLEH BERGANTUNG PADA NIAT BAIK PIHAK KETIGA ────────────────────┐
+   * │ IN_TRANSIT dulu TIDAK punya kunci di peta ini: satu-satunya jalan keluarnya adalah poll    │
+   * │ status CC menjawab `Delivered`. Kalau CC memarkir shipment di `Shipped` (mapCcShipmentStatus│
+   * │ memetakannya ke IN_TRANSIT — tidak memajukan apa pun), atau GET /outbound-shipment/:id      │
+   * │ mulai menjawab 200-body-kosong "id tak dikenal" (refreshStatus sengaja TIDAK menulis apa pun│
+   * │ pada kasus itu), barisnya tersangkut SELAMANYA — dan `nftAddress`-nya ikut menahan indeks   │
+   * │ unik yang dilebarkan, jadi mint itu tidak bisa diminta kirim lagi.                          │
+   * │ NOL UANG dipertaruhkan (IN_TRANSIT = NFT-nya memang SUDAH dibakar, jadi tidak ada yang bisa │
+   * │ menebusnya dua kali) — yang dipertaruhkan adalah KENDALI. Operator yang sudah memastikan    │
+   * │ kartunya sampai sekarang bisa menutupnya sendiri, tanpa mengedit Postgres.                  │
+   * └────────────────────────────────────────────────────────────────────────────────────────────┘
+   *
+   * Status yang tetap tak bisa digerakkan endpoint ini (AWAITING_PAYMENT, BURN_SUBMITTED,
+   * DELIVERED, REFUND_DUE, CANCELED, dan READY_TO_FUND) SENGAJA punya rute sendiri,
+   * bukan tanpa rute:
+   *   - AWAITING_PAYMENT-> CANCELED   : POST /admin/redemptions/:id/cancel-awaiting-payment
+   *                                     (wajib beralasan; melaporkan utang ongkir yang tersisa).
+   *   - BURN_SUBMITTED  -> FUNDED     : POST /admin/redemptions/:id/recover-burn-submitted
+   *                                     (wajib beralasan + pernyataan verifikasi ke CC).
+   *   - READY_TO_FUND   -> REFUND_DUE : POST /admin/redemptions/:id/settle-refund-due
+   *                                     (wajib beralasan; satu-satunya penulis REFUND_DUE).
+   *   - DELIVERED / REFUND_DUE / CANCELED: terminal, tidak memblokir apa pun.
+   *
+   * IN_TRANSIT kini punya DUA jalan keluar: poll shipment CC (CcShippingService.refreshStatus →
+   * `Delivered`) yang OTOMATIS tapi MILIK PIHAK KETIGA, dan PATCH status ini yang MILIK KITA.
    */
   async updateRedemptionStatus(id: string, status: RedemptionStatus) {
     const row = await this.prisma.cardRedemption.findUnique({ where: { id } });
@@ -159,7 +194,7 @@ export class AdminService {
       throw new NotFoundException('Permintaan kirim tidak ditemukan.');
     }
     // Partial: status yang tak tercantum → tak punya transisi admin (default []). Ini yang menutup
-    // BURN_SUBMITTED/IN_TRANSIT/DELIVERED dst. dari sentuhan admin, sekaligus menyenangkan tipe
+    // BURN_SUBMITTED/DELIVERED dst. dari sentuhan admin, sekaligus menyenangkan tipe
     // (enum RedemptionStatus kini punya banyak nilai jalur-real).
     const allowed: Partial<Record<RedemptionStatus, RedemptionStatus[]>> = {
       [RedemptionStatus.REQUESTED]: [
@@ -171,10 +206,22 @@ export class AdminService {
         RedemptionStatus.SHIPPED,
         RedemptionStatus.CANCELED,
       ],
+      // B1: penutupan jalur record-only. Tanpa ini SHIPPED memblokir mint-nya selamanya.
+      [RedemptionStatus.SHIPPED]: [RedemptionStatus.DELIVERED],
       // Resolusi manual jalur real: funding yang ditinggalkan user → RECLAIM_DUE (USDC sudah/mungkin
       // keluar; JANGAN refund Rupiah, reclaim USDC on-chain manual).
       [RedemptionStatus.FUNDING]: [RedemptionStatus.RECLAIM_DUE],
       [RedemptionStatus.FUNDED]: [RedemptionStatus.RECLAIM_DUE],
+      // B1: penutupan RECLAIM_DUE sesudah USDC-nya benar-benar direklaim/ditulis-rugi. Kartunya
+      // TIDAK pernah dibakar (itulah arti RECLAIM_DUE), jadi mint-nya memang boleh diminta lagi.
+      // refundSafe TIDAK ikut ditulis di sini: ia tetap false, dan gerbang refund tetap menolak.
+      [RedemptionStatus.RECLAIM_DUE]: [RedemptionStatus.CANCELED],
+      // B1: penutupan kasus support pasca-burn yang akhirnya sampai ke user.
+      [RedemptionStatus.SHIP_FAILED_POST_BURN]: [RedemptionStatus.DELIVERED],
+      // B2: penutupan yang DIKENDALIKAN KITA untuk kiriman yang diparkir CC di `Shipped`.
+      // Tidak menyentuh uang: IN_TRANSIT berarti NFT-nya sudah dibakar, jadi tidak ada yang bisa
+      // ditebus dua kali dan tidak ada Rupiah yang jadi bisa di-refund gara-gara transisi ini.
+      [RedemptionStatus.IN_TRANSIT]: [RedemptionStatus.DELIVERED],
     };
     if (!(allowed[row.status] ?? []).includes(status)) {
       throw new BadRequestException(
@@ -189,18 +236,400 @@ export class AdminService {
     }
     // RECLAIM_DUE: USDC treasury sudah/mungkin didanai ke wallet user tapi burn tak dituntaskan →
     // refundSafe=false supaya gerbang refund tak pernah membalikkan Rupiah (rugi dobel).
+    // Perhatikan ARAH-nya: hanya MASUK ke RECLAIM_DUE yang menulis false. KELUAR darinya
+    // (→ CANCELED) sengaja TIDAK menulis apa pun — refundSafe tetap false. Tidak ada satu pun
+    // cabang di method ini yang pernah menulis refundSafe=true.
     const extra =
       status === RedemptionStatus.RECLAIM_DUE ? { refundSafe: false } : {};
+    if (
+      row.status === RedemptionStatus.RECLAIM_DUE &&
+      status === RedemptionStatus.CANCELED
+    ) {
+      this.logger.error(
+        `Redemption ${id}: RECLAIM_DUE → CANCELED (penutupan manual). Operator MENYATAKAN USDC ` +
+          `ongkir sudah direklaim atau ditulis-rugi. refundSafe TETAP ${row.refundSafe} — ` +
+          'penutupan ini BUKAN izin me-refund Rupiah. Kartunya tidak pernah dibakar, jadi mint ' +
+          `${row.nftAddress} kembali bisa diminta kirim.`,
+      );
+    }
     if (status === RedemptionStatus.RECLAIM_DUE) {
       this.logger.warn(
         `Redemption ${id} → RECLAIM_DUE (resolusi manual). USDC ongkir sudah/mungkin di wallet ` +
           `user — reclaim on-chain; JANGAN refund Rupiah (refundSafe=false).`,
       );
     }
+    // B2: penutupan MANUAL sebuah kiriman jalur-real. Poll CC yang biasanya melakukannya tidak
+    // pernah menjawab `Delivered` untuk baris ini, jadi operator MENYATAKAN kartunya sampai.
+    // refundSafe TIDAK disentuh: menutup kasus BUKAN izin membalikkan Rupiah.
+    if (
+      row.status === RedemptionStatus.IN_TRANSIT &&
+      status === RedemptionStatus.DELIVERED
+    ) {
+      this.logger.warn(
+        `Redemption ${id}: IN_TRANSIT → DELIVERED (penutupan MANUAL, bukan dari poll CC). ` +
+          `Shipment CC ${row.outboundShipmentId ?? 'tidak ada'}, nft ${row.nftAddress}, user ` +
+          `${row.userId}. Operator MENYATAKAN kiriman sudah sampai — CC tidak pernah menjawab ` +
+          `\`Delivered\`. refundSafe TETAP ${row.refundSafe}; NFT-nya memang sudah dibakar, jadi ` +
+          'mint ini tidak bisa (dan tidak boleh) diminta kirim lagi.',
+      );
+    }
     return this.prisma.cardRedemption.update({
       where: { id },
       data: { status, ...extra },
     });
+  }
+
+  /**
+   * PEMULIHAN MANUAL: kembalikan SATU baris yang nyangkut di BURN_SUBMITTED ke FUNDED.
+   *
+   * ⚠️ OPERATOR MENYATAKAN SUDAH MEMVERIFIKASI KE COLLECTORCRYPT BAHWA KARTUNYA BELUM DIBAKAR.
+   * Kalau ternyata sudah dibakar, aksi ini mengundang user menandatangani burn KEDUA untuk kartu
+   * yang sudah tidak ada. Verifikasi dulu lewat GET /outbound-shipment/:id atau
+   * support@collectorcrypt.com. Aksi ini TIDAK PERNAH membuat uang bisa di-refund: refundSafe
+   * DIPAKSA tetap false.
+   *
+   * KENAPA ADA: `updateRedemptionStatus` SENGAJA tidak bisa menggerakkan BURN_SUBMITTED — itu
+   * pilihan keamanan yang tetap berlaku. Tapi beberapa kegagalan burn mendarat di BURN_SUBMITTED
+   * tanpa jalan keluar otomatis (403 CC yang tidak membawa jaminan "nothing was burned"; pelepasan
+   * klaim ke FUNDED yang gagal), sementara reprepareBurn HANYA menerima FUNDED. Tanpa rute ini
+   * satu-satunya pilihan manusia adalah mengedit Postgres langsung.
+   *
+   * BUKAN endpoint "set status apa saja": HANYA transisi BURN_SUBMITTED -> FUNDED, tidak ada
+   * parameter status, dan wajib disertai alasan operator yang ikut disimpan di baris.
+   */
+  async recoverBurnSubmittedToFunded(
+    id: string,
+    note: string,
+    admin: { id: string; walletAddress: string; role: string },
+  ) {
+    const reason = (note ?? '').trim();
+    if (reason.length < 10) {
+      throw new BadRequestException(
+        'Alasan pemulihan wajib diisi (minimal 10 karakter) dan akan disimpan permanen di baris ini.',
+      );
+    }
+
+    const row = await this.prisma.cardRedemption.findUnique({ where: { id } });
+    if (!row) {
+      throw new NotFoundException('Permintaan kirim tidak ditemukan.');
+    }
+    if (row.status !== RedemptionStatus.BURN_SUBMITTED) {
+      throw new BadRequestException(
+        `Pemulihan ini HANYA untuk baris yang nyangkut di BURN_SUBMITTED — status sekarang ${row.status}.`,
+      );
+    }
+
+    const stamp = new Date().toISOString();
+    const persistedNote =
+      `[ADMIN RECOVER BURN_SUBMITTED->FUNDED ${stamp} oleh ${admin.id} ` +
+      `(${admin.walletAddress})] operator menyatakan sudah memverifikasi ke CollectorCrypt bahwa ` +
+      `kartu BELUM dibakar. Alasan: ${reason}`;
+
+    // Log KERAS dulu — supaya jejaknya ada bahkan kalau tulisan DB gagal setelah ini.
+    // B2: catatan SEBELUMNYA ikut di-log. Itu satu-satunya string yang membedakan "submitBurn LEG
+    // GAGAL" / "submitBurn INDETERMINATE" / "submitBurn DITOLAK CC tanpa membakar apa pun", dan
+    // dulu ia lenyap tanpa jejak karena aksi ini MENIMPA kolom note.
+    this.logger.error(
+      `PEMULIHAN MANUAL redemption ${id}: BURN_SUBMITTED -> FUNDED oleh admin ${admin.id} ` +
+        `(${admin.walletAddress}) pada ${stamp}. Shipment CC ${row.outboundShipmentId ?? 'tidak ada'}, ` +
+        `nft ${row.nftAddress}, user ${row.userId}. refundSafe TETAP false (uang TIDAK jadi bisa ` +
+        `di-refund). CATATAN SEBELUMNYA (penyebab baris ini nyangkut): ` +
+        `${row.note ?? '(kosong)'}. Alasan operator: ${reason}`,
+    );
+
+    // Berpagar status di updateMany: baris yang keburu bergerak (mis. poll CC memajukannya ke
+    // IN_TRANSIT/DELIVERED) TIDAK akan dimundurkan oleh balapan.
+    const moved = await this.prisma.cardRedemption.updateMany({
+      where: { id, status: RedemptionStatus.BURN_SUBMITTED },
+      data: {
+        status: RedemptionStatus.FUNDED,
+        // TIDAK PERNAH true. Uang treasury sudah pindah ke wallet user; pemulihan ini murni soal
+        // status baris, bukan soal uang.
+        refundSafe: false,
+        // B2 — MENAMBAH, BUKAN MENIMPA. `note` adalah satu-satunya bukti DURABEL kenapa baris ini
+        // nyangkut (log droplet dirotasi; baris DB tidak). Menimpanya di sini berarti aksi
+        // pemulihan menghapus penyebabnya — itulah cara aksi ini bisa MENUTUPI kerugian nyata:
+        // lewat efek samping, bukan lewat desain. Pemotongan membuang bagian TERTUA, tidak pernah
+        // alasan kegagalan yang terbaru.
+        note: appendBoundedNote(row.note, persistedNote, NOTE_MAX),
+      },
+    });
+    if (moved.count !== 1) {
+      throw new ConflictException(
+        'Baris sudah berpindah status sebelum pemulihan tereksekusi — muat ulang lalu cek lagi.',
+      );
+    }
+
+    const updated = await this.prisma.cardRedemption.findUnique({
+      where: { id },
+    });
+    return {
+      redemption: updated,
+      warning:
+        'Baris dikembalikan ke FUNDED. Dengan menjalankan ini Anda MENYATAKAN sudah memverifikasi ' +
+        'ke CollectorCrypt bahwa kartu ini BELUM dibakar. refundSafe tetap false — USDC ongkir ' +
+        'sudah ada di wallet user; JANGAN me-refund Rupiah-nya.',
+    };
+  }
+
+  /**
+   * B1 — SATU-SATUNYA JALAN KELUAR untuk READY_TO_FUND: tandai ongkir Rupiah sebagai UTANG REFUND.
+   *
+   * KENAPA ADA: READY_TO_FUND berarti Rupiah ongkir SUDAH LUNAS tapi USDC BELUM dikirim. Kalau
+   * pendanaan tidak pernah bisa dijalankan — assertCostWithinPaid menolak permanen karena harga CC
+   * bergerak melewati plafon slippage, atau user tidak pernah kembali — baris itu dulu tersangkut
+   * SELAMANYA: tidak ada transisi admin, tidak ada rute user, dan kartunya ikut terkunci karena
+   * READY_TO_FUND memblokir. Pesan error-nya bahkan menjanjikan "ongkir Rupiah bisa di-refund"
+   * padahal TIDAK ADA satu pun kode di repo ini yang bisa menindaklanjutinya.
+   *
+   * INI SATU-SATUNYA PENULIS RedemptionStatus.REFUND_DUE di seluruh repo.
+   *
+   * APA YANG ANDA NYATAKAN SEBAGAI OPERATOR DENGAN MENJALANKAN INI:
+   *   • Anda akan MENGEMBALIKAN Rupiah ongkir user DI LUAR SISTEM (IDRX/manual). Baris ini menjadi
+   *     catatan utang itu; tidak ada kode yang mengirim uangnya otomatis.
+   *   • Dan itu MEMANG boleh: di READY_TO_FUND NOL USDC treasury pernah bergerak. Itu bukan
+   *     kepercayaan, itu DIPERIKSA — fundingSignature WAJIB null dan refundSafe WAJIB true, dan
+   *     keduanya ikut jadi PREDIKAT pada tulisan berpagar di bawah. Satu saja menyimpang → ditolak,
+   *     karena itu berarti baris ini pernah menyentuh jalur pasca-danai dan Rupiah-nya TIDAK aman
+   *     di-refund (rugi dobel). Kasus seperti itu diselesaikan lewat RECLAIM_DUE, bukan lewat sini.
+   *
+   * refundSafe TIDAK DITULIS di sini. Ia sudah true dan diverifikasi true sebagai predikat, dan
+   * aturan repo ini mutlak: tidak ada satu pun tempat yang boleh MENULIS refundSafe=true.
+   *
+   * EFEK SAMPING YANG DISENGAJA: REFUND_DUE ada di TERMINAL_STATUSES, jadi mint-nya BEBAS lagi —
+   * user bisa meminta kirim ulang (dengan invoice ongkir baru) tanpa menunggu refundnya beres.
+   * BUKAN endpoint "set status apa saja": HANYA READY_TO_FUND -> REFUND_DUE, tanpa parameter
+   * status, wajib beralasan, dan alasannya DITAMBAHKAN ke catatan baris (tidak menimpa).
+   */
+  async settleReadyToFundAsRefundDue(
+    id: string,
+    note: string,
+    admin: { id: string; walletAddress: string; role: string },
+  ) {
+    const reason = (note ?? '').trim();
+    if (reason.length < 10) {
+      throw new BadRequestException(
+        'Alasan penyelesaian wajib diisi (minimal 10 karakter) dan akan disimpan permanen di baris ini.',
+      );
+    }
+
+    const row = await this.prisma.cardRedemption.findUnique({ where: { id } });
+    if (!row) {
+      throw new NotFoundException('Permintaan kirim tidak ditemukan.');
+    }
+    if (row.status !== RedemptionStatus.READY_TO_FUND) {
+      throw new BadRequestException(
+        'Penyelesaian refund ongkir ini HANYA untuk baris READY_TO_FUND (Rupiah lunas, USDC belum ' +
+          `dikirim) — status sekarang ${row.status}.`,
+      );
+    }
+    // FAIL-CLOSED. Dua kolom jejak PASCA-danai: kalau salah satunya menyimpang, baris ini pernah
+    // menyentuh jalur pendanaan dan Rupiah-nya TIDAK aman di-refund — apa pun status-nya sekarang.
+    if (row.fundingSignature !== null || row.refundSafe !== true) {
+      this.logger.error(
+        `Penyelesaian refund redemption ${id} DITOLAK: status READY_TO_FUND tapi membawa jejak ` +
+          `PASCA-danai (fundingSignature=${row.fundingSignature ?? 'null'}, ` +
+          `refundSafe=${row.refundSafe}). JANGAN refund Rupiah sebelum posisi USDC dicek on-chain.`,
+      );
+      throw new BadRequestException(
+        'Baris ini membawa jejak pendanaan USDC (fundingSignature/refundSafe). Refund Rupiah TIDAK ' +
+          'aman sampai posisi USDC dicek on-chain — selesaikan lewat RECLAIM_DUE, bukan lewat rute ini.',
+      );
+    }
+
+    // Order Rupiah-nya — supaya operator tahu PERSIS apa yang harus dikembalikan.
+    const order = row.paymentOrderId
+      ? await this.prisma.paymentOrder.findUnique({
+          where: { id: row.paymentOrderId },
+        })
+      : await this.prisma.paymentOrder.findFirst({
+          where: { redemptionId: id, packType: 'SHIPPING' },
+          orderBy: { createdAt: 'desc' },
+        });
+
+    const stamp = new Date().toISOString();
+    const persistedNote =
+      `[ADMIN SETTLE READY_TO_FUND->REFUND_DUE ${stamp} oleh ${admin.id} ` +
+      `(${admin.walletAddress})] ongkir Rupiah ${order?.merchantOrderId ?? 'order tidak ditemukan'} ` +
+      `(Rp ${order?.priceIdr ?? '?'}) dinyatakan sebagai UTANG REFUND; nol USDC treasury pernah ` +
+      `bergerak untuk baris ini. Alasan: ${reason}`;
+
+    // Log KERAS dulu — jejaknya ada bahkan kalau tulisan DB gagal setelah ini. Catatan SEBELUMNYA
+    // ikut di-log sebelum ditambahi (B2: jangan pernah menghilangkan bukti yang lama).
+    this.logger.error(
+      `UTANG REFUND ONGKIR redemption ${id}: READY_TO_FUND -> REFUND_DUE oleh admin ${admin.id} ` +
+        `(${admin.walletAddress}) pada ${stamp}. User ${row.userId}, nft ${row.nftAddress}, order ` +
+        `${order?.merchantOrderId ?? 'tidak ditemukan'} Rp ${order?.priceIdr ?? '?'}. refundSafe ` +
+        `TETAP true dan fundingSignature null → Rupiah ini BENAR-BENAR aman di-refund, dan operator ` +
+        `WAJIB mengembalikannya di luar sistem. CATATAN SEBELUMNYA: ${row.note ?? '(kosong)'}. ` +
+        `Alasan operator: ${reason}`,
+    );
+
+    // Tulisan BERPAGAR: predikatnya mengulang KETIGA syarat uang, jadi keputusan di atas tidak bisa
+    // basi karena balapan (mis. fundAndPrepare yang menang klaim READY_TO_FUND -> FUNDING).
+    // refundSafe DIBACA sebagai predikat, TIDAK PERNAH ditulis.
+    const moved = await this.prisma.cardRedemption.updateMany({
+      where: {
+        id,
+        status: RedemptionStatus.READY_TO_FUND,
+        fundingSignature: null,
+        refundSafe: true,
+      },
+      data: {
+        status: RedemptionStatus.REFUND_DUE,
+        processedAt: new Date(),
+        note: appendBoundedNote(row.note, persistedNote, NOTE_MAX),
+      },
+    });
+    if (moved.count !== 1) {
+      throw new ConflictException(
+        'Baris sudah berpindah status sebelum penyelesaian tereksekusi (mungkin pendanaan USDC ' +
+          'barusan dimulai) — muat ulang lalu cek lagi. JANGAN refund sebelum statusnya jelas.',
+      );
+    }
+
+    const updated = await this.prisma.cardRedemption.findUnique({
+      where: { id },
+    });
+    return {
+      redemption: updated,
+      rupiahOrder: order
+        ? {
+            merchantOrderId: order.merchantOrderId,
+            priceIdr: order.priceIdr,
+            status: order.status,
+            paidAt: order.paidAt,
+          }
+        : null,
+      warning:
+        'Baris ditandai REFUND_DUE. Di status READY_TO_FUND NOL USDC treasury pernah bergerak ' +
+        '(fundingSignature null + refundSafe true — diverifikasi sebagai SYARAT, bukan diasumsikan), ' +
+        'jadi ongkir Rupiah ini BENAR-BENAR aman di-refund. REFUND ITU HARUS ANDA LAKUKAN DI LUAR ' +
+        'SISTEM: tidak ada kode yang mengirim uangnya otomatis. Kartunya tidak pernah dibakar dan ' +
+        'mint-nya kini bebas — user boleh meminta kirim lagi dengan tagihan ongkir baru.',
+    };
+  }
+
+  /**
+   * B1 — JALAN KELUAR TERAKHIR untuk `AWAITING_PAYMENT`: batalkan barisnya (admin), apa pun status
+   * order ongkirnya.
+   *
+   * KENAPA ADA, PADAHAL USER SUDAH PUNYA TOMBOL BATAL. Tombol user sengaja menolak dua status order
+   * (PAID, FULFILLED) karena di sana pemenuhan otomatisnya masih hidup / sudah tuntas. Itu benar
+   * untuk tombol, tapi menyisakan kasus di mana TIDAK ADA yang bisa bergerak:
+   *   • user sudah pergi (ganti wallet, akun ditinggalkan) dan barisnya menahan mint selamanya;
+   *   • order PAID yang IDRX-nya tidak pernah bisa diverifikasi (mis. pin tak terbaca berulang),
+   *     jadi reconciler mengulang tanpa pernah konvergen.
+   * Tanpa rute ini, satu-satunya pilihan manusia adalah mengedit Postgres langsung — dan itulah
+   * bentuk kambuh yang sama untuk ketiga kalinya.
+   *
+   * PAGAR UANG (SAMA KETATNYA dengan rute admin lain):
+   *   • HANYA dari AWAITING_PAYMENT. Tidak ada parameter status; tidak bisa dipakai untuk apa pun lain.
+   *   • FAIL-CLOSED pada jejak PASCA-danai: fundingSignature WAJIB null dan refundSafe WAJIB true,
+   *     dan keduanya ikut jadi PREDIKAT tulisan berpagar. refundSafe DIBACA, TIDAK PERNAH DITULIS.
+   *   • Wajib beralasan (≥10 karakter) dan alasannya DITAMBAHKAN (bukan menimpa) ke catatan baris.
+   *
+   * KENAPA AMAN WALAU ONGKIRNYA SUDAH DIBAYAR: di AWAITING_PAYMENT baris redemption-nya NOL uang.
+   * Utang ongkir hidup di baris PaymentOrder, dan baris itu TIDAK ikut dibatalkan —
+   * `recordShippingRefundDebts` menjadikan yang macet di FULFILLING sebagai REFUND_DUE dan
+   * MELAPORKAN sisanya. Hasil laporannya ikut dikembalikan di respons ini supaya operator melihat
+   * PERSIS berapa Rupiah yang harus dikembalikan, bukan cuma "sudah dibatalkan".
+   */
+  async cancelAwaitingPayment(
+    id: string,
+    note: string,
+    admin: { id: string; walletAddress: string; role: string },
+  ) {
+    const reason = (note ?? '').trim();
+    if (reason.length < 10) {
+      throw new BadRequestException(
+        'Alasan pembatalan wajib diisi (minimal 10 karakter) dan akan disimpan permanen di baris ini.',
+      );
+    }
+
+    const row = await this.prisma.cardRedemption.findUnique({ where: { id } });
+    if (!row) {
+      throw new NotFoundException('Permintaan kirim tidak ditemukan.');
+    }
+    if (row.status !== RedemptionStatus.AWAITING_PAYMENT) {
+      throw new BadRequestException(
+        'Pembatalan ini HANYA untuk baris AWAITING_PAYMENT (tagihan ongkir terbit, baris ' +
+          `redemption belum menyentuh uang) — status sekarang ${row.status}.`,
+      );
+    }
+    // FAIL-CLOSED. Dua kolom jejak PASCA-danai: kalau salah satunya menyimpang, baris ini pernah
+    // menyentuh jalur pendanaan USDC dan TIDAK boleh ditutup lewat rute pra-danai ini.
+    if (row.fundingSignature !== null || row.refundSafe !== true) {
+      this.logger.error(
+        `Pembatalan admin redemption ${id} DITOLAK: status AWAITING_PAYMENT tapi membawa jejak ` +
+          `PASCA-danai (fundingSignature=${row.fundingSignature ?? 'null'}, ` +
+          `refundSafe=${row.refundSafe}). Selesaikan lewat RECLAIM_DUE, bukan lewat rute ini.`,
+      );
+      throw new BadRequestException(
+        'Baris ini membawa jejak pendanaan USDC (fundingSignature/refundSafe) padahal statusnya ' +
+          'AWAITING_PAYMENT. Jangan ditutup lewat rute ini — cek posisi USDC on-chain dulu.',
+      );
+    }
+
+    const stamp = new Date().toISOString();
+    const persistedNote =
+      `[ADMIN CANCEL AWAITING_PAYMENT->CANCELED ${stamp} oleh ${admin.id} ` +
+      `(${admin.walletAddress})] baris redemption nol uang; utang ongkir (bila ada) tetap ` +
+      `tercatat di PaymentOrder-nya sendiri. Alasan: ${reason}`;
+
+    // Log KERAS dulu — jejaknya ada bahkan kalau tulisan DB gagal setelah ini.
+    this.logger.error(
+      `PEMBATALAN ADMIN redemption ${id}: AWAITING_PAYMENT -> CANCELED oleh admin ${admin.id} ` +
+        `(${admin.walletAddress}) pada ${stamp}. User ${row.userId}, nft ${row.nftAddress}. ` +
+        `Mint-nya jadi BEBAS diminta kirim lagi. CATATAN SEBELUMNYA: ${row.note ?? '(kosong)'}. ` +
+        `Alasan operator: ${reason}`,
+    );
+
+    // Tulisan BERPAGAR: predikatnya mengulang KETIGA syarat, jadi keputusan di atas tidak bisa basi
+    // karena balapan (mis. fulfilShipping yang menang klaim AWAITING_PAYMENT -> READY_TO_FUND).
+    const moved = await this.prisma.cardRedemption.updateMany({
+      where: {
+        id,
+        status: RedemptionStatus.AWAITING_PAYMENT,
+        fundingSignature: null,
+        refundSafe: true,
+      },
+      data: {
+        status: RedemptionStatus.CANCELED,
+        processedAt: new Date(),
+        note: appendBoundedNote(row.note, persistedNote, NOTE_MAX),
+      },
+    });
+    if (moved.count !== 1) {
+      throw new ConflictException(
+        'Baris sudah berpindah status sebelum pembatalan tereksekusi (mungkin pembayaran ongkirnya ' +
+          'barusan masuk) — muat ulang lalu cek lagi.',
+      );
+    }
+
+    // PEMBUKUAN — sesudah pembatalan commit. Order ongkir yang macet di FULFILLING jadi REFUND_DUE;
+    // yang lain dilaporkan apa adanya. Tidak pernah melempar.
+    const shippingDebts = await recordShippingRefundDebts({
+      prisma: this.prisma,
+      logger: this.logger,
+      redemptionId: id,
+      actor: `admin ${admin.id}`,
+      reason,
+    });
+
+    const updated = await this.prisma.cardRedemption.findUnique({
+      where: { id },
+    });
+    return {
+      redemption: updated,
+      /** Tagihan ongkir yang terpengaruh + aksi operatornya. [] = nol Rupiah pernah mendarat. */
+      shippingDebts,
+      warning:
+        'Baris DIBATALKAN dan mint-nya kini bebas — user boleh meminta kirim lagi. Pembatalan ini ' +
+        'TIDAK menghapus tagihan ongkirnya: periksa `shippingDebts` di respons ini. Setiap order ' +
+        'yang tercatat REFUND_DUE dengan refundSafe=true WAJIB Anda kembalikan DI LUAR SISTEM — ' +
+        'tidak ada kode yang mengirim uangnya otomatis.',
+    };
   }
 
   /**

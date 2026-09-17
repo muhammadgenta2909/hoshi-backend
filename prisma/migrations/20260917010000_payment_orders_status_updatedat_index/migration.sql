@@ -1,0 +1,32 @@
+-- B2 — INDEX KOMPOSIT UNTUK SAPUAN EXPIRED (dan untuk sapuan FULFILLING yang macet).
+--
+-- APA YANG DILAKUKAN QUERY-NYA (src/payments/payments.service.ts, reconcile()):
+--
+--   sapuan EXPIRED    : WHERE status = 'EXPIRED'    AND "updatedAt" >= now() - 1 jam
+--                       ORDER BY "updatedAt" ASC LIMIT 25
+--   sapuan FULFILLING : WHERE status = 'FULFILLING' AND "updatedAt" <= cutoff
+--                       ORDER BY "updatedAt" ASC LIMIT 50
+--
+-- Sampai sekarang payment_orders hanya punya index SATU KOLOM ("status"). Dengan itu Postgres
+-- memungut SELURUH baris berstatus tersebut, lalu memfilter rentang waktunya dan MENGURUTKANNYA
+-- di memori — tiap tick, selamanya. Untuk status yang jumlah barisnya tumbuh monoton (EXPIRED
+-- adalah yang paling cepat tumbuh dari semuanya: setiap invoice yang tidak dibayar berakhir di
+-- sana dan tidak pernah pergi), biaya itu naik terus sementara jawabannya hampir selalu "tidak ada
+-- apa-apa". Index komposit ini membuat kedua predikat + ORDER BY-nya dilayani satu range scan.
+--
+-- KENAPA SEKARANG: sapuan EXPIRED berjalan tiap tick reconciler (default 120 detik). Ia MEMANG
+-- sudah dibatasi jendela satu jam di sisi aplikasi, tapi batas itu tidak menolong perencana query
+-- selama index-nya tidak memuat kolom yang dibatasi.
+--
+-- APA YANG TIDAK DILAKUKAN MIGRATION INI:
+--   • TIDAK menghapus "payment_orders_status_idx". Ia kini REDUNDAN secara pembacaan (prefiks dari
+--     index baru), tapi membuangnya adalah keputusan tersendiri dengan risikonya sendiri —
+--     lakukan sadar di pass terpisah, jangan sebagai efek samping penambahan ini.
+--   • TIDAK mengubah satu baris data pun, TIDAK mengubah kolom, TIDAK menyentuh status/refundSafe.
+--
+-- CATATAN OPERASI: CREATE INDEX (tanpa CONCURRENTLY, karena Prisma menjalankan migration di dalam
+-- transaksi) mengambil kunci tulis pada payment_orders selama pembuatannya. Pada tabel sebesar ini
+-- itu hitungan milidetik; kalau tabelnya kelak besar, jalankan versi CONCURRENTLY-nya di luar
+-- Prisma lebih dulu — "IF NOT EXISTS" di bawah membuat migration ini jadi no-op yang aman.
+CREATE INDEX IF NOT EXISTS "payment_orders_status_updatedAt_idx"
+  ON "payment_orders"("status", "updatedAt");

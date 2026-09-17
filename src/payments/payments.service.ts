@@ -103,10 +103,148 @@ const RECONCILE_BATCH_MAX = 50;
  */
 const RECONCILE_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 
+/**
+ * B1 — SABUK-DAN-BRETEL untuk balapan kedaluwarsa-vs-pembayaran: seberapa lama sesudah sebuah
+ * order JADI EXPIRED ia masih ikut diverifikasi ulang oleh reconciler.
+ *
+ * KENAPA ADA SAMA SEKALI: kedua jalur utang balapan ini (settleExpiredButPaid dan settleLostClaim)
+ * dipicu oleh SEBUAH CALLBACK. Callback IDRX dikirim TEPAT SEKALI dan tidak pernah diulang, jadi
+ * kalau callback-nya HILANG (deploy/OOM/502 tiga detik) tidak ada apa pun yang menyadari bahwa
+ * order EXPIRED itu sebenarnya DIBAYAR. Sapuan ini menghapus ketergantungan itu.
+ *
+ * KENAPA DIBATASI `updatedAt`, BUKAN `createdAt`: `updatedAt` adalah detik ketika barisnya
+ * benar-benar DITULIS jadi EXPIRED — awal jendela bahayanya. Satu jam sesudah itu, vonis terminal
+ * IDRX sendiri tidak akan berbalik jadi PAID, dan baris yang jujur-kedaluwarsa (mayoritas mutlak)
+ * berhenti dipoll selamanya alih-alih membebani History API tanpa batas. Baris yang MEMANG jadi
+ * utang keluar dari himpunan ini lebih awal lagi: statusnya berubah jadi REFUND_DUE, dan filter
+ * `status = EXPIRED` tidak melihatnya lagi → tidak mungkin ada utang kedua.
+ */
+const RECONCILE_EXPIRED_SWEEP_MS = 60 * 60 * 1000;
+
+/** Batas batch sapuan EXPIRED. TERPISAH dan lebih kecil: ia tidak boleh menyandera jatah order
+ *  PENDING/PAID yang masih bisa MAJU (yang itu menahan uang user yang belum jadi apa-apa). */
+const RECONCILE_EXPIRED_BATCH_MAX = 25;
+
+/**
+ * B2 — JEDA MINIMAL sebelum baris EXPIRED yang jawabannya BELUM terminal ditanya ulang.
+ *
+ * Sapuan EXPIRED memilih baris yang sama selama SATU JAM penuh (baris yang jujur-kedaluwarsa tidak
+ * pernah ditulis, jadi `updatedAt`-nya tidak bergerak dan ia tetap lolos filter). Pada interval
+ * default 120 detik itu 30 tick — 30 panggilan History untuk SATU baris, yang semuanya menjawab hal
+ * yang sama. Jeda ini yang memutusnya: baris yang sudah ditanya tidak ditanya lagi sebelum lewat.
+ *
+ * KENAPA TIDAK LANGSUNG "berhenti selamanya" untuk semua: hanya vonis TERMINAL IDRX ('EXPIRED')
+ * yang tidak mungkin berbalik jadi PAID. 'WAITING_FOR_PAYMENT' MASIH bisa — dan menangkap
+ * pembayaran terlambat itulah SATU-SATUNYA alasan jendela sejam ini ada. Jadi yang non-terminal
+ * DIJEDA, bukan dihentikan.
+ *
+ * ╔════════════════════════════════════════════════════════════════════════════════════════════╗
+ * ║ B1 — JEDA INI TIDAK BOLEH MENUTUP MULUT SAPUAN TEPAT SEBELUM JENDELANYA HABIS.             ║
+ * ╚════════════════════════════════════════════════════════════════════════════════════════════╝
+ * Jeda datar 10 menit yang TIDAK sadar tepi jendela membuka kembali lubang yang jadi ALASAN
+ * sapuan ini ada. Jendelanya tertutup keras di `updatedAt >= now - RECONCILE_EXPIRED_SWEEP_MS`:
+ * begitu lewat, baris itu TIDAK PERNAH ditanya lagi, selamanya. Kalau pertanyaan terakhir jatuh
+ * 10 menit sebelum tepi itu, SEMUA pembayaran yang mendarat di 10 menit terakhir hilang tanpa
+ * satu baris pun jejak — persis skenario "callback IDRX hilang" yang sapuan ini tangani, dan
+ * `recordUnfulfilled` sudah terlanjur melepas redemption-nya AWAITING_PAYMENT → REQUESTED
+ * sehingga layar user MENGUNDANG PEMBAYARAN KEDUA.
+ *
+ * ATURANNYA (lihat `quietExpiredSweepNonTerminal`): jeda non-terminal TIDAK PERNAH boleh
+ * menjangkau MARGIN TERAKHIR jendela — dan marginnya adalah konstanta yang SAMA ini. Dengan
+ * margin ≥ panjang jeda, jarak antara pertanyaan TERAKHIR dan tertutupnya jendela terbatas pada
+ * SATU interval reconciler, berapa pun intervalnya:
+ *   - interval ≥ jeda  → tiap tick memang sudah bertanya; paparannya satu interval.
+ *   - interval < jeda  → margin (= jeda) memuat setidaknya satu tick, dan di dalam margin TIDAK
+ *                        ADA jeda sama sekali, jadi tick TERAKHIR sebelum tepi pasti bertanya.
+ * Harganya: beberapa panggilan History ekstra di ekor tiap baris non-terminal (pada interval
+ * default 120 detik: ≤ 5 tick × 10 menit margin). Itu ditukar dengan tidak pernah kehilangan
+ * pembayaran terlambat — pertukaran yang arahnya TIDAK boleh dibalik demi menghemat panggilan.
+ */
+const EXPIRED_SWEEP_RECHECK_MS = 10 * 60 * 1000;
+
+/** B2 — plafon memori peta jeda. Di atas ini entri baru tidak ditambahkan: efeknya cuma
+ *  "ditanya lagi nanti", TIDAK PERNAH "utang terlewat". */
+const EXPIRED_SWEEP_QUIET_MAX = 5_000;
+
+/** B2 — plafon panjang `notIn` yang dikirim ke Postgres. Sisanya ikut terambil dan ditanya ulang
+ *  (aman, cuma boros) — lebih baik daripada mengirim predikat raksasa tiap tick. */
+const EXPIRED_SWEEP_NOT_IN_MAX = 500;
+
 const ERROR_MAX = 500;
+
+/**
+ * B1 — status PaymentOrder yang berarti pembayaran ongkir SUDAH MENDARAT (atau sedang
+ * diselesaikan). Dipakai sebagai PAGAR untuk SATU hal saja: MENERBITKAN TAGIHAN KEDUA.
+ * Selama satu saja order ongkir redemption ada di salah satu status ini, klaim AWAITING_PAYMENT-nya
+ * TIDAK BOLEH dilepas ke REQUESTED — kalau dilepas, user mendapat invoice baru dan MEMBAYAR DUA
+ * KALI untuk satu pengiriman, sementara Rupiah yang pertama masih menggantung.
+ *
+ * DAFTAR INI BUKAN LAGI PAGAR PEMBATALAN. Sampai pass ini, RedemptionService memakai daftar yang
+ * IDENTIK untuk melarang batal-sendiri, dan itulah yang menutup SETIAP jalan keluar
+ * AWAITING_PAYMENT sekaligus (B1, kambuh ke-3): satu daftar, empat pintu. Sekarang pembatalan
+ * punya daftarnya SENDIRI yang lebih sempit (CANCEL_BLOCKING_ORDER_STATUSES di
+ * redemption.service.ts) — membatalkan tidak menerbitkan tagihan apa pun, jadi ia tidak boleh
+ * dipagari oleh alasan "nanti bayar dua kali".
+ *
+ * KARENA ITU 400 dari pagar ini TIDAK PERNAH BOLEH JADI BUNTU: pesannya WAJIB menunjuk jalan
+ * keluar yang masih hidup (batalkan permintaannya, lalu minta kirim lagi).
+ *
+ * PENDING dan EXPIRED/FAILED SENGAJA TIDAK di sini: keduanya berarti nol Rupiah mendarat.
+ */
+const SHIPPING_MONEY_LANDED_STATUSES: PaymentStatus[] = [
+  PaymentStatus.PAID,
+  PaymentStatus.FULFILLING,
+  PaymentStatus.FULFILLED,
+  PaymentStatus.REFUND_DUE,
+];
+
+/**
+ * B1 — TERMINAL TANPA PENYERAHAN. Dua sifat SEKALIGUS, dan keduanya wajib:
+ *
+ *   1. TERMINAL  — order tidak akan pernah maju lagi dengan sendirinya. Tak ada pemanggil yang
+ *      sedang memegangnya, tak ada klaim yang sedang berjalan, tak ada mesin yang akan menebusnya.
+ *   2. TANPA PENYERAHAN — status ini HANYA bisa dicapai TANPA klaim atomik pernah diambil, jadi
+ *      TIDAK ADA satu pun jalur pemenuhan (gacha.purchase / reseller.settle / balance.credit /
+ *      fulfilShipping) yang pernah berjalan atas order ini. EXPIRED cuma ditulis recordUnfulfilled
+ *      berpredikat PENDING|PAID; FAILED tidak pernah ditulis kode produksi mana pun dan artinya
+ *      (lihat markRefundDue) adalah "kami YAKIN tidak ada uang user yang tertahan".
+ *
+ * INI SATU-SATUNYA HIMPUNAN yang boleh diubah jadi UTANG ketika sebuah klaim KALAH sementara
+ * pemanggilnya memegang bukti PAID+MINTED server-ke-server. Semua status lain yang bisa
+ * memenangkan klaim itu (FULFILLING = pemenang sah sedang menyerahkan, FULFILLED = sudah
+ * diserahkan, REFUND_DUE = utangnya sudah tercatat, PENDING/PAID = klaim dilepas untuk diulang
+ * dan reconciler masih memiliki order itu) TIDAK BOLEH menghasilkan utang: itu akan
+ * mendeklarasikan utang atas barang yang sudah/sedang dikirim, atau utang KEDUA.
+ *
+ * ⚠️ JANGAN pernah menambahkan status ke sini tanpa membuktikan sifat (2). Sebuah status yang
+ * bisa dicapai SESUDAH penyerahan akan mengubah baris ini jadi mesin refund-dobel.
+ */
+const TERMINAL_UNDELIVERED_STATUSES: PaymentStatus[] = [
+  PaymentStatus.EXPIRED,
+  PaymentStatus.FAILED,
+];
 
 const errorMessage = (err: unknown): string =>
   (err instanceof Error ? err.message : 'Unknown error').slice(0, ERROR_MAX);
+
+/**
+ * B2 — APA yang dibayar order ini, dalam bahasa manusia.
+ *
+ * KENAPA ADA: kelas ini lahir sebagai rail pack, jadi hampir setiap log utangnya berbunyi "pack".
+ * Sejak rail yang sama mengangkut TOP-UP, KARTU MARKETPLACE, dan ONGKIR KIRIM FISIK, kalimat itu
+ * menyesatkan pada saat yang paling mahal: operator yang jam 3 pagi mencari "kenapa user bayar
+ * ongkir tapi kartunya tidak dikirim" tidak akan pernah mencocokkan log yang bicara soal pack.
+ * Label ini diturunkan dari KOLOM ORDER (sentinel packType/redemptionId/listingId yang di-set
+ * SERVER), bukan dari tebakan — jadi ia tidak bisa dipalsukan lewat body klien.
+ */
+function orderSubject(order: PaymentOrder): string {
+  if (order.packType === 'SHIPPING' || order.redemptionId) {
+    return 'ONGKIR KIRIM FISIK';
+  }
+  if (order.packType === 'TOPUP') return 'TOP-UP SALDO';
+  if (order.listingId) return 'KARTU MARKETPLACE';
+  return 'PACK';
+}
 
 /**
  * Catatan mint IDRX seperti dikembalikan History API. Tipenya DITURUNKAN dari IdrxClient
@@ -203,6 +341,15 @@ export interface ReconcileSummary {
 @Injectable()
 export class PaymentsService {
   private readonly logger = new Logger(PaymentsService.name);
+
+  /**
+   * B2 — merchantOrderId → epoch ms sampai kapan sapuan EXPIRED TIDAK BOLEH menanyakannya lagi.
+   *
+   * MURNI DI MEMORI, dan itu disengaja: lihat `quietExpiredSweep`. Tidak ada kolom, tidak ada
+   * tulisan, jadi peta ini TIDAK BISA berbohong tentang keadaan sebuah order — satu-satunya yang
+   * dipengaruhinya adalah KAPAN kita bertanya lagi ke IDRX, bukan apa yang kita simpulkan.
+   */
+  private readonly expiredSweepQuiet = new Map<string, number>();
 
   constructor(
     private readonly prisma: PrismaService,
@@ -739,7 +886,7 @@ export class PaymentsService {
   async createShippingOrder(
     redemptionId: string,
     user: AuthUser,
-    privyToken: string,
+    ccAccessToken: string,
   ): Promise<PaymentOrderDto> {
     const treasuryAddress = this.treasuryAddressOrRefuse();
     // Gate fitur: kalau HOSHI_CC_SHIPPING_ENABLED mati → tolak (record-only tak tersentuh).
@@ -752,14 +899,25 @@ export class PaymentsService {
     if (redemption.userId !== user.id) {
       throw new ForbiddenException('Redemption ini bukan milik Anda.');
     }
-    if (redemption.status !== RedemptionStatus.REQUESTED) {
+    // B1 — DUA status boleh MASUK ke rute ini, dan URUTAN di bawah ini adalah perbaikannya.
+    // DULU: cek status (hanya REQUESTED) berjalan SEBELUM cabang idempoten, jadi begitu baris
+    // pindah ke AWAITING_PAYMENT cabang idempoten itu TIDAK PERNAH TERCAPAI — user yang kembali ke
+    // invoice-nya sendiri (tombol "Buka halaman pembayaran") dijawab 400, selamanya. Sekarang:
+    //   AWAITING_PAYMENT + invoice MASIH HIDUP  -> kembalikan invoice yang SAMA (re-entry),
+    //   AWAITING_PAYMENT + invoice MATI/hilang  -> lepas balik ke REQUESTED lalu terbitkan yang baru,
+    //   status lain                             -> 400 seperti dulu.
+    if (
+      redemption.status !== RedemptionStatus.REQUESTED &&
+      redemption.status !== RedemptionStatus.AWAITING_PAYMENT
+    ) {
       throw new BadRequestException(
         `Redemption ini tidak dalam status yang bisa dibuatkan tagihan ongkir (status ${redemption.status}).`,
       );
     }
 
-    // IDEMPOTEN per redemption: order ongkir PENDING yang belum kedaluwarsa → kembalikan yang itu
-    // (spam "Bayar Ongkir" tidak menumpuk order/mint-request).
+    // IDEMPOTEN per redemption + RE-ENTRY: order ongkir PENDING yang belum kedaluwarsa →
+    // kembalikan yang itu (spam "Bayar Ongkir" tidak menumpuk order/mint-request, dan user yang
+    // kembali ke baris AWAITING_PAYMENT-nya sendiri mendapat invoice yang SAMA, bukan 400).
     const existingPending = await this.prisma.paymentOrder.findFirst({
       where: {
         userId: user.id,
@@ -772,6 +930,13 @@ export class PaymentsService {
     });
     if (existingPending) return toPaymentOrderDto(existingPending);
 
+    // AWAITING_PAYMENT TANPA invoice hidup = invoice-nya sudah mati (user menutup tab IDRX; lihat
+    // HOSHI_ORDER_EXPIRY_MINUTES). Lepas klaimnya balik ke REQUESTED supaya baris ini tidak
+    // mengunci kartunya selamanya. Helper-nya MENOLAK KERAS kalau ada pembayaran yang mendarat.
+    if (redemption.status === RedemptionStatus.AWAITING_PAYMENT) {
+      await this.releaseAbandonedShippingClaim(redemptionId);
+    }
+
     await this.assertOrderQuota(user.id);
 
     // 1. Taksir ongkir (USD) dari CC → USDC base unit. Server-side; tak pernah dari klien.
@@ -779,7 +944,7 @@ export class PaymentsService {
       await this.ccShipping.estimateForRedemption(
         redemptionId,
         user,
-        privyToken,
+        ccAccessToken,
       );
     if (!Number.isSafeInteger(priceUsdc) || priceUsdc <= 0) {
       throw new ServiceUnavailableException(
@@ -870,6 +1035,70 @@ export class PaymentsService {
     return toPaymentOrderDto(created);
   }
 
+  /**
+   * B1 — LEPAS klaim AWAITING_PAYMENT yang invoice-nya sudah mati, balik ke REQUESTED.
+   *
+   * KENAPA REQUESTED DAN BUKAN CANCELED: nol Rupiah masuk dan user JELAS masih menginginkan
+   * kartunya (ia baru saja menekan "Bayar ongkir" lagi). REQUESTED memulihkan PERSIS keadaan
+   * sebelum invoice terbit — alamat, snapshot kartu, dan baris feed-nya tetap utuh — sementara
+   * CANCELED memaksanya membuat permintaan baru dari nol. REQUESTED juga status yang memang
+   * dibutuhkan klaim atomik di akhir createShippingOrder, jadi tidak ada jalur khusus baru.
+   *
+   * PAGAR UANG: kalau ADA order ongkir yang pembayarannya sudah mendarat
+   * (PAID/FULFILLING/FULFILLED/REFUND_DUE) → TOLAK. Kita tidak pernah melepas klaim atas baris yang
+   * Rupiah-nya sudah masuk; itu akan mengubah pembayaran sah jadi utang refund hanya karena user
+   * menekan tombol dua kali.
+   *
+   * BALAPAN: tulisannya BERPAGAR (status AWAITING_PAYMENT + fundingSignature null + refundSafe
+   * true), head-to-head dengan klaim fulfilShipping. Yang kalah tidak menulis apa pun.
+   */
+  private async releaseAbandonedShippingClaim(
+    redemptionId: string,
+  ): Promise<void> {
+    const landed = await this.prisma.paymentOrder.findFirst({
+      where: {
+        redemptionId,
+        packType: 'SHIPPING',
+        status: { in: SHIPPING_MONEY_LANDED_STATUSES },
+      },
+      orderBy: { createdAt: 'desc' },
+    });
+    if (landed) {
+      this.logger.warn(
+        `Redemption ${redemptionId}: klaim AWAITING_PAYMENT TIDAK dilepas — order ongkir ` +
+          `${landed.merchantOrderId} berstatus ${landed.status} (pembayaran sudah mendarat).`,
+      );
+      throw new BadRequestException(
+        `Pembayaran ongkir untuk permintaan ini sudah masuk (order ${landed.merchantOrderId}, ` +
+          `status ${landed.status}). Tunggu prosesnya selesai — jangan membuat tagihan baru, ` +
+          'nanti kamu membayar dua kali. Kalau macet: batalkan permintaan kirimnya ' +
+          '(POST /redemptions/:id/cancel) lalu minta kirim lagi — pembayaran yang sudah masuk ' +
+          'tetap tercatat sebagai utang refund pada tagihannya sendiri.',
+      );
+    }
+
+    const released = await this.prisma.cardRedemption.updateMany({
+      where: {
+        id: redemptionId,
+        status: RedemptionStatus.AWAITING_PAYMENT,
+        // Fail-closed: dua kolom jejak PASCA-danai. Dibaca sebagai PREDIKAT, tidak pernah ditulis.
+        fundingSignature: null,
+        refundSafe: true,
+      },
+      data: { status: RedemptionStatus.REQUESTED },
+    });
+    if (released.count !== 1) {
+      throw new BadRequestException(
+        'Permintaan kirim ini baru saja berpindah status (mungkin pembayaranmu barusan masuk). ' +
+          'Muat ulang halamannya lalu cek lagi.',
+      );
+    }
+    this.logger.log(
+      `Redemption ${redemptionId}: invoice ongkir mati → klaim AWAITING_PAYMENT dilepas balik ke ` +
+        'REQUESTED. Nol Rupiah masuk; tagihan baru boleh diterbitkan.',
+    );
+  }
+
   /* ─────────────────────────── Callback IDRX ─────────────────────────── */
 
   /**
@@ -927,10 +1156,25 @@ export class PaymentsService {
       this.logger.warn(`Order ${merchantOrderId} tidak dikenal — diabaikan.`);
       return 'UNKNOWN_ORDER';
     }
+    // ┌─ B2 — `EXPIRED` BUKAN LAGI JALAN BUNTU ────────────────────────────────────────────────┐
+    // │ DULU EXPIRED ikut short-circuit di bawah, dan itulah cara uang hilang DIAM-DIAM:        │
+    // │ tick reconciler dan callback pembayaran memverifikasi BERSAMAAN di batas kedaluwarsa,   │
+    // │ pembacaan reconciler menjawab EXPIRED sementara pembacaan callback menjawab PAID. Kalau │
+    // │ transaksi kedaluwarsa commit duluan, order jadi EXPIRED — lalu callback yang membawa    │
+    // │ bukti PEMBAYARAN NYATA berhenti di sini, tidak pernah mencapai klaim atomik, tidak      │
+    // │ pernah mencapai failToRefund. Rupiah-nya duduk di treasury tanpa satu pun baris utang.  │
+    // │                                                                                        │
+    // │ Sekarang EXPIRED DIVERIFIKASI ULANG. Kalau IDRX bilang benar-benar tak dibayar → tetap  │
+    // │ EXPIRED, nol tulisan, nol utang. Kalau ternyata DIBAYAR → jadi UTANG YANG TERCATAT.     │
+    // │ ATURAN YANG TIDAK BOLEH DILANGGAR: jalur ini MENCATAT UTANG, ia TIDAK PERNAH mengirim   │
+    // │ barangnya. "Jangan pernah menebus ulang order yang ambigu" tetap berlaku utuh.          │
+    // └────────────────────────────────────────────────────────────────────────────────────────┘
+    if (order.status === PaymentStatus.EXPIRED) {
+      return this.settleExpiredButPaid(order);
+    }
     if (
       order.status === PaymentStatus.FULFILLED ||
       order.status === PaymentStatus.REFUND_DUE ||
-      order.status === PaymentStatus.EXPIRED ||
       order.status === PaymentStatus.FAILED
     ) {
       return 'ALREADY_CLAIMED';
@@ -975,8 +1219,21 @@ export class PaymentsService {
     const pinned = this.assertRecordMatchesOrder(order, record);
     if (pinned) {
       if (pinned.refund) {
-        // Terbukti menyimpang → utang manual.
-        await this.markRefundDue(order, pinned.reason, record);
+        // TERBUKTI MENYIMPANG → utang TETAP dicatat (operator harus melihatnya) TAPI
+        // refundSafe=false. Lihat markProvenDeviationRefundDue: yang tidak terbukti milik kita
+        // masuk kategori paling hati-hati. Jalur kedaluwarsa memakai helper yang SAMA.
+        await this.markProvenDeviationRefundDue(
+          order,
+          pinned.reason,
+          `Verifikasi server-ke-server ke IDRX menjawab paymentStatus=${paymentStatus} ` +
+            `userMintStatus=${userMintStatus}, tapi catatannya TIDAK cocok dengan order ini. ` +
+            `Order TIDAK ditebus — tidak ada pack/kartu/saldo yang berangkat dari jalur ini.`,
+          [PaymentStatus.PENDING, PaymentStatus.PAID],
+          {
+            idrxPaymentStatus: paymentStatus,
+            idrxUserMintStatus: userMintStatus,
+          },
+        );
         return 'REFUND_DUE';
       }
       // Field pin WAJIB tidak ada → tak bisa diputuskan. Fail-closed TANPA menyentuh status:
@@ -1009,13 +1266,422 @@ export class PaymentsService {
       },
     });
     if (claimed.count !== 1) {
+      // B1 — KALAH KLAIM ≠ SELALU "pihak lain sedang menyerahkan". Lihat settleLostClaim.
+      return this.settleLostClaim(order, paymentStatus, userMintStatus);
+    }
+
+    return this.fulfilClaimed(order);
+  }
+
+  /**
+   * B1 — KLAIM ATOMIK KALAH, SEMENTARA PEMANGGIL INI MEMEGANG BUKTI PEMBAYARAN SERVER-KE-SERVER.
+   *
+   * ╔════════════════════════════════════════════════════════════════════════════════════════════╗
+   * ║ INTERLEAVING YANG DULU MENGUAPKAN UANG TANPA SATU BARIS PUN JEJAK — DI SETIAP RAIL.        ║
+   * ╚════════════════════════════════════════════════════════════════════════════════════════════╝
+   *
+   * `settleExpiredButPaid` hanya menangkap balapan yang callback-nya MEMBACA SESUDAH commit
+   * kedaluwarsa (baris sudah EXPIRED di pembacaan teratas verifyAndFulfil). Interleaving yang
+   * SATUNYA lolos utuh:
+   *
+   *   1. callback membaca order — masih PENDING.
+   *   2. IDRX menjawab PAID+MINTED; pin (tujuan mint + nominal + requestType) LOLOS.
+   *   3. tick reconciler yang bersamaan commit kedaluwarsa duluan → baris jadi EXPIRED.
+   *   4. klaim atomik `status IN (PENDING,PAID) → FULFILLING` cocok NOL baris.
+   *
+   * Dulu langkah 4 berhenti di `logger.log(... sudah diklaim pihak lain ...)` pada level INFO —
+   * kalimat yang terbaca seperti hasil NORMAL. Nol tulisan, nol REFUND_DUE, nol ERROR. Dan tidak
+   * ada apa pun yang memicunya ulang: IDRX tidak pernah mengulang callback, reconciler dulu hanya
+   * memindai PENDING/PAID/FULFILLING, dan getOrder hanya memverifikasi ulang PENDING|PAID. Untuk
+   * order ONGKIR, `recordUnfulfilled` pada langkah 3 sekalian melepas redemption-nya
+   * AWAITING_PAYMENT → REQUESTED, jadi layar user kembali ke "Menunggu ongkir" dan MENGUNDANG
+   * PEMBAYARAN KEDUA. Rail yang sama mengangkut pack, kartu marketplace, dan top-up.
+   *
+   * ╔════════════════════════════════════════════════════════════════════════════════════════════╗
+   * ║ CARA MEMBEDAKAN "TERMINAL TANPA PENYERAHAN + TERBUKTI DIBAYAR" DARI PEMENANG KLAIM YANG SAH ║
+   * ╚════════════════════════════════════════════════════════════════════════════════════════════╝
+   *
+   * BUKAN dari kenapa klaimnya kalah (tidak bisa diketahui), melainkan dari BACA ULANG barisnya —
+   * satu findUnique SESUDAH klaim gagal — lalu DUA syarat yang harus terpenuhi BERSAMAAN:
+   *
+   *   (a) pemanggil ini memegang bukti PAID+MINTED dari panggilan SERVER-KE-SERVER ke IDRX yang
+   *       pin-nya sudah lolos. Ini sudah dijamin oleh posisi kode: baris ini hanya tercapai
+   *       SESUDAH `paymentStatus==='PAID' && userMintStatus==='MINTED'` dan
+   *       `assertRecordMatchesOrder` mengembalikan null. Body callback tidak pernah ikut menentukan.
+   *   (b) status HASIL BACA ULANG ada di TERMINAL_UNDELIVERED_STATUSES (EXPIRED/FAILED) —
+   *       himpunan yang HANYA bisa dicapai tanpa klaim atomik pernah diambil, jadi tidak ada satu
+   *       pun barang yang pernah berangkat atas order ini.
+   *
+   * SEMUA status lain = ALREADY_CLAIMED yang SAH, dan mereka pulang TANPA utang dan TANPA barang:
+   *   - FULFILLING : pemenang sah SEDANG menyerahkan. Utang di sini = utang atas barang terkirim.
+   *   - FULFILLED  : sudah diserahkan.
+   *   - REFUND_DUE : utangnya SUDAH tercatat — mencatat lagi = utang DOBEL.
+   *   - PENDING/PAID: klaim dilepas untuk diulang (releaseClaimForRetry). Order masih HIDUP dan
+   *                   masih dimiliki reconciler; mendeklarasikannya utang akan membunuh order yang
+   *                   sebentar lagi ditebus dengan benar.
+   *
+   * ATURAN YANG TIDAK BOLEH DILANGGAR: jalur ini MENCATAT UTANG, ia TIDAK PERNAH mengirim
+   * barangnya. Ia tidak menyentuh fulfilClaimed, gacha.purchase, reseller.settle, balance.credit,
+   * fulfilShipping, escrow, maupun treasury. "Jangan pernah menebus ulang order yang ambigu" utuh.
+   *
+   * IDEMPOTEN: tulisannya `markRefundDueRaw` berpagar `status IN (EXPIRED, FAILED)`. Callback yang
+   * datang lagi menemukan baris sudah REFUND_DUE dan berhenti di penjaga terminal verifyAndFulfil;
+   * sapuan EXPIRED reconciler tidak lagi melihatnya (ia memfilter `status = EXPIRED`). Satu utang.
+   */
+  private async settleLostClaim(
+    order: PaymentOrder,
+    paymentStatus: string,
+    userMintStatus: string,
+  ): Promise<FulfilOutcome> {
+    // B2: sebut BARANGNYA. Kalimat lama selalu bicara "pack", padahal rail yang sama mengangkut
+    // ongkir kirim fisik — dan itu membuat satu-satunya jejak sebuah order ongkir tak bisa dicari.
+    const subject = orderSubject(order);
+    const merchantOrderId = order.merchantOrderId;
+
+    let after: PaymentOrder | null;
+    try {
+      after = await this.prisma.paymentOrder.findUnique({
+        where: { merchantOrderId },
+      });
+    } catch (err) {
+      // Tidak bisa memutuskan → FAIL-CLOSED tanpa menyentuh status, TAPI TERIAK. Reconciler
+      // (termasuk sapuan EXPIRED yang baru) akan memutuskannya lagi nanti.
+      this.logger.error(
+        `Order ${subject} ${merchantOrderId} (user ${order.userId}, Rp ${order.priceIdr}): klaim ` +
+          `atomik KALAH sementara IDRX sudah menjawab PAID+MINTED, dan baca-ulang statusnya GAGAL: ` +
+          `${errorMessage(err)}. Status TIDAK diubah — reconciler akan memutuskannya lagi.`,
+      );
+      return 'VERIFY_FAILED';
+    }
+    if (!after) {
+      this.logger.error(
+        `Order ${subject} ${merchantOrderId} (user ${order.userId}, Rp ${order.priceIdr}): klaim ` +
+          'atomik KALAH sementara IDRX sudah menjawab PAID+MINTED, tapi barisnya HILANG saat ' +
+          'dibaca ulang. Status TIDAK diubah — periksa manual.',
+      );
+      return 'VERIFY_FAILED';
+    }
+
+    if (!TERMINAL_UNDELIVERED_STATUSES.includes(after.status)) {
+      // Pemenang klaim yang SAH (atau utang yang sudah tercatat / order yang masih hidup):
+      // SHORT-CIRCUIT tanpa utang dan tanpa barang. Status hasil baca ulang ikut disebut supaya
+      // "sudah diklaim pihak lain" tidak lagi jadi kalimat buram.
       this.logger.log(
-        `Order ${merchantOrderId} sudah diklaim pihak lain — tidak ada pack kedua yang dibeli.`,
+        `Order ${subject} ${merchantOrderId} sudah diklaim pihak lain (status sekarang ` +
+          `${after.status}) — tidak ada pemenuhan kedua dan tidak ada utang yang dicatat.`,
       );
       return 'ALREADY_CLAIMED';
     }
 
-    return this.fulfilClaimed(order);
+    await this.markRefundDueRaw(
+      order,
+      `BALAPAN KEDALUWARSA vs PEMBAYARAN (kalah klaim): verifikasi server-ke-server ke IDRX ` +
+        `menjawab paymentStatus=${paymentStatus} userMintStatus=${userMintStatus} dan pin-nya ` +
+        `lolos, tapi klaim atomik PENDING|PAID → FULFILLING kalah dan order kini ${after.status} ` +
+        `— terminal TANPA penyerahan. Jadi user membayar dan TIDAK menerima apa pun. Barangnya ` +
+        `TIDAK dikirim dari jalur ini (aturan "jangan pernah menebus ulang order ambigu" tetap ` +
+        `berlaku) — ini murni pencatatan utang.`,
+      TERMINAL_UNDELIVERED_STATUSES,
+      { idrxPaymentStatus: paymentStatus, idrxUserMintStatus: userMintStatus },
+    );
+    return 'REFUND_DUE';
+  }
+
+  /**
+   * B2 — SISA JENDELA SAPUAN untuk baris EXPIRED ini, dalam milidetik. MENTAH: boleh ≤ 0.
+   *
+   * `updatedAt` pada baris EXPIRED adalah DETIK KETIKA BARIS ITU JADI EXPIRED, jadi tepi jendela
+   * sapuan = `updatedAt + RECONCILE_EXPIRED_SWEEP_MS` — persis batas yang dipakai filter
+   * `updatedAt >= now - RECONCILE_EXPIRED_SWEEP_MS` di reconcile(). Sesudah itu baris ini tidak
+   * pernah ditanya lagi. Nilainya SENGAJA tidak dilantai di sini: kedua pemakainya punya aturan
+   * lantai/plafon yang BERBEDA, dan melantainya di satu tempat pernah menyembunyikan tepi jendela
+   * dari jalur non-terminal (B1).
+   */
+  private expiredSweepWindowLeftMs(order: PaymentOrder): number {
+    return order.updatedAt.getTime() + RECONCILE_EXPIRED_SWEEP_MS - Date.now();
+  }
+
+  /**
+   * B2 — jeda untuk vonis TERMINAL IDRX ('EXPIRED'): diam sampai jendelanya HABIS.
+   *
+   * 'EXPIRED' tidak akan pernah berbalik jadi PAID, jadi baris ini cukup ditanya SEKALI: satu
+   * panggilan History untuk 30 tick, bukan 30. Lantainya EXPIRED_SWEEP_RECHECK_MS supaya baris
+   * yang jendelanya sudah (hampir) habis tidak menghasilkan entri jeda nol-detik yang langsung
+   * ditanya ulang.
+   */
+  private quietExpiredSweepTerminal(order: PaymentOrder): void {
+    this.quietExpiredSweep(
+      order.merchantOrderId,
+      Math.max(this.expiredSweepWindowLeftMs(order), EXPIRED_SWEEP_RECHECK_MS),
+    );
+  }
+
+  /**
+   * B1 — jeda untuk SETIAP hasil NON-TERMINAL (WAITING_FOR_PAYMENT, status tak dikenal, tidak ada
+   * catatan di IDRX, IDRX melempar, PIN_UNVERIFIABLE): dijeda, TAPI TIDAK PERNAH melewati MARGIN
+   * TERAKHIR jendela sapuan.
+   *
+   * SATU-SATUNYA tempat kebijakan itu ditulis — kelima cabang non-terminal memanggil ini, bukan
+   * `quietExpiredSweep(…, EXPIRED_SWEEP_RECHECK_MS)` langsung, supaya tidak ada cabang yang bisa
+   * tertinggal saat kebijakannya berubah. Jeda datar yang tidak sadar tepi jendela adalah lubang
+   * kehilangan-diam yang dijelaskan di EXPIRED_SWEEP_RECHECK_MS.
+   *
+   * MEKANISMENYA: jeda = min(RECHECK, sisaJendela − RECHECK). Begitu sisanya masuk margin terakhir
+   * (≤ RECHECK) hasilnya ≤ 0 dan baris ini TIDAK DIJEDA SAMA SEKALI — tiap tick bertanya sampai
+   * jendelanya benar-benar tertutup, sehingga SELALU ada satu pertanyaan terakhir sebelum
+   * penutupan dan pembayaran yang mendarat di menit-menit pamungkas tetap jadi utang TERCATAT.
+   */
+  private quietExpiredSweepNonTerminal(order: PaymentOrder): void {
+    const quietForMs = Math.min(
+      EXPIRED_SWEEP_RECHECK_MS,
+      this.expiredSweepWindowLeftMs(order) - EXPIRED_SWEEP_RECHECK_MS,
+    );
+    if (quietForMs <= 0) return;
+    this.quietExpiredSweep(order.merchantOrderId, quietForMs);
+  }
+
+  /**
+   * B2 — "sudah ditanya, jangan tanya lagi sebelum `ms`".
+   *
+   * KENAPA DI MEMORI, BUKAN KOLOM DB: apa pun yang ditulis ke baris PaymentOrder akan menggerakkan
+   * `updatedAt` (Prisma @updatedAt) — dan `updatedAt` pada baris EXPIRED BUKAN metadata bebas: ia
+   * adalah DETIK KETIKA BARIS ITU JADI EXPIRED, satu-satunya sumber jendela sapuan sejam ini.
+   * Menulisnya akan BERBOHONG tentang kapan order kedaluwarsa dan sekaligus memperpanjang
+   * jendelanya tanpa batas (baris yang disentuh tiap tick tidak pernah keluar dari `gte`). Kolom
+   * khusus + migrasi juga TIDAK menolong: tulisannya tetap menggerakkan `updatedAt` kecuali lewat
+   * SQL mentah yang mem-bypass Prisma. Peta ini tidak menyentuh basis data sama sekali, jadi ia
+   * TIDAK BISA berbohong tentang keadaan: satu-satunya efeknya adalah "kapan kita bertanya lagi".
+   *
+   * TAHAN RESTART: peta hilang saat proses mati → setiap baris ditanya SEKALI lagi lalu konvergen
+   * lagi. Kehilangan entri tidak pernah bisa MELEWATKAN utang; ia cuma membuat satu panggilan
+   * History ekstra. (Kebalikannya — entri yang bertahan — juga tidak bisa melewatkan utang: jeda
+   * non-terminal tidak pernah menjangkau margin terakhir jendela, dan hanya vonis TERMINAL yang
+   * dijeda sampai jendelanya habis.)
+   *
+   * MEMORI BERBATAS: di atas EXPIRED_SWEEP_QUIET_MAX entri, entri baru tidak ditambahkan.
+   * Konsekuensinya cuma "ditanya lagi nanti", tidak pernah "utang terlewat".
+   *
+   * ⚠️ JANGAN PANGGIL LANGSUNG dari cabang hasil verifikasi. Dua pembungkusnya
+   * (`quietExpiredSweepTerminal` / `quietExpiredSweepNonTerminal`) yang memegang kebijakan tepi
+   * jendela; memanggil yang ini dengan durasi datar adalah persis regresi B1.
+   */
+  private quietExpiredSweep(merchantOrderId: string, ms: number): void {
+    if (
+      this.expiredSweepQuiet.size >= EXPIRED_SWEEP_QUIET_MAX &&
+      !this.expiredSweepQuiet.has(merchantOrderId)
+    ) {
+      return;
+    }
+    this.expiredSweepQuiet.set(merchantOrderId, Date.now() + ms);
+  }
+
+  /**
+   * B2 — id yang jedanya MASIH berlaku (sekalian membuang yang sudah lewat).
+   *
+   * Dipakai sebagai `notIn` di query sapuan, BUKAN sebagai filter sesudah query: baris yang sudah
+   * dijawab tidak boleh ikut memakan jatah `take` — kalau ikut, ia bisa menyandera baris EXPIRED
+   * yang lebih baru selama sejam penuh (urutannya oldest-first), persis kelaparan yang dihindari
+   * oleh batch terpisah ini. Panjangnya dipotong di EXPIRED_SWEEP_NOT_IN_MAX dengan sisa jeda
+   * TERPANJANG diprioritaskan (itulah vonis terminal): yang terpotong hanya ditanya ulang — aman.
+   */
+  private activeExpiredSweepQuiet(now: number): string[] {
+    const active: { id: string; until: number }[] = [];
+    for (const [id, until] of this.expiredSweepQuiet) {
+      if (until <= now) {
+        this.expiredSweepQuiet.delete(id);
+      } else {
+        active.push({ id, until });
+      }
+    }
+    if (active.length <= EXPIRED_SWEEP_NOT_IN_MAX) {
+      return active.map((entry) => entry.id);
+    }
+    return active
+      .sort((a, b) => b.until - a.until)
+      .slice(0, EXPIRED_SWEEP_NOT_IN_MAX)
+      .map((entry) => entry.id);
+  }
+
+  /**
+   * B2 — order LOKAL sudah `EXPIRED`; cek apakah pembayarannya ternyata SUNGGUHAN mendarat.
+   *
+   * SATU-SATUNYA sumber bukti tetap panggilan server-ke-server ke IDRX — sama seperti jalur normal,
+   * DAN dengan PIN yang sama persis (lihat `assertRecordMatchesOrder` + `markRefundDue`). Empat
+   * kemungkinan, dan hanya satu yang menulis apa pun:
+   *
+   *   1. IDRX bilang BUKAN 'PAID'  → memang kedaluwarsa tanpa dibayar. NOL tulisan (EXPIRED sudah
+   *      terminal dan benar), NOL utang. Ini jalur mayoritas, dan ia tidak boleh berisik.
+   *   2. IDRX tak bisa dihubungi   → kami TIDAK TAHU. Status tidak disentuh, ERROR (ini satu-satunya
+   *      kasus di mana utang bisa luput tercatat sama sekali). Catatan yang TIDAK ADA di History
+   *      BUKAN kasus itu: untuk invoice yang tak pernah dibayar, absennya justru yang DIHARAPKAN —
+   *      jadi ia WARN, bukan ERROR (lihat B2 di bawah).
+   *   3. IDRX bilang 'PAID' tapi PIN-nya tak bisa diputuskan (field pin WAJIB tidak ada) →
+   *      FAIL-CLOSED: `PIN_UNVERIFIABLE`, NOL tulisan, status tidak disentuh, ERROR.
+   *   4. IDRX bilang 'PAID' dan pin LOLOS (atau pin TERBUKTI MENYIMPANG) → REFUND_DUE lewat
+   *      markRefundDueRaw dengan predikat [EXPIRED]; penyimpangan ikut dibawa di `error`.
+   *
+   * ╔════════════════════════════════════════════════════════════════════════════════════════════╗
+   * ║ B1 — KENAPA PIN-NYA WAJIB DI SINI, BUKAN "cukup paymentStatus === 'PAID'".                 ║
+   * ╚════════════════════════════════════════════════════════════════════════════════════════════╝
+   * `refundSafe = true` adalah KLAIM OPERASIONAL: uang user terbukti kami pegang DAN terbukti
+   * belum diserahkan. Operator memutuskan refund dengan MEMBACA KOLOM ITU. 'PAID' sendirian tidak
+   * membuktikan paruh pertamanya — catatan yang sama bisa mencetak ke wallet ORANG LAIN,
+   * bernominal jauh di bawah tagihan, atau ber-requestType 'usdt'.
+   * Jalur normal memperlakukan pin ini sebagai penentu; jalur ini DULU melewatinya, dan sejak
+   * sapuan EXPIRED ada, SETIAP baris EXPIRED melewatinya — tiap tick, selama sejam.
+   * Kebijakannya sekarang mengikuti jalur normal lewat KODE yang sama. SATU SUMBU yang sengaja
+   * TIDAK identik: jalur normal MENSYARATKAN `userMintStatus==='MINTED'` sebelum melangkah sama
+   * sekali (`:1208`), sedangkan jalur ini memang harus tetap mencatat utang untuk mint yang
+   * gagal/di-refund — kalau tidak, uangnya hilang tanpa jejak. Maka bedanya dipindahkan ke kolom
+   * `refundSafe`, bukan ke "catat / tidak catat", dan GERBANG MINT di `markRefundDueRaw` yang
+   * menegakkannya. Jangan tulis ulang kalimat ini jadi "cermin persis" — itu yang dulu membuat
+   * cabang pin-lolos di sini menulis refundSafe=true untuk `userMintStatus=REFUND`.
+   *   - pin lolos + MINTED   → utang dicatat, refundSafe=true (memang terbukti dua-duanya).
+   *   - pin lolos, mint TIDAK
+   *     MINTED               → utang TETAP dicatat, refundSafe=FALSE lewat GERBANG MINT.
+   *   - pin menyimpang       → utang TETAP dicatat (user tetap bayar & tetap tidak menerima apa
+   *                            pun) TAPI refundSafe=FALSE: uangnya tidak terbukti pernah kami
+   *                            terima, jadi ia belum boleh ditransfer. Kedua jalur menulisnya
+   *                            lewat `markProvenDeviationRefundDue` — satu tempat, satu kebijakan;
+   *                            di sanalah alasannya ditulis lengkap.
+   *   - pin tak terputuskan  → NOL tulisan, `PIN_UNVERIFIABLE`, ERROR. Sama seperti jalur normal.
+   *
+   * IDEMPOTEN: tulisannya updateMany berpagar `status IN (EXPIRED)`. Callback yang datang lagi
+   * menemukan order sudah REFUND_DUE dan berhenti di penjaga terminal verifyAndFulfil — jadi tidak
+   * ada utang kedua, dan tidak ada log utang kedua. Dua verifikasi yang BENAR-BENAR bersamaan bisa
+   * sama-sama menerbitkan log (sengaja: log terbit SEBELUM tulisan supaya kegagalan DB tidak
+   * menelan utangnya), tapi tetap hanya SATU baris yang berubah.
+   *
+   * TIDAK PERNAH MENGIRIM BARANGNYA. Jalur ini tidak menyentuh klaim atomik, gacha.purchase,
+   * fulfilShipping, escrow, maupun treasury. Ia hanya mencatat utang.
+   */
+  private async settleExpiredButPaid(
+    order: PaymentOrder,
+  ): Promise<FulfilOutcome> {
+    const subject = orderSubject(order);
+    const merchantOrderId = order.merchantOrderId;
+    let record: IdrxMintRecord | null;
+    try {
+      record = await this.idrx.findMintByMerchantOrderId(merchantOrderId);
+    } catch (err) {
+      // IDRX tak terjangkau = KAMI TIDAK TAHU → tetap ERROR. Tapi jangan diulangi tiap tick:
+      // jeda pendek, jadi satu gangguan IDRX menghasilkan beberapa baris, bukan tiga puluh.
+      // B1: jedanya SADAR TEPI JENDELA — IDRX yang ngadat di menit ke-50 tidak boleh berarti
+      // baris ini tidak pernah ditanya lagi sebelum jendelanya tertutup.
+      this.quietExpiredSweepNonTerminal(order);
+      this.logger.error(
+        `Order ${subject} ${merchantOrderId} (user ${order.userId}, Rp ${order.priceIdr}) ` +
+          `sudah EXPIRED dan verifikasi ulang ke IDRX GAGAL: ${errorMessage(err)}. Status TIDAK ` +
+          'diubah. KALAU pembayarannya ternyata mendarat, utangnya BELUM tercatat — periksa ' +
+          'manual di dashboard IDRX dengan merchantOrderId ini.',
+      );
+      return 'VERIFY_FAILED';
+    }
+    if (!record) {
+      // B2 — INI HASIL YANG DIHARAPKAN, BUKAN ALARM. Invoice yang memang tidak pernah dibayar
+      // wajar tidak punya baris di History API. Dulu kalimat ini terbit di level ERROR, dan sejak
+      // sapuan EXPIRED ada ia terbit LAGI tiap tick untuk order yang sama — ERROR jadi murah dan
+      // utang SUNGGUHAN (yang juga ERROR) tenggelam di antaranya. ERROR sekarang disimpan untuk
+      // uang yang benar-benar butuh manusia; ini WARN, dan jedanya membuatnya tidak berulang.
+      // B1: "belum ada catatan" BUKAN vonis terminal — catatannya bisa muncul begitu user membayar
+      // di halaman IDRX. Jadi jedanya sadar tepi jendela, bukan 10 menit datar.
+      this.quietExpiredSweepNonTerminal(order);
+      this.logger.warn(
+        `Order ${subject} ${merchantOrderId} (user ${order.userId}, Rp ${order.priceIdr}) sudah ` +
+          'EXPIRED dan TIDAK punya catatan di History API IDRX — konsisten dengan "memang tidak ' +
+          'pernah dibayar". Status TIDAK diubah, NOL utang dicatat. Akan dicek ulang beberapa kali ' +
+          'lagi selama jendela sapuan sebelum berhenti.',
+      );
+      return 'VERIFY_FAILED';
+    }
+
+    const paymentStatus = String(record.paymentStatus);
+    const userMintStatus = String(record.userMintStatus);
+    if (paymentStatus !== 'PAID') {
+      // Kedaluwarsa yang jujur: nol Rupiah mendarat. Biarkan EXPIRED apa adanya — NOL tulisan.
+      //
+      // B2 — KONVERGENSI SAPUAN. 'EXPIRED' adalah vonis TERMINAL milik IDRX SENDIRI
+      // (IdrxPaymentStatus hanya punya PAID | WAITING_FOR_PAYMENT | EXPIRED, dan kita mengirim
+      // expiryPeriod yang SAMA dengan umur order kita) — ia tidak akan pernah berbalik jadi PAID,
+      // jadi baris ini boleh berhenti ditanya untuk SISA jendela sapuan: satu panggilan History,
+      // bukan tiga puluh. WAITING_FOR_PAYMENT MASIH BISA berbalik jadi PAID (user membayar di
+      // halaman IDRX sesudah order kita kedaluwarsa — justru SATU-SATUNYA alasan jendela sejam ini
+      // ada), jadi ia hanya DIJEDA sebentar, tidak pernah dihentikan. Menyamakan keduanya =
+      // melewatkan utang sungguhan, dan itu persis yang tidak boleh ditukar demi hemat panggilan.
+      //
+      // B1 — DAN JEDA NON-TERMINALNYA SADAR TEPI JENDELA. Jeda datar 10 menit di sini berarti
+      // pertanyaan terakhir selalu jatuh sampai ~10 menit SEBELUM jendela tertutup, dan
+      // pembayaran yang mendarat di celah itu tidak pernah ditanyakan lagi — hilang diam-diam,
+      // persis kasus yang sapuan ini ada untuk menangkapnya. Lihat quietExpiredSweepNonTerminal.
+      if (paymentStatus === 'EXPIRED') {
+        this.quietExpiredSweepTerminal(order);
+      } else {
+        this.quietExpiredSweepNonTerminal(order);
+      }
+      return 'ALREADY_CLAIMED';
+    }
+
+    // ┌─ B1 — PIN DULU, BARU UTANG. Cermin persis jalur normal di verifyAndFulfil. ────────────┐
+    // │ Tanpa ini, 'PAID' sendirian cukup untuk MENDEKLARASIKAN UTANG REFUND-SAFE — klaim bahwa │
+    // │ uang user terbukti kami pegang — padahal catatannya bisa mencetak ke wallet lain.       │
+    // └────────────────────────────────────────────────────────────────────────────────────────┘
+    const pinned = this.assertRecordMatchesOrder(order, record);
+    if (pinned && !pinned.refund) {
+      // Field pin WAJIB tidak ada → TIDAK BISA DIPUTUSKAN. FAIL-CLOSED, persis jalur normal:
+      // status tidak disentuh, NOL tulisan, dan TERIAK supaya manusia memeriksa kontrak IDRX-nya.
+      // Mencatat REFUND_DUE di sini = mungkin salah mendeklarasikan utang atas uang yang tidak
+      // pernah sampai ke kita.
+      // B1: PIN_UNVERIFIABLE juga NON-TERMINAL (field pin-nya bisa muncul di panggilan berikutnya),
+      // jadi jedanya tidak boleh menjangkau margin terakhir jendela. Tetap NOL tulisan.
+      this.quietExpiredSweepNonTerminal(order);
+      this.logger.error(
+        `Order ${subject} ${merchantOrderId} (user ${order.userId}, Rp ${order.priceIdr}): sudah ` +
+          `EXPIRED dan IDRX menjawab PAID, tapi ${pinned.reason} — utang TIDAK dicatat ` +
+          '(fail-closed) dan status TIDAK diubah. Butuh pemeriksaan manual bila berulang.',
+      );
+      return 'PIN_UNVERIFIABLE';
+    }
+
+    // Uangnya NYATA. Sebutkan juga posisi mint-nya: kalau IDRX sendiri menyatakan mint-nya
+    // gagal/ditolak/di-refund, refundnya kemungkinan besar dari sisi MEREKA — operator harus
+    // memverifikasi dulu supaya tidak terjadi refund DOBEL.
+    const mintNote = ['FAILED', 'REJECTED', 'REFUND'].includes(userMintStatus)
+      ? `userMintStatus=${userMintStatus} → IDRX menyatakan token TIDAK dikirim ke treasury; ` +
+        'refundnya kemungkinan dari sisi IDRX — VERIFIKASI DULU, jangan refund dobel'
+      : `userMintStatus=${userMintStatus}`;
+
+    const context =
+      `BALAPAN KEDALUWARSA vs PEMBAYARAN: order lokal sudah EXPIRED, tapi verifikasi ` +
+      `server-ke-server ke IDRX menjawab paymentStatus=PAID (${mintNote}). Order EXPIRED tidak ` +
+      `pernah ditebus, jadi user membayar dan TIDAK menerima apa pun. Barangnya TIDAK dikirim ` +
+      `dari jalur ini (aturan "jangan pernah menebus ulang order ambigu" tetap berlaku) — ini ` +
+      `murni pencatatan utang.`;
+    const extra = {
+      idrxPaymentStatus: paymentStatus,
+      idrxUserMintStatus: userMintStatus,
+    };
+
+    // B2 — Pin TERBUKTI MENYIMPANG (bukan "tak terputuskan"): utangnya TETAP dicatat, tapi lewat
+    // helper yang SAMA dengan jalur normal — satu tempat, satu kebijakan, refundSafe=false.
+    // Kedua jalur memanggil helper itu supaya mereka tidak bisa berpisah lagi seperti dulu.
+    if (pinned) {
+      await this.markProvenDeviationRefundDue(
+        order,
+        pinned.reason,
+        context,
+        [PaymentStatus.EXPIRED],
+        extra,
+      );
+      return 'REFUND_DUE';
+    }
+
+    // Pin LOLOS: TUJUAN mint-nya terbukti treasury kita dan barangnya TERBUKTI belum diserahkan.
+    // Paruh "uangnya benar-benar masuk" ditentukan GERBANG MINT di markRefundDueRaw dari
+    // `extra.idrxUserMintStatus` — MINTED → refundSafe=true; FAILED/REJECTED/REFUND/PENDING/
+    // PROCESSING → utang tetap dicatat tapi refundSafe=false. Jangan duplikasi cek itu di sini:
+    // satu gerbang di titik tulis berlaku juga untuk pemanggil yang belum ada.
+    await this.markRefundDueRaw(order, context, [PaymentStatus.EXPIRED], extra);
+    return 'REFUND_DUE';
   }
 
   /**
@@ -1213,6 +1879,14 @@ export class PaymentsService {
           where: {
             id: redemptionId,
             status: RedemptionStatus.AWAITING_PAYMENT,
+            // B1 — PIN KE ORDER INI. Sejak klaim AWAITING_PAYMENT BISA DILEPAS (invoice
+            // kedaluwarsa / batal user), baris yang sama bisa berjalan lagi dengan invoice BARU.
+            // Tanpa pin ini, invoice LAMA yang dibayar telat akan MEMBAJAK baris yang sudah
+            // terikat invoice BARU: Rupiah yang benar-benar dibayar dan snapshot harga yang dipakai
+            // assertCostWithinPaid jadi milik dua order berbeda. createShippingOrder selalu menulis
+            // paymentOrderId DI DALAM transaksi yang sama dengan pembuatan order, jadi pin ini
+            // tidak pernah meleset untuk baris yang lahir dari jalur itu.
+            paymentOrderId: order.id,
           },
           data: { status: RedemptionStatus.READY_TO_FUND },
         });
@@ -1230,9 +1904,15 @@ export class PaymentsService {
       if (claimed !== 1) {
         // Redemption tak lagi AWAITING_PAYMENT (mis. dibatalkan). Rupiah sudah masuk, ongkir belum
         // dilayani, NOL USDC bergerak → utang refund AMAN (refundSafe=true default).
+        // Baris ini sudah TIDAK lagi milik order ini: dibatalkan user, invoice-nya kedaluwarsa
+        // lalu dilepas ke REQUESTED, atau sudah terikat invoice yang LEBIH BARU. Rupiah-nya sudah
+        // masuk, ongkir belum dilayani, NOL USDC bergerak → utang refund AMAN (refundSafe=true).
+        // INI yang membuat pelepasan klaim tidak pernah menelan uang diam-diam.
         return this.failToRefund(
           order,
-          `Redemption ${redemptionId} bukan lagi AWAITING_PAYMENT — ongkir Rupiah perlu di-refund manual.`,
+          `Redemption ${redemptionId} bukan lagi AWAITING_PAYMENT milik order ini (dibatalkan user, ` +
+            'invoice kedaluwarsa lalu dilepas, atau sudah terikat invoice yang lebih baru) — ongkir ' +
+            'Rupiah perlu di-refund manual.',
         );
       }
       this.logger.log(
@@ -1707,6 +2387,12 @@ export class PaymentsService {
    *
    * Dipanggil dari endpoint admin (proyek ini sengaja tidak punya scheduler), jadi cadence-nya
    * ditentukan cron eksternal.
+   *
+   * TIGA HIMPUNAN, TIGA QUERY TERPISAH (sengaja tidak digabung — lihat alasannya di masing-masing):
+   *   1. PENDING/PAID  — order yang BISA maju. Ditebus.
+   *   2. FULFILLING    — macet di tengah belanja treasury. Hanya DILAPORKAN (risiko dobel-bayar).
+   *   3. EXPIRED baru  — B1: sabuk-dan-bretel balapan kedaluwarsa-vs-pembayaran. Diverifikasi
+   *      ulang ke IDRX; kalau ternyata DIBAYAR → utang tercatat. TIDAK PERNAH mengirim barangnya.
    */
   async reconcile(olderThanMinutes = 5): Promise<ReconcileSummary> {
     const now = Date.now();
@@ -1754,8 +2440,39 @@ export class PaymentsService {
       take: RECONCILE_BATCH_MAX,
     });
 
+    // ── B1 — SAPUAN EXPIRED (sabuk-dan-bretel atas kedua jalur utang balapan) ────────────────────
+    // Kedua interleaving balapan kedaluwarsa-vs-pembayaran sampai sekarang HANYA ketahuan kalau
+    // sebuah callback kebetulan datang. Callback IDRX dikirim sekali dan tidak pernah diulang.
+    // Sapuan ini membuat orphan tidak lagi bergantung pada callback mana pun: ia memverifikasi
+    // ulang baris EXPIRED ke IDRX sendiri, dan `verifyAndFulfil` membelokkannya ke
+    // settleExpiredButPaid (yang MENCATAT UTANG, tidak pernah mengirim barangnya).
+    //
+    // DIBATASI DUA ARAH supaya tidak pernah memindai sejarah purba selamanya:
+    //   - `updatedAt >= now - RECONCILE_EXPIRED_SWEEP_MS`: hanya baris yang BARU SAJA jadi EXPIRED.
+    //   - batch TERPISAH & lebih kecil: tidak bisa memakan jatah order PENDING/PAID yang bisa maju.
+    // IDEMPOTEN: begitu utangnya tercatat, statusnya REFUND_DUE dan filter `status = EXPIRED` ini
+    // tidak melihatnya lagi — sapuan berikutnya TIDAK BISA membuat utang kedua. Dan tulisan
+    // settleExpiredButPaid sendiri berpagar `status IN (EXPIRED)`, jadi dua sapuan yang bersamaan
+    // pun hanya memindahkan SATU baris.
+    // B2 — KONVERGENSI. Tanpa ini sapuan bertanya ULANG ke IDRX untuk baris yang SAMA di setiap
+    // tick selama sejam (baris jujur-kedaluwarsa tidak pernah ditulis → `updatedAt`-nya tak
+    // bergerak → ia tetap lolos filter): 25 baris × 30 tick = 750 panggilan History per jam yang
+    // semuanya menjawab hal yang sama. `notIn` dipakai DI DALAM query, bukan filter sesudahnya,
+    // supaya baris yang sudah dijawab juga tidak memakan jatah `take` dan tidak bisa menyandera
+    // baris EXPIRED yang lebih baru. Isinya cuma jadwal bertanya — lihat quietExpiredSweep.
+    const quiet = this.activeExpiredSweepQuiet(now);
+    const expiredSweep = await this.prisma.paymentOrder.findMany({
+      where: {
+        status: PaymentStatus.EXPIRED,
+        updatedAt: { gte: new Date(now - RECONCILE_EXPIRED_SWEEP_MS) },
+        ...(quiet.length > 0 ? { merchantOrderId: { notIn: quiet } } : {}),
+      },
+      orderBy: { updatedAt: 'asc' },
+      take: RECONCILE_EXPIRED_BATCH_MAX,
+    });
+
     const summary: ReconcileSummary = {
-      scanned: stale.length + stuck.length,
+      scanned: stale.length + stuck.length + expiredSweep.length,
       fulfilled: 0,
       expired: 0,
       refundDue: 0,
@@ -1766,10 +2483,20 @@ export class PaymentsService {
     for (const order of stuck) {
       // Proses mati di tengah belanja treasury. Satu-satunya jalan keluar yang jujur: manusia
       // mencocokkan ke ledger CcPackPurchase (lewat packMemo/userId).
+      // B1/B2: SEBUT BARANGNYA, dan sebut jalan keluarnya. Order ONGKIR yang macet di sini dulu
+      // ikut MENGUNCI kartunya (redemption-nya tersangkut AWAITING_PAYMENT tanpa jalan keluar).
+      // Sekarang ada jalan keluar, dan operator harus tahu namanya — bukan cuma "periksa manual".
+      const stuckSubject = orderSubject(order);
       this.logger.error(
-        `Order ${order.merchantOrderId} macet di FULFILLING sejak ${order.updatedAt.toISOString()}. ` +
-          'TIDAK ditebus ulang otomatis (risiko dobel-bayar treasury) — butuh pemeriksaan manual ' +
-          'terhadap ledger CcPackPurchase.',
+        `Order ${stuckSubject} ${order.merchantOrderId} macet di FULFILLING sejak ` +
+          `${order.updatedAt.toISOString()}. TIDAK ditebus ulang otomatis (risiko dobel-bayar ` +
+          'treasury) — butuh pemeriksaan manual terhadap ledger CcPackPurchase.' +
+          (stuckSubject === 'ONGKIR KIRIM FISIK'
+            ? ` Redemption ${order.redemptionId ?? '?'} kemungkinan tersangkut AWAITING_PAYMENT: ` +
+              'user bisa POST /redemptions/:id/cancel, atau operator POST ' +
+              '/admin/redemptions/:id/cancel-awaiting-payment — keduanya menandai order ini ' +
+              'REFUND_DUE (utang tercatat) dan membebaskan mint-nya.'
+            : ''),
       );
       summary.stillPending += 1;
     }
@@ -1796,6 +2523,27 @@ export class PaymentsService {
       }
     }
 
+    // B1 — sapuan EXPIRED. `verifyAndFulfil` membelokkan setiap baris ini ke settleExpiredButPaid:
+    // 'REFUND_DUE' = pembayarannya ternyata NYATA → utang tercatat (barangnya TIDAK dikirim);
+    // 'ALREADY_CLAIMED' = IDRX menegaskan memang tak pernah dibayar → tetap EXPIRED, nol tulisan.
+    // Yang terakhir dihitung sebagai `expired`, BUKAN `stillPending`: kedaluwarsa yang jujur bukan
+    // pekerjaan yang tertunda, dan mencampurnya akan membuat angka "masih menunggu" jadi bohong.
+    for (const order of expiredSweep) {
+      const outcome = await this.verifyAndFulfil(order.merchantOrderId);
+      switch (outcome) {
+        case 'REFUND_DUE':
+          summary.refundDue += 1;
+          break;
+        case 'VERIFY_FAILED':
+        case 'PIN_UNVERIFIABLE':
+          summary.verifyFailed += 1;
+          break;
+        default:
+          summary.expired += 1;
+          break;
+      }
+    }
+
     if (summary.scanned > 0) {
       this.logger.log(
         `Reconcile: ${summary.scanned} dipindai, ${summary.fulfilled} ditebus, ` +
@@ -1804,14 +2552,16 @@ export class PaymentsService {
       );
     }
     if (summary.refundDue > 0) {
-      // JANGAN klaim semua REFUND_DUE = "boleh refund". Sebagian mungkin pasca-belanja (refundSafe=false)
-      // di mana treasury SUDAH bayar + kartu SUDAH terkirim → refund = RUGI DOBEL. Operator wajib cek
-      // kolom `refundSafe` per order, BUKAN status/teks doang.
+      // JANGAN klaim semua REFUND_DUE = "boleh refund". Operator wajib cek kolom `refundSafe`
+      // per order, BUKAN status/teks doang. B2 — refundSafe=false punya DUA sebab sekarang:
+      // pasca-belanja (barang sudah/mungkin terkirim) DAN pin menyimpang (uangnya tidak terbukti
+      // pernah kami terima). Keduanya = jangan transfer sebelum diverifikasi di luar sistem ini.
       this.logger.error(
         `${summary.refundDue} order REFUND_DUE — CEK kolom refundSafe PER ORDER sebelum refund. ` +
-          `refundSafe=true → user bayar & belum terima → refund benar. ` +
-          `refundSafe=false → treasury SUDAH bayar + kartu SUDAH terkirim → JANGAN REFUND (cek on-chain manual). ` +
-          `JANGAN refund massal.`,
+          `refundSafe=true → uang TERBUKTI kami pegang & barang TERBUKTI belum diserahkan → refund benar. ` +
+          `refundSafe=false → JANGAN REFUND dulu: treasury SUDAH bayar + kartu SUDAH terkirim (cek on-chain), ` +
+          `ATAU pin IDRX menyimpang sehingga Rupiah-nya tidak terbukti mendarat di treasury kami (cek dashboard IDRX). ` +
+          `Teks \`error\` menyebut yang mana. JANGAN refund massal.`,
       );
     }
     return summary;
@@ -1983,25 +2733,92 @@ export class PaymentsService {
     // (a) ia tetap terpindai reconciler dan (b) klaim atomik nanti tetap mengenalinya.
     const paid = paymentStatus === 'PAID';
 
-    await this.prisma.paymentOrder.updateMany({
-      // Predikat status: verifikasi yang datang telat TIDAK BOLEH menurunkan order yang sudah
-      // FULFILLING/FULFILLED — itu akan membuka jalan pembelian pack kedua.
-      where: {
-        merchantOrderId: order.merchantOrderId,
-        status: { in: [PaymentStatus.PENDING, PaymentStatus.PAID] },
-      },
-      data: {
-        idrxPaymentStatus: paymentStatus,
-        idrxUserMintStatus: userMintStatus,
-        txHash: typeof record.txHash === 'string' ? record.txHash : null,
-        ...(expired ? { status: PaymentStatus.EXPIRED } : {}),
-        ...(paid
-          ? { status: PaymentStatus.PAID, paidAt: order.paidAt ?? new Date() }
-          : {}),
-      },
+    // B1 — SATU TRANSAKSI: "order ini EXPIRED" dan "klaim redemption-nya dilepas" adalah SATU
+    // fakta. Kalau dipisah, sebuah crash di antara keduanya meninggalkan persis bug yang sedang
+    // diperbaiki: order mati, baris redemption terkunci AWAITING_PAYMENT selamanya.
+    const releasedRedemptions = await this.prisma.$transaction(async (tx) => {
+      const moved = await tx.paymentOrder.updateMany({
+        // Predikat status: verifikasi yang datang telat TIDAK BOLEH menurunkan order yang sudah
+        // FULFILLING/FULFILLED — itu akan membuka jalan pembelian pack kedua.
+        where: {
+          merchantOrderId: order.merchantOrderId,
+          status: { in: [PaymentStatus.PENDING, PaymentStatus.PAID] },
+        },
+        data: {
+          idrxPaymentStatus: paymentStatus,
+          idrxUserMintStatus: userMintStatus,
+          txHash: typeof record.txHash === 'string' ? record.txHash : null,
+          ...(expired ? { status: PaymentStatus.EXPIRED } : {}),
+          ...(paid
+            ? { status: PaymentStatus.PAID, paidAt: order.paidAt ?? new Date() }
+            : {}),
+        },
+      });
+
+      // ── B1: invoice ongkir yang MATI harus MELEPAS redemption-nya ────────────────────────────
+      // Tanpa ini AWAITING_PAYMENT tidak punya jalan keluar sama sekali: user menekan "Bayar
+      // ongkir", menutup tab IDRX, invoice-nya kedaluwarsa, dan kartunya terkunci selamanya.
+      //
+      // KENAPA CALLBACK YANG TELAT SELALU MENANG ATAS KEDALUWARSA (empat lapis, berurutan):
+      //  1. Cabang ini hanya tercapai kalau panggilan SERVER-KE-SERVER ke IDRX barusan menjawab
+      //     paymentStatus === 'EXPIRED' — vonis terminal IDRX sendiri untuk "tidak pernah dibayar".
+      //     Bukan body callback, bukan jam kita, bukan kolom idrx* tersimpan.
+      //  2. Pelepasan hanya jalan kalau updateMany DI ATAS benar-benar MEMINDAHKAN order ini
+      //     (count === 1). Jalur sukses yang bersamaan mengklaim order PENDING|PAID → FULFILLING
+      //     lebih dulu; predikat status kita lalu cocok 0 baris → nol pelepasan.
+      //  3. Pelepasannya sendiri updateMany BERPAGAR dan head-to-head dengan klaim fulfilShipping
+      //     (AWAITING_PAYMENT → READY_TO_FUND, predikat yang sama + paymentOrderId yang sama).
+      //     Postgres menyerialkan keduanya di baris itu: tepat satu menang.
+      //  4. Kalau kedaluwarsa yang menang lalu verifikasi PAID datang belakangan, order-nya sudah
+      //     EXPIRED → verifyAndFulfil membelokkannya ke settleExpiredButPaid, yang memverifikasi
+      //     ulang ke IDRX dan menandainya REFUND_DUE (predikat [EXPIRED]) begitu paymentStatus
+      //     terbukti PAID. Uangnya jadi UTANG YANG TERCATAT.
+      //     ⚠️ KALIMAT INI DULU BOHONG (B2). Yang tertulis di sini adalah "fulfilShipping mendapat
+      //     count !== 1 → failToRefund" — padahal fulfilShipping TIDAK PERNAH TERCAPAI: verifikasi
+      //     berikutnya berhenti di penjaga terminal verifyAndFulfil (EXPIRED) jauh sebelum klaim
+      //     atomik. Hasilnya: Rupiah mendarat, nol baris REFUND_DUE, nol log ERROR, dan user
+      //     melihat "Menunggu pembayaran ongkir" lalu membayar untuk KEDUA KALINYA. Kalau nanti
+      //     ada yang mengembalikan EXPIRED ke daftar short-circuit itu, lubang ini terbuka lagi.
+      // PIN paymentOrderId: kedaluwarsanya order X tidak akan pernah melepas baris yang sudah
+      // berjalan lagi dengan invoice Y. fundingSignature/refundSafe ikut jadi predikat (dibaca,
+      // tidak pernah ditulis) supaya baris berjejak PASCA-danai tak mungkin tersentuh.
+      if (
+        !expired ||
+        moved.count !== 1 ||
+        order.packType !== 'SHIPPING' ||
+        !order.redemptionId
+      ) {
+        return 0;
+      }
+      const released = await tx.cardRedemption.updateMany({
+        where: {
+          id: order.redemptionId,
+          status: RedemptionStatus.AWAITING_PAYMENT,
+          paymentOrderId: order.id,
+          fundingSignature: null,
+          refundSafe: true,
+        },
+        data: { status: RedemptionStatus.REQUESTED },
+      });
+      return released.count;
     });
 
-    if (expired) return 'EXPIRED';
+    if (expired) {
+      if (releasedRedemptions === 1) {
+        this.logger.log(
+          `Order ongkir ${order.merchantOrderId} EXPIRED (IDRX) → redemption ${order.redemptionId} ` +
+            'dilepas AWAITING_PAYMENT → REQUESTED. Nol Rupiah masuk; user bisa minta tagihan baru.',
+        );
+      } else if (order.packType === 'SHIPPING' && order.redemptionId) {
+        // BUKAN error: baris bisa saja sudah maju sendiri (pembayaran mendarat duluan), sudah
+        // dibatalkan user, atau sudah terikat invoice yang lebih baru.
+        this.logger.log(
+          `Order ongkir ${order.merchantOrderId} EXPIRED (IDRX) tapi redemption ` +
+            `${order.redemptionId} TIDAK dilepas — baris sudah bergerak / bukan lagi milik order ini.`,
+        );
+      }
+      return 'EXPIRED';
+    }
     if (paid) {
       // Rupiah masuk tapi mint-nya gagal/ditolak di sisi IDRX: token tidak pernah sampai ke
       // treasury, jadi refund-nya urusan IDRX — bukan utang kita. Tetap dicatat keras supaya
@@ -2114,25 +2931,77 @@ export class PaymentsService {
   }
 
   /**
-   * Kegagalan PIN PRA-KLAIM (order masih PENDING/PAID). Predikatnya PENDING|PAID: kalau pemenang
-   * lain sudah mengklaim, mark ini jadi no-op — bukan menimpa klaim yang sah.
+   * ╔════════════════════════════════════════════════════════════════════════════════════════════╗
+   * ║ B2 — KEBIJAKAN: PIN TERBUKTI MENYIMPANG ⇒ UTANG TERCATAT, TAPI refundSafe = FALSE.        ║
+   * ║ INI SATU-SATUNYA TEMPAT TULISAN ITU TERBIT. KEDUA jalur (normal + kedaluwarsa) lewat sini.║
+   * ╚════════════════════════════════════════════════════════════════════════════════════════════╝
+   *
+   * ATURAN OPERATOR yang seluruh kolom ini ada untuk melindunginya: operator memutuskan refund
+   * dengan MEMBACA `refundSafe`, BUKAN status dan BUKAN teks `error`. Maka `refundSafe = true`
+   * adalah KLAIM: uang user TERBUKTI kami pegang DAN TERBUKTI belum diserahkan. Dua-duanya, bukan
+   * salah satu.
+   *
+   * Pin yang MENYIMPANG membuktikan kebalikan dari paruh PERTAMA: `assertRecordMatchesOrder`
+   * mengembalikan refund:true persis ketika catatan IDRX menunjukkan Rupiah-nya me-mint ke wallet
+   * LAIN, bernominal DI BAWAH tagihan, atau ber-requestType bukan 'idrx'. Uang seperti itu TIDAK
+   * TERBUKTI pernah mendarat pada kami. Menulis refundSafe=true di situ menyuruh operator yang
+   * patuh mengirim Rupiah sungguhan untuk uang yang mungkin tidak pernah kami terima — rugi yang
+   * dibayar DUA KALI.
+   *
+   * KENAPA TETAP DICATAT SEBAGAI UTANG: user memang membayar sesuatu dan TIDAK menerima apa pun
+   * (klaim atomiknya tidak pernah diambil di kedua jalur). Menyembunyikannya = kehilangan diam.
+   * Yang berubah hanya IZIN TRANSFER-nya, bukan keberadaan utangnya.
+   *
+   * KENAPA false, BUKAN "true dengan catatan": sejalan dengan setiap pilihan fail-closed lain di
+   * sistem ini — yang TIDAK TERBUKTI milik kita jatuh ke kategori paling hati-hati. Ongkos yang
+   * DITERIMA: rotasi HOSHI_TREASURY_ADDRESS yang jinak menandai utang yang sebenarnya sah sebagai
+   * "perlu diselidiki". Itu FALSE NEGATIVE — arah yang aman, dan bisa dibereskan manusia.
+   *
+   * BUKAN INI: `PIN_UNVERIFIABLE` (field pin WAJIB-nya ABSEN). Itu "tidak bisa diputuskan", bukan
+   * "terbukti menyimpang" — ia tetap NOL TULISAN di kedua jalur, dan TIDAK BOLEH dilipat ke sini.
+   * BUKAN INI JUGA: pin LOLOS → tetap refundSafe=true lewat markRefundDueRaw/failToRefund.
+   *
+   * `context` ditaruh SESUDAH prefiks penyimpangan supaya alasan pin selamat dari pemotongan
+   * ERROR_MAX (500 char) dan terbaca manusia lebih dulu.
+   *
+   * KEBIJAKAN INI JUGA DITULIS DI LUAR KODE, supaya tidak bisa hilang bersama satu refactor:
+   *   - prisma/schema.prisma → PaymentOrder.refundSafe (komentar `///`)
+   *   - prisma/migrations/20260917020000_document_refund_safe_policy/migration.sql
+   *     (COMMENT ON COLUMN "payment_orders"."refundSafe" — yang dibaca operator dari DB langsung)
+   *   - src/payments/payments.service.spec.ts, describe "B1 — pin WAJIB juga di jalur EXPIRED":
+   *     satu catatan IDRX dijalankan lewat KEDUA jalur; setiap perbedaan hasil = test MERAH.
    */
-  private async markRefundDue(
+  private async markProvenDeviationRefundDue(
     order: PaymentOrder,
-    reason: string,
-    record: IdrxMintRecord,
+    pinnedReason: string,
+    context: string,
+    fromStatuses: PaymentStatus[],
+    extra: { idrxPaymentStatus: string; idrxUserMintStatus: string },
   ): Promise<void> {
     await this.markRefundDueRaw(
       order,
-      reason,
-      [PaymentStatus.PENDING, PaymentStatus.PAID],
-      {
-        idrxPaymentStatus: String(record.paymentStatus),
-        idrxUserMintStatus: String(record.userMintStatus),
-      },
+      `PIN MENYIMPANG (${pinnedReason}) — UANG INI TIDAK TERBUKTI KAMI TERIMA, jadi ` +
+        `refundSafe=false: JANGAN transfer apa pun sebelum kedatangan Rupiah-nya DIVERIFIKASI di ` +
+        `dashboard IDRX dengan merchantOrderId ini. Utangnya tetap dicatat supaya tidak hilang. ` +
+        context,
+      fromStatuses,
+      extra,
+      false,
     );
   }
 
+  /**
+   * B2 — `refundSafe` DEFAULT true, dan defaultnya HANYA sah kalau pemanggilnya sudah membuktikan
+   * KEDUANYA: uang user mendarat pada kami (pin LOLOS), dan barangnya belum diserahkan (klaim
+   * atomik belum pernah diambil, atau belum menyentuh treasury). Hanya DUA pemanggil yang boleh
+   * memakai default itu — settleLostClaim & jalur pin-lolos settleExpiredButPaid. Keduanya berada
+   * sesudah pin lolos, TAPI pin lolos SAJA tidak cukup: pin membuktikan TUJUAN mint-nya, bukan
+   * bahwa mint-nya TERJADI. Karena itu default `true` masih disaring GERBANG MINT di bawah, yang
+   * menurunkannya ke false kecuali `extra.idrxUserMintStatus === 'MINTED'`.
+   * Yang meleset dari salah satu paruhnya WAJIB mengoper false:
+   *   - pasca-belanja (treasury sudah/mungkin bayar)  → failToRefund(..., false)
+   *   - pin TERBUKTI menyimpang (uang tak terbukti kami terima) → markProvenDeviationRefundDue
+   */
   private async markRefundDueRaw(
     order: PaymentOrder,
     reason: string,
@@ -2140,17 +3009,58 @@ export class PaymentsService {
     extra?: { idrxPaymentStatus: string; idrxUserMintStatus: string },
     refundSafe = true,
   ): Promise<void> {
+    // ╔══════════════════════════════════════════════════════════════════════════════════════════╗
+    // ║ GERBANG MINT — refundSafe=true WAJIB punya bukti KEDUA paruhnya, dan paruh "uangnya      ║
+    // ║ benar-benar masuk" TIDAK dibuktikan oleh pin.                                            ║
+    // ║                                                                                          ║
+    // ║ Pin (assertRecordMatchesOrder) membaca destinationWalletAddress, toBeMinted, requestType ║
+    // ║ — ia membuktikan TUJUAN mint-nya, BUKAN bahwa mint-nya TERJADI. `userMintStatus=REFUND`  ║
+    // ║ berarti IDRX SUDAH mengembalikan uangnya ke user; `FAILED`/`REJECTED` berarti token-nya  ║
+    // ║ tidak pernah sampai ke treasury kami. Menandai itu refundSafe=true = operator yang       ║
+    // ║ menuruti aturan ("baca refundSafe, jangan teksnya") membayar user KEDUA kali.            ║
+    // ║                                                                                          ║
+    // ║ Karena itu gerbangnya ditaruh DI SINI, di titik tulisnya — bukan sebagai `if` di satu    ║
+    // ║ pemanggil. Bukti mint-nya sudah ada di tangan lewat `extra`, jadi fungsi ini menurunkan  ║
+    // ║ sendiri kesimpulannya dan tidak bergantung pada itikad baik pemanggil. Pemanggil baru     ║
+    // ║ yang lupa memikirkannya otomatis dapat jawaban yang hati-hati, bukan yang optimistis.    ║
+    // ║                                                                                          ║
+    // ║ SATU ATURAN, tanpa pengecualian per-nilai: hanya `MINTED` yang boleh true. PENDING/      ║
+    // ║ PROCESSING ikut false — uang yang masih di perjalanan bukan uang yang terbukti diterima. ║
+    // ║ ONGKOS YANG DITERIMA: pembayaran yang belakangan sukses mint meninggalkan utang          ║
+    // ║ refundSafe=false yang harus dibereskan operator manual. Itu negatif-palsu — arah aman.   ║
+    // ║ `extra` tidak diisi (semua pemanggil failToRefund) = PASCA-KLAIM, yang hanya tercapai    ║
+    // ║ sesudah gerbang `userMintStatus==='MINTED'` di verifyAndFulfil → paruhnya sudah terbukti.║
+    // ╚══════════════════════════════════════════════════════════════════════════════════════════╝
+    const mintProven = extra === undefined || extra.idrxUserMintStatus === 'MINTED';
+    if (refundSafe && !mintProven) {
+      this.logger.warn(
+        `Order ${order.merchantOrderId}: refundSafe DITURUNKAN ke false oleh gerbang mint — ` +
+          `idrxUserMintStatus=${extra?.idrxUserMintStatus}, bukan MINTED. Utangnya tetap dicatat.`,
+      );
+    }
+    refundSafe = refundSafe && mintProven;
     const message = reason.slice(0, ERROR_MAX);
+    // B2 — SEBUT BARANGNYA. Kalimat lama selalu berbunyi "pack"; sebuah utang ONGKIR KIRIM FISIK
+    // yang dilaporkan sebagai utang pack tidak akan pernah ditemukan operator yang mencarinya.
+    const subject = orderSubject(order);
     if (refundSafe) {
       this.logger.error(
-        `REFUND_DUE ${order.merchantOrderId} (user ${order.userId}, Rp ${order.priceIdr}): ${message} ` +
-          '— user SUDAH BAYAR dan belum menerima pack. Ini utang, bukan kegagalan.',
+        `REFUND_DUE[${subject}] ${order.merchantOrderId} (user ${order.userId}, Rp ${order.priceIdr}): ${message} ` +
+          '— user SUDAH BAYAR dan belum menerima apa pun. Ini utang, bukan kegagalan.',
       );
     } else {
-      // JANGAN samakan dengan utang-refund biasa: ini kegagalan pasca-belanja. Refund = rugi dobel.
+      // JANGAN samakan dengan utang-refund biasa. B2 — refundSafe=false sekarang punya DUA sebab,
+      // dan keduanya berujung pada perintah yang SAMA untuk operator: JANGAN transfer sebelum
+      // diverifikasi DI LUAR sistem ini. Sebab yang mana selalu ada DI DEPAN `message`:
+      //   (a) PASCA-BELANJA — treasury sudah/mungkin bayar + barangnya sudah/mungkin terkirim →
+      //       refund = RUGI DOBEL. Verifikasinya ON-CHAIN, lalu kirim ulang manual.
+      //   (b) PIN MENYIMPANG — Rupiah-nya TIDAK TERBUKTI mendarat di treasury kami → refund =
+      //       mengirim uang yang mungkin tak pernah kami terima. Verifikasinya di dashboard IDRX.
       this.logger.error(
-        `REFUND_DUE[JANGAN-REFUND] ${order.merchantOrderId} (user ${order.userId}, Rp ${order.priceIdr}): ${message} ` +
-          '— ⚠️ treasury SUDAH/MUNGKIN bayar + kartu SUDAH/MUNGKIN terkirim. CEK ON-CHAIN & kirim ulang manual. JANGAN REFUND.',
+        `REFUND_DUE[JANGAN-REFUND][${subject}] ${order.merchantOrderId} (user ${order.userId}, Rp ${order.priceIdr}): ${message} ` +
+          '— ⚠️ refundSafe=false: utang TERCATAT tapi BELUM boleh ditransfer. Verifikasi dulu ' +
+          '(ON-CHAIN untuk kegagalan pasca-belanja; dashboard IDRX untuk pin yang menyimpang), ' +
+          'baru putuskan. JANGAN REFUND sebelum itu.',
       );
     }
     try {

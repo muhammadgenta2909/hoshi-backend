@@ -1,0 +1,41 @@
+-- B2 — refundSafe=true ADALAH SEBUAH KLAIM, DAN SEKARANG KLAIM ITU PUNYA DUA PARUH YANG UTUH.
+--
+-- Migration ini TIDAK MENGUBAH SATU BARIS DATA PUN dan tidak mengubah tipe/default kolom apa pun.
+-- Ia hanya menempelkan COMMENT. Kolomnya sendiri dibuat di
+-- 20260817000000_add_payment_order_refund_safe. Aman dijalankan kapan saja, tidak mengambil kunci
+-- penulisan tabel.
+--
+-- ============================ ATURAN OPERATOR YANG DILINDUNGI ============================
+-- Operator memutuskan REFUND dengan MEMBACA KOLOM INI — bukan `status`, bukan teks `error`.
+-- Karena itu `refundSafe = true` bukan bendera teknis, melainkan KLAIM bahwa DUA hal TERBUKTI:
+--   (a) uang user TERBUKTI ada pada kami, DAN
+--   (b) barangnya TERBUKTI belum diserahkan.
+-- Salah mendeklarasikannya = uang sungguhan keluar dua kali.
+--
+-- ============================ APA YANG DIPERBAIKI PASS INI ============================
+-- Sampai pass ini, "pin IDRX TERBUKTI MENYIMPANG" ditulis sebagai refundSafe=true dengan
+-- penjelasan ditaruh di teks `error`. Pin menyimpang (assertRecordMatchesOrder → refund:true)
+-- berarti catatan IDRX menunjukkan Rupiah-nya me-mint ke wallet LAIN, bernominal DI BAWAH
+-- tagihan, atau ber-requestType bukan 'idrx' — yakni PEMBUKTIAN KEBALIKAN dari paruh (a).
+-- Kolomnya jadi mencampur "terbukti milik kami" dengan "terbukti BUKAN milik kami", dan operator
+-- yang patuh pada aturan di atas mengirim Rupiah untuk uang yang tidak pernah kami terima.
+-- Mengandalkan teks `error` sebagai mitigasi persis yang dinyatakan TIDAK BEKERJA oleh aturan itu.
+--
+-- KEBIJAKAN SEKARANG (berlaku di KEDUA jalur — order PENDING/PAID maupun order EXPIRED, lewat
+-- SATU fungsi: PaymentsService.markProvenDeviationRefundDue):
+--   - pin LOLOS            -> utang dicatat, refundSafe = true.  (a) dan (b) sama-sama terbukti.
+--   - pin TERBUKTI MENYIMPANG -> utang TETAP dicatat (menyembunyikannya = kehilangan diam),
+--                             TAPI refundSafe = FALSE: belum boleh ditransfer sebelum kedatangan
+--                             Rupiah-nya diverifikasi di dashboard IDRX.
+--   - pin TAK TERPUTUSKAN (field pin WAJIB-nya absen) -> NOL TULISAN sama sekali: status tidak
+--                             disentuh, tidak ada baris REFUND_DUE, reconciler mencoba lagi.
+--                             SENGAJA TIDAK dilipat ke kebijakan di atas.
+-- Ongkos yang DITERIMA: rotasi HOSHI_TREASURY_ADDRESS yang jinak menandai utang yang sebenarnya
+-- sah sebagai "perlu diselidiki" — FALSE NEGATIVE, arah yang aman, bisa dibereskan manusia.
+--
+-- Bukti hidupnya: src/payments/payments.service.spec.ts, describe
+-- "B1 — pin WAJIB juga di jalur EXPIRED (paritas dengan jalur normal)" — satu catatan IDRX
+-- dijalankan lewat KEDUA jalur dan setiap perbedaan hasil = test MERAH.
+-- ========================================================================================
+COMMENT ON COLUMN "payment_orders"."refundSafe" IS
+  'GERBANG REFUND. Operator memutuskan refund dengan membaca KOLOM INI, bukan status dan bukan teks error. true = KLAIM bahwa DUA hal terbukti: uang user ada pada kami DAN barangnya belum diserahkan. false = JANGAN transfer sebelum diverifikasi di luar sistem ini, dengan DUA sebab yang mungkin: (1) PASCA-BELANJA - treasury sudah/mungkin bayar + barangnya sudah/mungkin terkirim, verifikasi ON-CHAIN lalu kirim ulang manual, refund = rugi dobel; (2) PIN IDRX TERBUKTI MENYIMPANG - catatan IDRX menunjukkan Rupiah me-mint ke wallet lain / nominal di bawah tagihan / requestType bukan idrx, jadi uangnya TIDAK TERBUKTI mendarat di treasury kami, verifikasi di dashboard IDRX dengan merchantOrderId-nya. Teks `error` selalu menyebut sebab yang mana DI DEPAN (ia dipotong di 500 char). Pin yang TAK TERPUTUSKAN (field pin wajibnya absen) bukan salah satu dari keduanya: ia tidak menulis apa pun ke baris ini. Kebijakan lengkap + alasannya: PaymentsService.markProvenDeviationRefundDue di src/payments/payments.service.ts, dan prisma/migrations/20260917020000_document_refund_safe_policy/migration.sql.';

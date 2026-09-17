@@ -293,17 +293,31 @@ model CardRedemption {
   paymentOrderId      String? // FK ke PaymentOrder ongkir Rupiah (packType='SHIPPING')
   fundingSignature    String? // sig transfer USDC treasury→user
   burnSignature       String? // sig/ref burn+ship dari CC (kalau ada)
+  /// IDENTITAS set transaksi burn TERAKHIR yang kita terbitkan (sha256 hex atas byte PESAN tiap
+  /// transaksi + outboundShipmentId — lihat cc-shipping.txset.ts). Dipakai submitBurn untuk
+  /// menolak batch BASI secara LOKAL sebelum klaim atomik & sebelum CC dipanggil (dua modal yang
+  /// sama-sama re-prepare → CC 403 "not the complete set", yang TIDAK punya jaminan "nothing was
+  /// burned" dan akan membuat baris nyangkut di BURN_SUBMITTED).
+  /// null = baris lama ATAU set yang tak bisa dikanonikalisasi → pemeriksaan DILEWATI (perilaku
+  /// persis seperti sebelum kolom ini ada). Backward-compatible by construction.
+  burnTxSetHash       String?
   trackingIds         String[] // dari GET /outbound-shipment/:id
   trackingUrls        String[]
   /// false = kegagalan PASCA-danai (USDC sudah keluar ke wallet user) → JANGAN refund Rupiah (rugi
-  /// dobel). Gerbang refund WAJIB baca FIELD ini, BUKAN teks status. Sama semantik PaymentOrder.refundSafe.
+  /// dobel). Gerbang refund WAJIB baca FIELD ini, BUKAN teks status. Semantik UMUM-nya sama dengan
+  /// PaymentOrder.refundSafe ("true = terbukti aman ditransfer"), tapi di baris ini HANYA sebab
+  /// PASCA-danai yang berlaku: sebab "pin IDRX menyimpang" (B2) hidup di baris PaymentOrder, bukan
+  /// di sini. Dan tidak ada satu pun kode yang MENULIS true ke kolom ini — ia hanya dibaca sebagai
+  /// predikat fail-closed (lihat admin.service.ts + payments.service.ts).
   refundSafe Boolean @default(true)
 
   @@index([userId, createdAt])
   @@index([nftAddress])
   // CATATAN: ada juga PARTIAL UNIQUE INDEX "card_redemptions_active_nft_uniq" pada (nftAddress)
-  // WHERE status IN (REQUESTED,PACKING,SHIPPED) — anti dobel-kirim fisik. Prisma tak bisa
-  // memodelkan partial unique di schema, jadi ia hidup di migration SQL (di-apply migrate deploy).
+  // WHERE status IN (semua status IN-FLIGHT — lihat ACTIVE_STATUSES di redemption.service.ts)
+  // — anti dobel-kirim fisik. Prisma tak bisa memodelkan partial unique di schema, jadi ia hidup
+  // di migration SQL (di-apply migrate deploy). Migration 20260916000100 MELEBARKAN daftar itu
+  // dari 3 status (REQUESTED,PACKING,SHIPPED) ke seluruh status in-flight.
   @@map("card_redemptions")
 }
 
@@ -976,10 +990,19 @@ model PaymentOrder {
   /// Pesan error terakhir. JANGAN pernah menuliskan kredensial IDRX ke sini.
   error String?
 
-  /// Apakah AMAN merefund order ini saat status=REFUND_DUE. true (default) = user bayar tapi belum
-  /// menerima → refund BENAR. false = kegagalan PASCA-belanja: treasury SUDAH/MUNGKIN bayar + kartu
-  /// SUDAH/MUNGKIN terkirim → REFUND = RUGI DOBEL (cek on-chain + kirim ulang manual, JANGAN refund).
-  /// Gerbang refund apa pun WAJIB membaca FIELD ini, BUKAN teks `error`.
+  /// GERBANG REFUND. Gerbang refund apa pun WAJIB membaca FIELD ini, BUKAN status dan BUKAN teks
+  /// `error`. Karena itu `true` adalah KLAIM bahwa DUA hal TERBUKTI sekaligus: uang user ada pada
+  /// kami, DAN barangnya belum diserahkan. Salah mendeklarasikannya = uang keluar dua kali.
+  /// false = JANGAN transfer sebelum diverifikasi DI LUAR sistem ini. DUA sebab yang mungkin:
+  ///   (1) PASCA-BELANJA — treasury SUDAH/MUNGKIN bayar + kartu SUDAH/MUNGKIN terkirim → refund =
+  ///       RUGI DOBEL; verifikasinya ON-CHAIN, lalu kirim ulang manual.
+  ///   (2) B2 — PIN IDRX TERBUKTI MENYIMPANG (mint ke wallet lain / nominal di bawah tagihan /
+  ///       requestType bukan 'idrx') → Rupiah-nya TIDAK TERBUKTI mendarat di treasury kami;
+  ///       verifikasinya di dashboard IDRX. Utangnya tetap dicatat, izin transfernya yang ditahan.
+  /// Teks `error` selalu menyebut sebab yang mana DI DEPAN. Pin yang TAK TERPUTUSKAN (field pin
+  /// WAJIB-nya absen) BUKAN salah satu dari keduanya — ia tidak menulis apa pun ke baris ini.
+  /// Kebijakan lengkap: PaymentsService.markProvenDeviationRefundDue +
+  /// prisma/migrations/20260917020000_document_refund_safe_policy/migration.sql.
   refundSafe Boolean @default(true)
 
   createdAt   DateTime  @default(now())
@@ -990,6 +1013,11 @@ model PaymentOrder {
   /// Reconciler memindai order yang menggantung berdasarkan status — callback IDRX tidak pernah
   /// diulang, jadi polling inilah sumber kebenaran yang sebenarnya.
   @@index([status])
+  /// B2 — sapuan reconciler memfilter DAN mengurutkan dengan (status, updatedAt): EXPIRED dalam
+  /// jendela 1 jam, dan FULFILLING yang lewat cutoff. Tanpa komposit ini Postgres memungut semua
+  /// baris berstatus tersebut lalu mengurutkannya di memori tiap tick — dan jumlah baris EXPIRED
+  /// hanya tumbuh. Lihat prisma/migrations/20260917010000_payment_orders_status_updatedat_index.
+  @@index([status, updatedAt])
   @@index([userId])
   @@index([listingId])
   @@index([offerId])

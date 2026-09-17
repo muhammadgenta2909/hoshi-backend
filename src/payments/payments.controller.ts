@@ -19,7 +19,7 @@ import { AdminGuard } from '../auth/admin.guard';
 import { CurrentUser } from '../auth/current-user.decorator';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import type { AuthUser } from '../auth/jwt.strategy';
-import { PrivyToken } from '../auth/privy-token.decorator';
+import { CcAccessToken } from '../auth/cc-access-token.decorator';
 import { CreateListingOrderDto } from './dto/create-listing-order.dto';
 import { CreateOfferOrderDto } from './dto/create-offer-order.dto';
 import { CreatePackOrderDto } from './dto/create-pack-order.dto';
@@ -137,16 +137,21 @@ export class PaymentsController {
     summary:
       'Terbitkan tagihan rupiah untuk ONGKIR kirim kartu fisik (CC Vault Shipping) → QR/VA/paymentUrl IDRX',
     description:
-      'Ongkir (USD) di-taksir SERVER dari CollectorCrypt (butuh header x-privy-identity-token), ' +
+      'Ongkir (USD) di-taksir SERVER dari CollectorCrypt (butuh header x-cc-access-token: access token ' +
+      'sesi wallet sign-in CC, prefix cca_, dari /redemptions/siws/verify), ' +
       'lalu di-Rupiah-kan lewat kurs IDRX. TIDAK ADA USDC yang bergerak di request ini — pendanaan ' +
       'USDC ke wallet user + burn kartu dilakukan setelah Rupiah lunas, di sesi tanda-tangan user.',
   })
   createShippingOrder(
     @Body() dto: CreateShippingOrderDto,
     @CurrentUser() user: AuthUser,
-    @PrivyToken() privyToken: string,
+    @CcAccessToken() ccAccessToken: string,
   ) {
-    return this.payments.createShippingOrder(dto.redemptionId, user, privyToken);
+    return this.payments.createShippingOrder(
+      dto.redemptionId,
+      user,
+      ccAccessToken,
+    );
   }
 
   @Get('me/orders')

@@ -210,6 +210,16 @@ class EnvironmentVariables {
   @IsString()
   IDRX_MOCK_PUBLIC_URL?: string;
 
+  // Interval penyapu order tersangkut, dalam milidetik. Default 120000; lantai 30000; PLAFON
+  // 600000 (dijepit + ERROR kalau dilewati, lihat payments-reconcile.scheduler.ts).
+  // KENAPA TERDAFTAR DI SINI: ini BUKAN tuning. Nilainya adalah batas atas seberapa lama sebuah
+  // pembayaran yang callback-nya hilang bisa tidak terdeteksi. Dulu variabel ini tidak ada di
+  // skema mana pun, jadi salah ketik NAMANYA gagal diam-diam (jatuh ke default, masih aman) tapi
+  // salah isi NILAINYA menurunkan jaminan deteksi uang tanpa gejala. Sekarang terlihat saat boot.
+  @IsOptional()
+  @IsString()
+  PAYMENTS_RECONCILE_INTERVAL_MS?: string;
+
   // CC MOCK (staging/devnet). "1" mengaktifkan mock CollectorCrypt gacha: katalog mesin +
   // buka pack dijawab lokal dengan kartu palsu — tanpa API key CC, tanpa treasury ber-USDC,
   // tanpa transaksi on-chain. HANYA berlaku bila deployment tidak terlihat produksi
@@ -285,7 +295,8 @@ class EnvironmentVariables {
   // Kalau kosong, endpoint /redemptions/siws/nonce menolak dengan 503 "SIWS not configured"
   // (CcShippingService.siwsConfig) — TIDAK memanggil CC dengan partnerAppId/domain/uri undefined.
 
-  // Slug partner CC kita (atau Privy App ID) — dikirim sebagai partnerAppId ke /auth/wallet/nonce.
+  // partnerAppId yang DITERBITKAN CC (email support@collectorcrypt.com) — dikirim ke
+  // /auth/wallet/nonce. Nilai yang tidak dikenal CC dijawab 400 "Unknown partner".
   @IsOptional()
   @IsString()
   COLLECTORCRYPT_PARTNER_APP_ID?: string;

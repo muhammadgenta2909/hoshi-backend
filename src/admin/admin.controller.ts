@@ -35,6 +35,11 @@ import { AdminLoginDto } from './dto/admin-login.dto';
 import { AdminUpdateListingDto } from './dto/admin-update-listing.dto';
 import { SetListingStatusDto } from './dto/set-listing-status.dto';
 import { UpdateRedemptionStatusDto } from './dto/update-redemption-status.dto';
+import { CancelAwaitingPaymentDto } from './dto/cancel-awaiting-payment.dto';
+import { RecoverBurnSubmittedDto } from './dto/recover-burn-submitted.dto';
+import { SettleRefundDueDto } from './dto/settle-refund-due.dto';
+import { CurrentUser } from '../auth/current-user.decorator';
+import type { AuthUser } from '../auth/jwt.strategy';
 import {
   CreateContactMessageDto,
   MarkMessageReadDto,
@@ -233,13 +238,95 @@ export class AdminController {
   @ApiBearerAuth()
   @UseGuards(AdminGuard)
   @ApiOperation({
-    summary: 'Majukan status kirim: REQUESTED→PACKING→SHIPPED, atau CANCELED',
+    summary:
+      'Majukan/tutup status kirim. Record-only: REQUESTED→PACKING→SHIPPED→DELIVERED, atau ' +
+      'CANCELED. Jalur real (resolusi manual): FUNDING/FUNDED→RECLAIM_DUE, RECLAIM_DUE→CANCELED ' +
+      '(sesudah USDC direklaim; refundSafe TETAP false — BUKAN izin refund Rupiah), ' +
+      'SHIP_FAILED_POST_BURN→DELIVERED, IN_TRANSIT→DELIVERED (penutupan manual bila CC memarkir ' +
+      'kiriman di Shipped dan poll status tak pernah menjawab Delivered). ' +
+      'READY_TO_FUND dan BURN_SUBMITTED punya rute sendiri.',
   })
   updateRedemption(
     @Param('id') id: string,
     @Body() dto: UpdateRedemptionStatusDto,
   ) {
     return this.admin.updateRedemptionStatus(id, dto.status);
+  }
+
+  /**
+   * SATU-SATUNYA jalan keluar tanpa mengedit Postgres untuk baris yang nyangkut di BURN_SUBMITTED.
+   * Bukan endpoint "set status apa saja": HANYA BURN_SUBMITTED -> FUNDED, tidak ada parameter
+   * status, wajib beralasan, dan refundSafe tetap false.
+   */
+  @Post('redemptions/:id/recover-burn-submitted')
+  @ApiBearerAuth()
+  @UseGuards(AdminGuard)
+  @ApiOperation({
+    summary:
+      'PEMULIHAN MANUAL: BURN_SUBMITTED -> FUNDED (admin). PERINGATAN: dengan menjalankan ini ' +
+      'operator MENYATAKAN sudah memverifikasi ke CollectorCrypt bahwa kartunya BELUM dibakar. ' +
+      'Wajib menyertakan alasan (disimpan di baris). refundSafe TETAP false — aksi ini tidak ' +
+      'pernah membuat uang bisa di-refund.',
+  })
+  recoverRedemptionBurnSubmitted(
+    @Param('id') id: string,
+    @Body() dto: RecoverBurnSubmittedDto,
+    @CurrentUser() user: AuthUser,
+  ) {
+    return this.admin.recoverBurnSubmittedToFunded(id, dto.note, user);
+  }
+
+  /**
+   * B1 — SATU-SATUNYA jalan keluar untuk baris READY_TO_FUND (ongkir Rupiah LUNAS, USDC BELUM
+   * dikirim) yang tidak akan pernah bisa dipenuhi. Bentuknya sama dengan pemulihan BURN_SUBMITTED:
+   * satu transisi saja, tanpa parameter status, wajib beralasan, tulisan berpagar predikat.
+   * Bedanya: di sini refundSafe TIDAK ditulis — ia sudah true dan DIVERIFIKASI true (bersama
+   * fundingSignature null) sebagai SYARAT, karena itulah yang membuat Rupiah-nya benar-benar
+   * aman di-refund.
+   */
+  @Post('redemptions/:id/settle-refund-due')
+  @ApiBearerAuth()
+  @UseGuards(AdminGuard)
+  @ApiOperation({
+    summary:
+      'PENYELESAIAN MANUAL: READY_TO_FUND -> REFUND_DUE (admin). Ongkir Rupiah sudah LUNAS tapi ' +
+      'pendanaan USDC tidak pernah bisa dijalankan. Di status ini NOL USDC treasury bergerak ' +
+      '(diverifikasi: fundingSignature null + refundSafe true), jadi ongkir Rupiah BENAR-BENAR ' +
+      'aman di-refund — dan operator WAJIB melakukan refund itu DI LUAR SISTEM. Wajib menyertakan ' +
+      'alasan (DITAMBAHKAN ke catatan baris). Mint-nya jadi bebas: user boleh minta kirim lagi.',
+  })
+  settleRedemptionRefundDue(
+    @Param('id') id: string,
+    @Body() dto: SettleRefundDueDto,
+    @CurrentUser() user: AuthUser,
+  ) {
+    return this.admin.settleReadyToFundAsRefundDue(id, dto.note, user);
+  }
+
+  /**
+   * B1 — JALAN KELUAR TERAKHIR untuk baris AWAITING_PAYMENT (tagihan ongkir terbit, baris
+   * redemption NOL uang). Tombol batal user menutup kasus umumnya; rute ini untuk saat usernya
+   * sudah tidak ada, atau saat order ongkirnya duduk di status yang tombol user tolak
+   * (PAID/FULFILLED). Bentuknya sama dengan dua rute pemulihan lain: satu transisi saja, tanpa
+   * parameter status, wajib beralasan, tulisan berpagar predikat, dan refundSafe TIDAK ditulis.
+   */
+  @Post('redemptions/:id/cancel-awaiting-payment')
+  @ApiBearerAuth()
+  @UseGuards(AdminGuard)
+  @ApiOperation({
+    summary:
+      'PEMBATALAN MANUAL: AWAITING_PAYMENT -> CANCELED (admin). Untuk baris yang tagihan ongkirnya ' +
+      'terbit tapi tidak akan pernah bergerak lagi (user hilang, atau order ongkirnya macet di ' +
+      'FULFILLING sesudah proses mati). Baris redemption NOL uang di status ini — utang ongkirnya ' +
+      'tetap tercatat di PaymentOrder-nya sendiri dan DILAPORKAN di `shippingDebts` pada respons. ' +
+      'Wajib menyertakan alasan (DITAMBAHKAN ke catatan baris). Mint-nya jadi bebas diminta lagi.',
+  })
+  cancelRedemptionAwaitingPayment(
+    @Param('id') id: string,
+    @Body() dto: CancelAwaitingPaymentDto,
+    @CurrentUser() user: AuthUser,
+  ) {
+    return this.admin.cancelAwaitingPayment(id, dto.note, user);
   }
 
   @Get('listings')
