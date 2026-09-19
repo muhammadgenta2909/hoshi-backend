@@ -36,8 +36,31 @@ import {
   unescrowedUserListingWhere,
 } from '../marketplace/p2p.gate';
 import { PrismaService } from '../prisma/prisma.service';
-import { recordShippingRefundDebts } from '../payments/shipping-refund-debt';
+import {
+  recordShippingRefundDebts,
+  type ShippingRefundDebt,
+} from '../payments/shipping-refund-debt';
+import {
+  DOMESTIC_DEFAULT_TIERS,
+  DOMESTIC_LUAR_JAWA_IDR_PLACEHOLDER,
+  DOMESTIC_RATE_SCOPE_NATIONWIDE,
+  DOMESTIC_RATE_SCOPE_STATE_PREFIX,
+  DOMESTIC_RATE_SCOPE_TIER_PREFIX,
+  DOMESTIC_SHIPPING_FLAT_IDR_PLACEHOLDER,
+  DOMESTIC_TIER_JAWA,
+  DOMESTIC_TIER_LUAR_JAWA,
+  JAWA_PROVINCE_ALIASES,
+  assertSaneRate,
+  normalizeRegionKey,
+  normalizeScope,
+} from '../payments/domestic-shipping-rate';
+import {
+  IDRX_MAX_MINT_IDR,
+  IDRX_MIN_MINT_IDR,
+} from '../payments/idrx-mint-bounds';
 import { appendBoundedNote, NOTE_MAX } from '../common/append-note';
+import { isHoshiSellableStock } from '../common/hoshi-stock';
+import { isDomesticRedemption } from '../common/hoshi-domestic-shipping';
 import { AdminCreateListingDto } from './dto/admin-create-listing.dto';
 import { AdminUpdateListingDto } from './dto/admin-update-listing.dto';
 import { CreateContactMessageDto } from './dto/contact-message.dto';
@@ -54,6 +77,153 @@ import * as path from 'node:path';
 /** Label wallet ringkas: 5 depan + ".." + 4 belakang (cermin shortWallet marketplace). */
 function shortWalletLabel(w: string): string {
   return w.length <= 11 ? w : `${w.slice(0, 5)}..${w.slice(-4)}`;
+}
+
+/* ╔════════════════════════════════════════════════════════════════════════════════════════════╗
+   ║ B2 — SATU SUMBER KEBENARAN untuk transisi status redemption yang boleh dilakukan admin.    ║
+   ╚════════════════════════════════════════════════════════════════════════════════════════════╝
+   Dulu tabel ini hidup sebagai variabel LOKAL di `updateRedemptionStatus`, jadi satu-satunya cara
+   dashboard bisa tahu tombol mana yang sah adalah MENEBAK — dan tebakan itulah yang menampilkan
+   "Kemas" & "Kirim" pada baris domestik yang ongkirnya belum ditagih. Dinaikkan ke modul supaya
+   `listRedemptions()` MENYAJIKAN daftar yang SAMA PERSIS dengan yang ditegakkan penulisnya; tidak
+   ada dua salinan yang bisa menyimpang.
+
+   Partial: status yang tak tercantum → tak punya transisi admin (default []). Itu yang menutup
+   BURN_SUBMITTED/DELIVERED dst. dari sentuhan admin. Penjelasan lengkap tiap barisnya ada di
+   docblock `updateRedemptionStatus`. */
+const REDEMPTION_ADMIN_TRANSITIONS: Partial<
+  Record<RedemptionStatus, RedemptionStatus[]>
+> = {
+  [RedemptionStatus.REQUESTED]: [
+    RedemptionStatus.PACKING,
+    RedemptionStatus.SHIPPED,
+    RedemptionStatus.CANCELED,
+  ],
+  [RedemptionStatus.PACKING]: [
+    RedemptionStatus.SHIPPED,
+    RedemptionStatus.CANCELED,
+  ],
+  // B1: penutupan jalur record-only. Tanpa ini SHIPPED memblokir mint-nya selamanya.
+  [RedemptionStatus.SHIPPED]: [RedemptionStatus.DELIVERED],
+  // Resolusi manual jalur real: funding yang ditinggalkan user → RECLAIM_DUE (USDC sudah/mungkin
+  // keluar; JANGAN refund Rupiah, reclaim USDC on-chain manual).
+  [RedemptionStatus.FUNDING]: [RedemptionStatus.RECLAIM_DUE],
+  [RedemptionStatus.FUNDED]: [RedemptionStatus.RECLAIM_DUE],
+  // B1: penutupan RECLAIM_DUE sesudah USDC-nya benar-benar direklaim/ditulis-rugi. Kartunya
+  // TIDAK pernah dibakar (itulah arti RECLAIM_DUE), jadi mint-nya memang boleh diminta lagi.
+  // refundSafe TIDAK ikut ditulis di sini: ia tetap false, dan gerbang refund tetap menolak.
+  [RedemptionStatus.RECLAIM_DUE]: [RedemptionStatus.CANCELED],
+  // B1: penutupan kasus support pasca-burn yang akhirnya sampai ke user.
+  [RedemptionStatus.SHIP_FAILED_POST_BURN]: [RedemptionStatus.DELIVERED],
+  // B2: penutupan yang DIKENDALIKAN KITA untuk kiriman yang diparkir CC di `Shipped`.
+  // Tidak menyentuh uang: IN_TRANSIT berarti NFT-nya sudah dibakar, jadi tidak ada yang bisa
+  // ditebus dua kali dan tidak ada Rupiah yang jadi bisa di-refund gara-gara transisi ini.
+  [RedemptionStatus.IN_TRANSIT]: [RedemptionStatus.DELIVERED],
+};
+
+/**
+ * B2 — TRANSISI DOMESTIK YANG MENGIRIM BARANG. Inilah yang tidak boleh dijalankan sebelum ongkir
+ * Rupiah-nya lunas: keduanya berarti paketnya mulai bergerak keluar dari rak Hoshi.
+ */
+const DOMESTIC_FULFILMENT_TARGETS: RedemptionStatus[] = [
+  RedemptionStatus.PACKING,
+  RedemptionStatus.SHIPPED,
+];
+
+/** Panjang minimum pernyataan operator yang ikut DISIMPAN di baris (sama dengan rute admin lain). */
+const OPERATOR_NOTE_MIN = 10;
+
+/**
+ * B2 — RINGKASAN TAGIHAN ONGKIR satu baris redemption, untuk dashboard admin.
+ *
+ * Dulu tidak ada satu pun field seperti ini yang sampai ke layar: rail-nya dihitung lalu dibuang,
+ * dan keadaan pembayaran ongkirnya tidak pernah dihitung sama sekali. Operator melihat dua tombol
+ * dan tidak punya cara tahu bahwa menekannya berarti Hoshi menanggung ongkirnya.
+ */
+export interface AdminRedemptionOngkir {
+  /** true ⇔ rail ini menagih ongkir Rupiah lewat invoice IDRX (yaitu: rail DOMESTIK). */
+  required: boolean;
+  /** true ⇔ ADA order SHIPPING berstatus FULFILLED untuk baris ini = ongkirnya LUNAS. */
+  paid: boolean;
+  /** true ⇔ ada order yang pemenuhannya masih berjalan (PAID/FULFILLING) — TUNGGU, jangan majukan. */
+  inFlight: boolean;
+  /** true ⇔ ada order yang sudah tercatat sebagai utang refund (REFUND_DUE). */
+  refundDue: boolean;
+  /**
+   * Untuk order REFUND_DUE: gerbang refund-nya. false = operator DILARANG mengirim uang sebelum
+   * verifikasi di luar sistem. null = tidak ada order REFUND_DUE.
+   */
+  refundSafe: boolean | null;
+  /** Total Rupiah yang benar-benar LUNAS (jumlah order berstatus FULFILLED). */
+  paidIdr: number;
+  /** Semua tagihan ongkir baris ini, terbaru dulu. [] = belum pernah ada tagihan. */
+  orders: Array<{
+    merchantOrderId: string;
+    status: PaymentStatus;
+    priceIdr: number;
+    refundSafe: boolean;
+    createdAt: Date;
+    paidAt: Date | null;
+    fulfilledAt: Date | null;
+  }>;
+}
+
+/**
+ * Ringkasan "belum ada tagihan apa pun". FUNGSI, bukan konstanta: sebuah konstanta bersama akan
+ * membuat SEMUA baris ikut memakai SATU array `orders` yang sama, dan satu `push` di mana pun
+ * kelak akan bocor ke setiap baris lain. Objek baru tiap panggilan menutup jalan itu sepenuhnya.
+ */
+function ongkirNone(required = false): AdminRedemptionOngkir {
+  return {
+    required,
+    paid: false,
+    inFlight: false,
+    refundDue: false,
+    refundSafe: null,
+    paidIdr: 0,
+    orders: [],
+  };
+}
+
+/**
+ * B2 — APA YANG MASIH HARUS DIPUTUSKAN MANUSIA pada SATU baris redemption.
+ *
+ * Bentuknya sengaja sama dengan `actionRequired` di rute tarif ongkir: daftar kalimat, KOSONG
+ * berarti benar-benar tidak ada yang tertunggak. Ini pengganti `logger.warn` yang tidak pernah
+ * sampai ke siapa pun — sebuah peringatan yang tidak terbaca bukan pengaman.
+ */
+function redemptionActionRequired(
+  status: RedemptionStatus,
+  rail: 'HOSHI_DOMESTIC' | 'CC_VAULT',
+  ongkir: AdminRedemptionOngkir,
+): string[] {
+  const out: string[] = [];
+  if (rail === 'HOSHI_DOMESTIC' && status === RedemptionStatus.REQUESTED) {
+    if (ongkir.inFlight) {
+      out.push(
+        'Pembayaran ongkir user sedang diproses (order PAID/FULFILLING). TUNGGU satu putaran ' +
+          'reconciler — baris ini akan pindah ke PACKING sendiri begitu lunas. Jangan dimajukan ' +
+          'tangan sekarang.',
+      );
+    } else if (!ongkir.paid) {
+      out.push(
+        'ONGKIR BELUM LUNAS. Alur normalnya: user membayar invoice ongkir, lalu baris ini pindah ' +
+          'ke PACKING OTOMATIS. Memajukannya tangan berarti ONGKIRNYA DITANGGUNG HOSHI — jadi ' +
+          'PACKING/SHIPPED DITOLAK di sini kecuali Anda sadar-sadar menanggungnya ' +
+          '(absorbShippingFee=true + alasan, tersimpan permanen di baris).',
+      );
+    }
+  }
+  if (ongkir.refundDue) {
+    out.push(
+      ongkir.refundSafe === false
+        ? 'Ada tagihan ongkir REFUND_DUE dengan refundSafe=FALSE — JANGAN kirim uangnya. ' +
+            'Verifikasi dulu di luar sistem (dashboard IDRX / posisi USDC on-chain).'
+        : `Ada tagihan ongkir REFUND_DUE (refundSafe=true): KEMBALIKAN Rupiah-nya ke user DI LUAR ` +
+            'SISTEM. Tidak ada kode yang mengirimkannya otomatis.',
+    );
+  }
+  return out;
 }
 
 export interface AdminStatsResponse {
@@ -142,14 +312,435 @@ export class AdminService {
     };
   }
 
+  /* ──────────── TARIF ONGKIR KIRIM DOMESTIK (stok Hoshi, kurir lokal) ──────────── */
+
+  /**
+   * Semua baris tarif + penjelasan urutan resolusinya + APA YANG MASIH HARUS DIPUTUSKAN PEMILIK
+   * PRODUK. READ-ONLY.
+   *
+   * ┌──── KENAPA RUTE INI MENGEMBALIKAN LEBIH DARI SEKADAR BARIS ────────────────────────────┐
+   * │ Model ongkirnya BERTINGKAT PER WILAYAH tapi ANGKANYA BELUM DIPUTUSKAN. Kalau rute ini    │
+   * │ cuma mengembalikan isi tabel, tabel KOSONG akan terbaca sebagai "tidak ada yang perlu    │
+   * │ dilakukan" — padahal artinya justru sebaliknya: jalur bayar sedang memakai TIER          │
+   * │ PENAMPUNG di kode, dan setiap pembeli sedang ditagih angka yang belum disetujui siapa    │
+   * │ pun. Maka rute ini SELALU menyebut tier yang SEDANG BERLAKU (dari DB maupun dari         │
+   * │ penampung), menandai mana yang masih penampung, dan menaruhnya di `actionRequired`.      │
+   * └─────────────────────────────────────────────────────────────────────────────────────────┘
+   */
+  async listDomesticShippingRates() {
+    const state = await this.domesticRateState();
+    return {
+      data: state.rows,
+      /** Tier yang SEDANG berlaku — dari DB kalau ada baris aktif, kalau tidak dari penampung. */
+      effective: state.effective,
+      /** Kosong = konfigurasi ongkir lengkap. Tidak kosong = pembeli ditagih angka sementara. */
+      actionRequired: state.actionRequired,
+      /**
+       * B4 — true ⇔ TIDAK ADA satu pun baris AKTIF di DB, jadi jalur bayar sedang memakai
+       * DOMESTIC_DEFAULT_TIERS di kode. Sengaja jadi boolean sendiri: sebuah tabel kosong tidak
+       * boleh bisa terbaca sebagai "beres" hanya karena `data` berukuran nol.
+       */
+      usingDefaults: state.usingDefaults,
+      /** Jumlah tier yang harganya masih PENAMPUNG. >0 = pembeli ditagih angka yang belum disetujui. */
+      placeholderCount: state.effective.filter((t) => t.placeholder).length,
+      /**
+       * B4 — batas nominal yang DITEGAKKAN service (assertSaneRate). Form di dashboard WAJIB
+       * memvalidasi dengan angka ini supaya operator tidak baru tahu setelah menekan Simpan.
+       */
+      limits: {
+        minPriceIdr: IDRX_MIN_MINT_IDR,
+        maxPriceIdr: IDRX_MAX_MINT_IDR,
+        maxProvincesPerTier: 500,
+        maxScopeLength: 120,
+      },
+      /** Angka PENAMPUNG di kode — yang SEDANG ditagihkan selama `usingDefaults` true. */
+      placeholderPricesIdr: {
+        jawa: DOMESTIC_SHIPPING_FLAT_IDR_PLACEHOLDER,
+        luarJawa: DOMESTIC_LUAR_JAWA_IDR_PLACEHOLDER,
+      },
+      nationwideScope: DOMESTIC_RATE_SCOPE_NATIONWIDE,
+      tierScopePrefix: DOMESTIC_RATE_SCOPE_TIER_PREFIX,
+      stateScopePrefix: DOMESTIC_RATE_SCOPE_STATE_PREFIX,
+      /** Contoh SIAP-TEMPEL untuk menetapkan dua tier awal. */
+      example: {
+        jawa: {
+          scope: DOMESTIC_TIER_JAWA,
+          label: 'Jawa',
+          priceIdr: 22000,
+          provinces: [...JAWA_PROVINCE_ALIASES],
+        },
+        luarJawa: {
+          scope: DOMESTIC_TIER_LUAR_JAWA,
+          label: 'Luar Jawa',
+          priceIdr: 45000,
+          fallback: true,
+        },
+        satuProvinsi: { scope: 'STATE:papua', label: 'Papua', priceIdr: 95000 },
+      },
+      resolution:
+        'Urutan yang dipakai jalur bayar, dari paling spesifik: (1) baris AKTIF ber-scope ' +
+        "'STATE:<provinsi>'; (2) baris AKTIF yang `provinces`-nya memuat provinsi tujuan; " +
+        '(3) baris AKTIF ber-fallback=true (provinsi tak dikenal / alamat tanpa provinsi); ' +
+        "(4) baris AKTIF ber-scope '*'; (5) env HOSHI_DOMESTIC_SHIPPING_FLAT_IDR; (6) tier " +
+        'PENAMPUNG di kode (src/payments/domestic-shipping-rate.ts). Set baris di sini untuk ' +
+        'mengubah ongkir TANPA deploy dan TANPA restart — termasuk MENAMBAH TIER BARU.',
+      note:
+        'Alamat di LUAR Indonesia DITOLAK jalur ini (HOSHI_DOMESTIC_ADDRESS_UNSUPPORTED), bukan ' +
+        'ditagih tarif domestik. Alamat Indonesia TANPA provinsi tetap dilayani, dengan tarif ' +
+        'tier PENAMPUNG.',
+      /** PUT-nya UPSERT per `scope` → memanggilnya dua kali dengan body sama TIDAK menggandakan apa pun. */
+      idempotency:
+        "PUT /admin/shipping/domestic-rates adalah UPSERT dengan kunci `scope`: mengirim body " +
+        'yang sama dua kali menghasilkan baris yang sama (aman di-retry). Field yang TIDAK ' +
+        'disebut tidak diubah — sebuah PUT yang cuma membetulkan harga tidak mengosongkan ' +
+        'daftar provinsi tier itu.',
+    };
+  }
+
+  /**
+   * B4 — keadaan tarif yang DIPAKAI BERSAMA oleh GET dan PUT, supaya keduanya tidak bisa
+   * menyimpang. PUT mengembalikan `actionRequired`/`effective` yang SUDAH diperbarui, jadi
+   * dashboard bisa merender ulang tanpa memanggil GET lagi (dan tanpa menampilkan keadaan basi).
+   */
+  private async domesticRateState() {
+    const rows = await this.prisma.domesticShippingRate.findMany({
+      orderBy: { scope: 'asc' },
+    });
+    const activeRows = rows.filter((r) => r.active);
+
+    // Tier yang BENAR-BENAR dipakai hari ini. Kalau belum ada satu pun baris AKTIF, jalur bayar
+    // memakai DOMESTIC_DEFAULT_TIERS — jadi itulah yang ditampilkan, ditandai jelas.
+    const effective =
+      activeRows.length > 0
+        ? activeRows.map((r) => ({
+            scope: r.scope,
+            label: r.label,
+            priceIdr: r.priceIdr,
+            provinces: r.provinces,
+            fallback: r.fallback,
+            placeholder: r.placeholder,
+            from: 'DB' as const,
+          }))
+        : DOMESTIC_DEFAULT_TIERS.map((t) => ({
+            scope: t.scope,
+            label: t.label,
+            priceIdr: t.priceIdr,
+            provinces: [...t.provinces],
+            fallback: t.fallback,
+            placeholder: true,
+            from: 'DEFAULT_TIER' as const,
+          }));
+
+    const stillPlaceholder = effective.filter((t) => t.placeholder);
+    const fallbackCount = effective.filter((t) => t.fallback).length;
+
+    // Daftar tugas yang BELUM SELESAI. Kosong = konfigurasinya lengkap. Tidak pernah diperhalus
+    // jadi "peringatan" — ini hal-hal yang membuat pembeli ditagih angka yang salah.
+    const actionRequired: string[] = [];
+    if (stillPlaceholder.length > 0) {
+      actionRequired.push(
+        `${stillPlaceholder.length} tier masih memakai ANGKA PENAMPUNG yang belum diputuskan ` +
+          `pemilik produk (${stillPlaceholder.map((t) => t.scope).join(', ')}). Set harganya ` +
+          'lewat PUT /api/admin/shipping/domestic-rates — angka itu SEDANG ditagihkan ke pembeli.',
+      );
+    }
+    if (fallbackCount === 0) {
+      actionRequired.push(
+        'TIDAK ADA tier PENAMPUNG (fallback=true). Provinsi yang tidak terdaftar di tier mana pun ' +
+          "akan jatuh ke baris '*' (flat nasional) kalau ada, dan kalau tidak ada pun ke tier " +
+          'penampung di kode. Tandai satu tier — biasanya yang TERMAHAL — dengan fallback=true.',
+      );
+    }
+    if (fallbackCount > 1) {
+      actionRequired.push(
+        `Ada ${fallbackCount} tier yang sama-sama fallback=true. Seharusnya TEPAT SATU; resolusi ` +
+          'memakai yang TERMAHAL sampai ini dibereskan.',
+      );
+    }
+
+    return {
+      rows,
+      effective,
+      actionRequired,
+      usingDefaults: activeRows.length === 0,
+    };
+  }
+
+  /**
+   * UPSERT satu TIER ongkir (kunci: scope). Default scope '*' = flat nasional (bentuk lama).
+   *
+   * INI RUTE TEMPAT PEMILIK PRODUK MENETAPKAN ONGKIRNYA, dan tempat TIER BARU LAHIR: karena satu
+   * baris = satu tier yang membawa harganya SEKALIGUS daftar provinsinya, menambah tier tidak
+   * pernah butuh perubahan kode, migrasi, atau restart.
+   *
+   * NOL DANA TREASURY: baris ini hanya menentukan nominal RUPIAH yang ditagihkan ke pembeli.
+   * Tidak ada USDC, tidak ada plafon treasury yang tersentuh.
+   *
+   * TIGA PENEGAKAN DI SINI, semuanya di depan operator (bukan nanti di checkout user):
+   *   1. nominal divalidasi ke batas mint IDRX (assertSaneRate) — tarif di bawah Rp 20.000
+   *      menghasilkan baris yang kelihatan benar tapi invoice-nya tidak akan pernah bisa terbit.
+   *   2. `provinces` DINORMALKAN (huruf kecil, tanda baca jadi spasi) supaya pencocokan tidak
+   *      bergantung pada cara operator mengetik, dan duplikatnya dibuang.
+   *   3. fallback TUNGGAL: menyalakan flag itu di satu baris otomatis mematikannya di baris lain,
+   *      dalam SATU transaksi. Tanpa ini, partial unique index di DB akan menolak tulisannya
+   *      dengan P2002 yang tidak menjelaskan apa-apa.
+   */
+  async setDomesticShippingRate(
+    input: {
+      scope?: string;
+      priceIdr: number;
+      provinces?: string[];
+      fallback?: boolean;
+      label?: string;
+      active?: boolean;
+      note?: string;
+    },
+    admin: { id: string; walletAddress: string },
+  ) {
+    // Scope dinormalkan lewat helper yang SAMA dengan yang dipakai resolusi, supaya
+    // 'STATE:DKI Jakarta' yang diketik admin dan 'STATE:dki jakarta' yang dicari jalur bayar
+    // tidak pernah jadi dua baris berbeda yang saling tidak kelihatan.
+    const scope = normalizeScope(input.scope ?? DOMESTIC_RATE_SCOPE_NATIONWIDE);
+    if (!scope) {
+      throw new BadRequestException(
+        `Scope tidak boleh kosong. Pakai '${DOMESTIC_RATE_SCOPE_NATIONWIDE}' untuk flat nasional, ` +
+          `'${DOMESTIC_RATE_SCOPE_TIER_PREFIX}<NAMA>' untuk tier wilayah.`,
+      );
+    }
+    assertSaneRate(input.priceIdr, scope);
+
+    // Provinsi dinormalkan + di-dedup. Yang kosong dibuang: satu entri kosong akan cocok dengan
+    // alamat yang tidak menyebut provinsi, diam-diam mengubah tier ini jadi penampung kedua.
+    const provinces =
+      input.provinces === undefined
+        ? undefined
+        : [
+            ...new Set(
+              input.provinces.map((p) => normalizeRegionKey(p)).filter((p) => p.length > 0),
+            ),
+          ];
+
+    // Keadaan AKHIR baris ini dihitung dari gabungan "apa yang dikirim" dan "apa yang sudah ada",
+    // BUKAN dari body saja. Kalau tidak: sebuah PUT yang cuma menyalakan `active: true` pada baris
+    // yang SUDAH fallback akan melewati pembersihan di bawah dan ditolak index parsialnya dengan
+    // P2002 yang tidak menjelaskan apa-apa.
+    const existing = await this.prisma.domesticShippingRate.findUnique({
+      where: { scope },
+      select: { fallback: true, active: true },
+    });
+    const willBeFallback = input.fallback ?? existing?.fallback ?? false;
+    const willBeActive = input.active ?? existing?.active ?? true;
+    const wantsFallback = input.fallback === true;
+
+    const row = await this.prisma.$transaction(async (tx) => {
+      // FALLBACK TUNGGAL — dimatikan di baris lain DULU, di transaksi yang sama, supaya tidak
+      // pernah ada dua penampung (dan supaya index parsialnya tidak menolak tulisan ini).
+      if (willBeFallback && willBeActive) {
+        await tx.domesticShippingRate.updateMany({
+          where: { fallback: true, scope: { not: scope } },
+          data: { fallback: false },
+        });
+      }
+      return tx.domesticShippingRate.upsert({
+        where: { scope },
+        create: {
+          scope,
+          priceIdr: input.priceIdr,
+          provinces: provinces ?? [],
+          fallback: wantsFallback,
+          label: input.label ?? null,
+          active: input.active ?? true,
+          note: input.note ?? null,
+          // Ditulis MANUSIA → bukan penampung lagi. Inilah yang membuat `actionRequired` menyusut.
+          placeholder: false,
+          updatedBy: admin.id,
+        },
+        update: {
+          priceIdr: input.priceIdr,
+          // TIDAK DISEBUT = TIDAK DIUBAH. Sebuah PUT yang cuma membetulkan harga tidak boleh
+          // diam-diam mengosongkan daftar provinsi tier itu.
+          ...(provinces !== undefined && { provinces }),
+          ...(input.fallback !== undefined && { fallback: input.fallback }),
+          ...(input.label !== undefined && { label: input.label }),
+          ...(input.active !== undefined && { active: input.active }),
+          ...(input.note !== undefined && { note: input.note }),
+          placeholder: false,
+          updatedBy: admin.id,
+        },
+      });
+    });
+
+    // PERINGATAN KONFIGURASI — dihitung SESUDAH tulisannya, dari keadaan yang sebenarnya.
+    const after = await this.prisma.domesticShippingRate.findMany({
+      where: { active: true },
+      select: { scope: true, priceIdr: true, fallback: true, placeholder: true },
+    });
+    const warnings: string[] = [];
+    const fallbacks = after.filter((r) => r.fallback);
+    if (fallbacks.length === 0) {
+      warnings.push(
+        'Belum ada tier PENAMPUNG (fallback=true). Provinsi yang tidak terdaftar di tier mana pun ' +
+          "akan jatuh ke baris '*' kalau ada, kalau tidak ke tier penampung di kode.",
+      );
+    }
+    const dearest = after.reduce(
+      (a, r) => (r.priceIdr > a ? r.priceIdr : a),
+      0,
+    );
+    if (fallbacks.length === 1 && fallbacks[0].priceIdr < dearest) {
+      warnings.push(
+        `Tier PENAMPUNG (${fallbacks[0].scope}, Rp ${fallbacks[0].priceIdr}) BUKAN yang termahal ` +
+          `(termahal: Rp ${dearest}). Provinsi yang belum terdaftar akan ditagih KURANG dari ` +
+          'tier termahal — pastikan itu memang yang kamu mau.',
+      );
+    }
+    const stillPlaceholder = after.filter((r) => r.placeholder);
+    if (stillPlaceholder.length > 0) {
+      warnings.push(
+        `${stillPlaceholder.length} tier lain masih memakai angka PENAMPUNG ` +
+          `(${stillPlaceholder.map((r) => r.scope).join(', ')}).`,
+      );
+    }
+
+    this.logger.warn(
+      `ADMIN tarif ongkir DOMESTIK scope '${scope}' = Rp ${row.priceIdr} ` +
+        `(active=${row.active}, fallback=${row.fallback}, provinsi=${row.provinces.length}) ` +
+        `oleh ${admin.id} (${admin.walletAddress}). ` +
+        'Berlaku untuk tagihan ongkir BERIKUTNYA; tagihan yang sudah terbit memakai nominal ' +
+        'yang di-snapshot di baris PaymentOrder-nya sendiri.',
+    );
+    // B4 — keadaan SESUDAH tulisan, dari fungsi yang SAMA dengan GET. Dashboard bisa merender
+    // ulang langsung dari respons PUT: tidak ada jendela di mana layar memperlihatkan
+    // `actionRequired` yang basi, dan tidak ada dua perhitungan yang bisa menyimpang.
+    const state = await this.domesticRateState();
+    return {
+      rate: row,
+      warnings,
+      warning:
+        'Tarif ini dipakai untuk tagihan ongkir BERIKUTNYA. Tagihan yang sudah terbit TIDAK ' +
+        'berubah — nominalnya di-snapshot di PaymentOrder saat invoice dibuat.',
+      /** Bentuknya IDENTIK dengan field bernama sama di GET — satu tipe di klien. */
+      effective: state.effective,
+      actionRequired: state.actionRequired,
+      usingDefaults: state.usingDefaults,
+    };
+  }
+
   /* ---------------------- Kirim kartu fisik (redemption) ---------------------- */
 
-  /** Semua permintaan kirim kartu fisik (admin), terbaru dulu. */
+  /**
+   * Semua permintaan kirim kartu fisik (admin), terbaru dulu.
+   *
+   * `rail` DITURUNKAN dari kolom `listingId` (bukan dari `source`, yang free-form dan bisa
+   * berbunyi 'HOSHI' pada baris warisan jalur CC). Operator WAJIB bisa melihat bedanya sekilas:
+   * HOSHI_DOMESTIC = kemas & kirim sendiri lewat kurir lokal, isi resinya di sini.
+   * CC_VAULT = burn + shipment CollectorCrypt; resinya datang dari poll CC, jangan diisi tangan.
+   */
   async listRedemptions() {
-    return this.prisma.cardRedemption.findMany({
+    const rows = await this.prisma.cardRedemption.findMany({
       orderBy: { createdAt: 'desc' },
       take: 200,
     });
+    const ongkirById = await this.summarizeOngkir(rows.map((r) => r.id));
+
+    return rows.map((r) => {
+      const domestic = isDomesticRedemption(r);
+      const rail = domestic
+        ? ('HOSHI_DOMESTIC' as const)
+        : ('CC_VAULT' as const);
+      const ongkir: AdminRedemptionOngkir = domestic
+        ? (ongkirById.get(r.id) ?? ongkirNone(true))
+        : ongkirNone(false);
+
+      // Transisi yang BENAR-BENAR akan diterima penulisnya — dari tabel yang SAMA, lalu dikurangi
+      // pagar ongkir. Inilah yang dulu tidak ada: dashboard menggambar tombolnya sendiri.
+      const allNext = REDEMPTION_ADMIN_TRANSITIONS[r.status] ?? [];
+      const ongkirBlocks =
+        domestic &&
+        r.status === RedemptionStatus.REQUESTED &&
+        !ongkir.paid;
+      const blockedNextStatuses = ongkirBlocks
+        ? allNext.filter((s) => DOMESTIC_FULFILMENT_TARGETS.includes(s))
+        : [];
+      const allowedNextStatuses = allNext.filter(
+        (s) => !blockedNextStatuses.includes(s),
+      );
+
+      return {
+        ...r,
+        rail,
+        ongkir,
+        /** Tombol yang boleh dirender. Sudah dikurangi pagar ongkir — bukan tabel mentah. */
+        allowedNextStatuses,
+        /**
+         * Tombol yang tabelnya izinkan TAPI pagar ongkir tolak. Render disabled + alasannya,
+         * jangan disembunyikan: operator harus tahu bahwa jalan keluarnya ada tapi berbayar.
+         */
+        blockedNextStatuses,
+        /** Kosong = tidak ada yang tertunggak di baris ini. Tidak pernah diperhalus jadi "info". */
+        actionRequired: redemptionActionRequired(r.status, rail, ongkir),
+      };
+    });
+  }
+
+  /**
+   * B2 — keadaan tagihan ongkir untuk BANYAK baris redemption sekaligus (satu query, bukan N+1).
+   *
+   * Sumbernya SATU: baris PaymentOrder ber-`packType='SHIPPING'`. Tidak ada kolom turunan di
+   * CardRedemption yang bisa menyimpang darinya.
+   */
+  private async summarizeOngkir(
+    redemptionIds: string[],
+  ): Promise<Map<string, AdminRedemptionOngkir>> {
+    const out = new Map<string, AdminRedemptionOngkir>();
+    if (redemptionIds.length === 0) return out;
+
+    const orders = await this.prisma.paymentOrder.findMany({
+      where: { redemptionId: { in: redemptionIds }, packType: 'SHIPPING' },
+      orderBy: { createdAt: 'desc' },
+      select: {
+        redemptionId: true,
+        merchantOrderId: true,
+        status: true,
+        priceIdr: true,
+        refundSafe: true,
+        createdAt: true,
+        paidAt: true,
+        fulfilledAt: true,
+      },
+    });
+
+    for (const o of orders) {
+      if (!o.redemptionId) continue;
+      const cur = out.get(o.redemptionId) ?? ongkirNone(true);
+      cur.orders.push({
+        merchantOrderId: o.merchantOrderId,
+        status: o.status,
+        priceIdr: o.priceIdr,
+        refundSafe: o.refundSafe,
+        createdAt: o.createdAt,
+        paidAt: o.paidAt,
+        fulfilledAt: o.fulfilledAt,
+      });
+      if (o.status === PaymentStatus.FULFILLED) {
+        cur.paid = true;
+        cur.paidIdr += o.priceIdr;
+      }
+      if (
+        o.status === PaymentStatus.PAID ||
+        o.status === PaymentStatus.FULFILLING
+      ) {
+        cur.inFlight = true;
+      }
+      if (o.status === PaymentStatus.REFUND_DUE) {
+        cur.refundDue = true;
+        // Gerbang refund PALING KETAT menang: satu order yang tidak boleh di-refund cukup untuk
+        // menahan seluruh barisnya. Menaikkannya kembali ke true di sini akan menghapus larangan.
+        cur.refundSafe = (cur.refundSafe ?? true) && o.refundSafe;
+      }
+      out.set(o.redemptionId, cur);
+    }
+    return out;
   }
 
   /**
@@ -200,42 +791,40 @@ export class AdminService {
    * IN_TRANSIT kini punya DUA jalan keluar: poll shipment CC (CcShippingService.refreshStatus →
    * `Delivered`) yang OTOMATIS tapi MILIK PIHAK KETIGA, dan PATCH status ini yang MILIK KITA.
    */
-  async updateRedemptionStatus(id: string, status: RedemptionStatus) {
+  async updateRedemptionStatus(
+    id: string,
+    status: RedemptionStatus,
+    /**
+     * RESI kurir — HANYA sah untuk baris jalur DOMESTIK. Pada baris jalur CC, kolom
+     * trackingIds/trackingUrls MILIK poll shipment CollectorCrypt: menulisnya tangan di sini
+     * akan menimpa nomor resi asli dengan angka yang kita karang, dan tidak ada apa pun di
+     * baris itu yang menandai bahwa itu terjadi. Jadi ditolak, bukan diabaikan.
+     */
+    tracking?: { trackingIds?: string[]; trackingUrls?: string[] },
+    /**
+     * B2 — PENANGGUNGAN ONGKIR YANG DISENGAJA. Satu-satunya cara memajukan baris DOMESTIK dari
+     * REQUESTED ke PACKING/SHIPPED tanpa ongkir yang lunas. Bukan "flag paksa" umum: ia hanya
+     * berlaku untuk sel matriks itu, wajib membawa alasan, dan alasannya DISIMPAN di baris.
+     */
+    opts?: { absorbShippingFee?: boolean; note?: string },
+  ) {
     const row = await this.prisma.cardRedemption.findUnique({ where: { id } });
     if (!row) {
       throw new NotFoundException('Permintaan kirim tidak ditemukan.');
     }
-    // Partial: status yang tak tercantum → tak punya transisi admin (default []). Ini yang menutup
-    // BURN_SUBMITTED/DELIVERED dst. dari sentuhan admin, sekaligus menyenangkan tipe
-    // (enum RedemptionStatus kini punya banyak nilai jalur-real).
-    const allowed: Partial<Record<RedemptionStatus, RedemptionStatus[]>> = {
-      [RedemptionStatus.REQUESTED]: [
-        RedemptionStatus.PACKING,
-        RedemptionStatus.SHIPPED,
-        RedemptionStatus.CANCELED,
-      ],
-      [RedemptionStatus.PACKING]: [
-        RedemptionStatus.SHIPPED,
-        RedemptionStatus.CANCELED,
-      ],
-      // B1: penutupan jalur record-only. Tanpa ini SHIPPED memblokir mint-nya selamanya.
-      [RedemptionStatus.SHIPPED]: [RedemptionStatus.DELIVERED],
-      // Resolusi manual jalur real: funding yang ditinggalkan user → RECLAIM_DUE (USDC sudah/mungkin
-      // keluar; JANGAN refund Rupiah, reclaim USDC on-chain manual).
-      [RedemptionStatus.FUNDING]: [RedemptionStatus.RECLAIM_DUE],
-      [RedemptionStatus.FUNDED]: [RedemptionStatus.RECLAIM_DUE],
-      // B1: penutupan RECLAIM_DUE sesudah USDC-nya benar-benar direklaim/ditulis-rugi. Kartunya
-      // TIDAK pernah dibakar (itulah arti RECLAIM_DUE), jadi mint-nya memang boleh diminta lagi.
-      // refundSafe TIDAK ikut ditulis di sini: ia tetap false, dan gerbang refund tetap menolak.
-      [RedemptionStatus.RECLAIM_DUE]: [RedemptionStatus.CANCELED],
-      // B1: penutupan kasus support pasca-burn yang akhirnya sampai ke user.
-      [RedemptionStatus.SHIP_FAILED_POST_BURN]: [RedemptionStatus.DELIVERED],
-      // B2: penutupan yang DIKENDALIKAN KITA untuk kiriman yang diparkir CC di `Shipped`.
-      // Tidak menyentuh uang: IN_TRANSIT berarti NFT-nya sudah dibakar, jadi tidak ada yang bisa
-      // ditebus dua kali dan tidak ada Rupiah yang jadi bisa di-refund gara-gara transisi ini.
-      [RedemptionStatus.IN_TRANSIT]: [RedemptionStatus.DELIVERED],
-    };
-    if (!(allowed[row.status] ?? []).includes(status)) {
+    const domestic = isDomesticRedemption(row);
+    const wantsTracking =
+      (tracking?.trackingIds?.length ?? 0) > 0 ||
+      (tracking?.trackingUrls?.length ?? 0) > 0;
+    if (wantsTracking && !domestic) {
+      throw new BadRequestException(
+        'Resi hanya bisa diisi tangan untuk pengiriman DOMESTIK (stok Hoshi). Untuk kartu vault ' +
+          'CollectorCrypt, resinya datang dari poll shipment CC — jangan ditimpa manual.',
+      );
+    }
+    // Tabel transisinya kini MODUL-LEVEL (REDEMPTION_ADMIN_TRANSITIONS) supaya `listRedemptions()`
+    // menyajikan daftar yang SAMA PERSIS dengan yang ditegakkan di sini. Satu tabel, dua pembaca.
+    if (!(REDEMPTION_ADMIN_TRANSITIONS[row.status] ?? []).includes(status)) {
       throw new BadRequestException(
         `Tidak bisa mengubah status dari ${row.status} ke ${status}.`,
       );
@@ -251,8 +840,78 @@ export class AdminService {
     // Perhatikan ARAH-nya: hanya MASUK ke RECLAIM_DUE yang menulis false. KELUAR darinya
     // (→ CANCELED) sengaja TIDAK menulis apa pun — refundSafe tetap false. Tidak ada satu pun
     // cabang di method ini yang pernah menulis refundSafe=true.
-    const extra =
+    const extra: { refundSafe?: boolean } =
       status === RedemptionStatus.RECLAIM_DUE ? { refundSafe: false } : {};
+    // RESI DOMESTIK. Ditulis hanya kalau diberikan; tidak pernah menimpa dengan array kosong.
+    const trackingData: { trackingIds?: string[]; trackingUrls?: string[] } = {};
+    if (domestic && tracking?.trackingIds?.length) {
+      trackingData.trackingIds = tracking.trackingIds;
+    }
+    if (domestic && tracking?.trackingUrls?.length) {
+      trackingData.trackingUrls = tracking.trackingUrls;
+    }
+    // ╔════════════════════════════════════════════════════════════════════════════════════════╗
+    // ║ B2 — MENOLAK, BUKAN SEKADAR MEMPERINGATKAN: baris DOMESTIK yang ongkirnya BELUM lunas. ║
+    // ╚════════════════════════════════════════════════════════════════════════════════════════╝
+    // Dulu sel matriks ini cuma `logger.warn`. Peringatan itu tidak pernah sampai ke siapa pun:
+    // dashboard tidak membaca log, responsnya tidak menyebutkannya, dan operator melihat dua
+    // tombol yang tampak normal. Setiap penekanannya = satu paket yang ongkirnya ditanggung Hoshi
+    // tanpa seorang pun memutuskannya. Peringatan yang tidak terbaca BUKAN pengaman.
+    //
+    // KENAPA TETAP ADA JALAN LEWAT (dan bukan larangan mutlak): menanggung ongkir kadang MEMANG
+    // keputusan bisnis yang benar (goodwill, promo, user yang sudah membayar lewat kanal lain).
+    // Larangan mutlak akan menghapus kemampuan itu dan memaksa operator mengedit Postgres — pola
+    // yang sudah tiga kali melahirkan bug di repo ini. Jadi: DITOLAK secara default, LOLOS hanya
+    // lewat pernyataan eksplisit yang DISIMPAN DI BARIS (bukan cuma di log).
+    //
+    // KETERJANGKAUAN JALAN KELUAR TIDAK BERKURANG: REQUESTED tetap punya dua jalan keluar yang
+    // tidak butuh pernyataan apa pun (user POST /redemptions/:id/cancel dan admin PATCH →
+    // CANCELED), dan PACKING/SHIPPED tetap terbuka begitu ongkirnya lunas atau ditanggung sadar.
+    let absorbNote: string | null = null;
+    if (
+      domestic &&
+      row.status === RedemptionStatus.REQUESTED &&
+      DOMESTIC_FULFILMENT_TARGETS.includes(status)
+    ) {
+      const ongkir = (await this.summarizeOngkir([id])).get(id) ?? ongkirNone(true);
+
+      if (!ongkir.paid) {
+        const inFlightNote = ongkir.inFlight
+          ? ' CATATAN: ada tagihan ongkir yang pembayarannya SEDANG DIPROSES (PAID/FULFILLING) — ' +
+            'baris ini akan pindah ke PACKING sendiri begitu lunas. Tunggu satu putaran reconciler ' +
+            'sebelum memutuskan menanggungnya.'
+          : '';
+        const reason = (opts?.note ?? '').trim();
+
+        if (opts?.absorbShippingFee !== true) {
+          throw new BadRequestException(
+            `Baris DOMESTIK ${id} belum punya ongkir yang lunas, jadi ${row.status} → ${status} ` +
+              'DITOLAK. Alur normalnya: user membayar invoice ongkir dan baris ini pindah ke ' +
+              'PACKING OTOMATIS. Kalau Hoshi memang mau MENANGGUNG ongkirnya, kirim ulang dengan ' +
+              '`absorbShippingFee: true` beserta `note` (alasan, min. ' +
+              `${OPERATOR_NOTE_MIN} karakter) — keduanya disimpan permanen di baris ini.` +
+              inFlightNote,
+          );
+        }
+        if (reason.length < OPERATOR_NOTE_MIN) {
+          throw new BadRequestException(
+            `Menanggung ongkir wajib beralasan (minimal ${OPERATOR_NOTE_MIN} karakter) dan ` +
+              'alasannya disimpan permanen di baris ini.',
+          );
+        }
+
+        const stamp = new Date().toISOString();
+        absorbNote =
+          `[ADMIN ONGKIR DITANGGUNG HOSHI ${stamp}] ${row.status} → ${status} tanpa ongkir yang ` +
+          `lunas. Operator MENYATAKAN Hoshi menanggung ongkir paket ini. Alasan: ${reason}`;
+        // Log KERAS dulu — jejaknya ada bahkan kalau tulisan DB gagal sesudah ini.
+        this.logger.error(
+          `ONGKIR DITANGGUNG HOSHI — redemption DOMESTIK ${id}: ${row.status} → ${status} ` +
+            `DI-MAJUKAN ADMIN tanpa pembayaran ongkir. Listing ${row.listingId}, user ` +
+            `${row.userId}. Nol Rupiah ongkir pernah masuk untuk baris ini. Alasan: ${reason}`,
+        );
+      }
+    }
     if (
       row.status === RedemptionStatus.RECLAIM_DUE &&
       status === RedemptionStatus.CANCELED
@@ -285,10 +944,72 @@ export class AdminService {
           'mint ini tidak bisa (dan tidak boleh) diminta kirim lagi.',
       );
     }
-    return this.prisma.cardRedemption.update({
+    // Pernyataan "ongkir ditanggung Hoshi" ikut ke KOLOM `note`, bukan cuma ke log: sebuah
+    // keputusan uang harus bisa dibaca kembali dari barisnya sendiri berbulan-bulan kemudian.
+    const noteData = absorbNote
+      ? { note: appendBoundedNote(row.note, absorbNote, NOTE_MAX) }
+      : {};
+    const updated = await this.prisma.cardRedemption.update({
       where: { id },
-      data: { status, ...extra },
+      data: { status, ...extra, ...trackingData, ...noteData },
     });
+
+    // ╔════════════════════════════════════════════════════════════════════════════════════╗
+    // ║ PEMBUKUAN ONGKIR saat baris DOMESTIK dibatalkan admin. WAJIB, dan baru sejak       ║
+    // ║ jalur domestik ada.                                                                 ║
+    // ╚════════════════════════════════════════════════════════════════════════════════════╝
+    // Dulu CANCELED dari REQUESTED/PACKING hanya mungkin untuk baris record-only yang NOL
+    // uang — tidak pernah ada tagihan ongkir yang bisa tertinggal. Baris DOMESTIK berbeda:
+    // PACKING berarti ongkir Rupiah-nya SUDAH LUNAS (order SHIPPING FULFILLED). Membatalkannya
+    // tanpa pembukuan = user membayar ongkir, paketnya tidak dikirim, dan tidak ada satu pun
+    // baris yang mencatat utangnya. Helper ini TIDAK PERNAH MELEMPAR, jadi pembatalan yang
+    // sudah commit tidak bisa berubah jadi 500.
+    let shippingDebts: ShippingRefundDebt[] = [];
+    if (domestic && status === RedemptionStatus.CANCELED) {
+      shippingDebts = await recordShippingRefundDebts({
+        prisma: this.prisma,
+        logger: this.logger,
+        redemptionId: id,
+        // B1 — rail + status-SEBELUM. `PACKING` di rail domestik berarti order ongkirnya FULFILLED
+        // (fulfilShipping menulis keduanya dalam satu transaksi), dan itulah yang membuat
+        // pembatalan ini melahirkan UTANG REFUND yang harus tercatat, bukan sekadar dilaporkan.
+        rail: 'HOSHI_DOMESTIC',
+        canceledFromStatus: row.status,
+        actor: 'admin (PATCH status)',
+        reason: `dibatalkan admin dari status ${row.status}`,
+      });
+    }
+
+    // Keadaan ongkir dibaca ULANG SESUDAH pembukuan di atas, supaya respons PATCH memperlihatkan
+    // baris seperti apa adanya SEKARANG (mis. order yang barusan jadi REFUND_DUE) — dashboard
+    // bisa memperbarui barisnya tanpa memanggil GET lagi.
+    const rail = domestic
+      ? ('HOSHI_DOMESTIC' as const)
+      : ('CC_VAULT' as const);
+    const ongkirAfter: AdminRedemptionOngkir = domestic
+      ? ((await this.summarizeOngkir([id])).get(id) ?? ongkirNone(true))
+      : ongkirNone(false);
+
+    return {
+      ...updated,
+      /**
+       * Tagihan ongkir yang terdampak. SELALU ADA sebagai field (array kosong kalau tidak ada),
+       * supaya bentuk respons rute ini tidak berubah-ubah per cabang — klien yang membacanya
+       * tidak perlu tahu rail mana yang baru saja digerakkan.
+       */
+      shippingDebts,
+      /**
+       * B2 — bentuk yang SAMA PERSIS dengan baris di GET /admin/redemptions, termasuk
+       * `blockedNextStatuses` yang di sini SELALU kosong (tidak ada transisi yang mendarat
+       * kembali di REQUESTED, satu-satunya status yang pagar ongkirnya berlaku). Fieldnya tetap
+       * ada supaya klien memakai SATU tipe untuk baris hasil GET maupun hasil PATCH.
+       */
+      rail,
+      ongkir: ongkirAfter,
+      allowedNextStatuses: REDEMPTION_ADMIN_TRANSITIONS[updated.status] ?? [],
+      blockedNextStatuses: [] as RedemptionStatus[],
+      actionRequired: redemptionActionRequired(updated.status, rail, ongkirAfter),
+    };
   }
 
   /**
@@ -625,6 +1346,10 @@ export class AdminService {
       prisma: this.prisma,
       logger: this.logger,
       redemptionId: id,
+      // Rail dari kolom `listingId` (immutable), status-sebelum dari baris yang kami baca di atas
+      // dan yang PREDIKAT tulisannya sudah menjamin masih AWAITING_PAYMENT saat dibatalkan.
+      rail: isDomesticRedemption(row) ? 'HOSHI_DOMESTIC' : 'CC_VAULT',
+      canceledFromStatus: RedemptionStatus.AWAITING_PAYMENT,
       actor: `admin ${admin.id}`,
       reason,
     });
@@ -1039,6 +1764,23 @@ export class AdminService {
     });
   }
 
+  /**
+   * Impor massal stok Hoshi (CSV/JSON dari dashboard admin).
+   *
+   * ┌──── KENAPA `sellable: true` DI SINI (dan kenapa ketiadaannya adalah BUG) ─────────────┐
+   * │ Rute ini dan `createListing` dijaga AdminGuard yang SAMA, jadi keduanya membawa       │
+   * │ kepercayaan yang sama: seorang admin yang meng-upload 200 kartu MENYATAKAN kartu itu   │
+   * │ stok fisik Hoshi yang dijual. Tanpa flag ini barisnya default `sellable=false`, dan    │
+   * │ SETIAP jalur billing menolaknya (payments.service: jalur Hoshi-inventory mewajibkan    │
+   * │ `listing.sellable === true`). Hasilnya: 200 kartu terpajang, nol Rupiah bisa masuk,    │
+   * │ DIAM-DIAM — tanpa satu pun pesan yang menjelaskan kenapa.                              │
+   * │                                                                                       │
+   * │ Ini TIDAK melonggarkan gerbangnya: default `false` ada untuk baris SEED/CHART-FILLER   │
+   * │ yang tidak pernah lewat rute ber-AdminGuard sama sekali. Baris seperti itu tetap       │
+   * │ tidak bisa dibeli maupun diminta kirim. Baris yang SUDAH terlanjur diimpor sebelum     │
+   * │ perbaikan ini dinaikkan lewat `setListingsSellable` (eksplisit, per-id).               │
+   * └───────────────────────────────────────────────────────────────────────────────────────┘
+   */
   async importListings(dto: ImportListingsDto) {
     const seller = dto.sellerOverride ?? 'admin';
     const items = dto.items.map((item) => ({
@@ -1057,6 +1799,9 @@ export class AdminService {
       element: item.element ?? '',
       category: item.category ?? '',
       sellerAddress: seller,
+      // Stok Hoshi genuine yang di-upload admin → boleh dijual (jalur Hoshi-inventory), SAMA
+      // seperti createListing. Lihat blok panjang di atas method ini.
+      sellable: true,
       certificate: item.certificate,
       vaultLocation: item.vaultLocation,
       cardNumber: item.cardNumber,
@@ -1072,10 +1817,246 @@ export class AdminService {
     return { imported: created.length, items: created };
   }
 
+  /**
+   * ╔══════════════════════════════════════════════════════════════════════════════════════╗
+   * ║ A — PERBAIKAN DATA: naikkan/turunkan flag `sellable` pada baris yang SUDAH ADA.      ║
+   * ╚══════════════════════════════════════════════════════════════════════════════════════╝
+   *
+   * MASALAHNYA. Baris yang diimpor SEBELUM `importListings` menulis `sellable: true` tetap
+   * tidak bisa dibeli SELAMANYA, dan sebelum rute ini tidak ada satu pun kontrol untuk
+   * memperbaikinya (`updateListing` tidak menyentuh flag itu) — jalan keluarnya cuma mengedit
+   * Postgres langsung.
+   *
+   * ┌──── KENAPA PER-ID DAN BUKAN "jadikan semuanya sellable" ──────────────────────────────┐
+   * │ Seluruh GUNA flag ini adalah menahan baris seed/placeholder. Dan bentuk baris seed
+   * │ IDENTIK dengan bentuk stok sungguhan: `source=HOSHI` + `sellerId=null` adalah bentuk
+   * │ DEFAULT setiap listing. Artinya TIDAK ADA predikat otomatis yang bisa membedakan
+   * │ "kartu fisik yang benar-benar ada di rak" dari "chart filler" — hanya manusia yang
+   * │ tahu. Sebuah sapuan massal karena itu akan membuka kembali persis bahaya yang
+   * │ defaultnya `false` diciptakan untuk menutup: pembeli membayar Rupiah untuk kartu hantu.
+   * │
+   * │ Maka: daftar id EKSPLISIT, dibatasi 500 per panggilan, setiap perubahan DI-LOG dengan
+   * │ id admin-nya, dan operator diharapkan MEMBACA dulu lewat `listUnsellableStock()` /
+   * │ query SQL yang didokumentasikan di sana.
+   * └──────────────────────────────────────────────────────────────────────────────────────┘
+   *
+   * PAGAR BENTUK (ditegakkan sebagai PREDIKAT pada tulisannya, bukan cuma dibaca):
+   *   • source != COLLECTORCRYPT — baris katalog CC bukan stok kita; fisiknya di gudang CC.
+   *   • sellerId = null         — listing milik user lain tidak pernah jadi "stok Hoshi".
+   *   • status = ACTIVE         — baris SOLD/CANCELLED tidak perlu (dan tidak boleh) diubah:
+   *     SOLD berarti sudah berpindah tangan, dan menaikkan flag di sana hanya mengaburkan
+   *     riwayat. Baris SOLD yang lolos jalur beli lain tetap bisa dikirim lewat jalur CC.
+   *
+   * REVERSIBEL DENGAN SENGAJA (`sellable: false` juga diterima): kalau operator salah menandai
+   * satu baris, ia harus bisa menurunkannya lagi SEBELUM ada yang membelinya — tanpa itu satu
+   * salah klik jadi permanen.
+   */
+  async setListingsSellable(
+    ids: string[],
+    sellable: boolean,
+    admin: { id: string; walletAddress: string },
+  ) {
+    const unique = [...new Set((ids ?? []).map((v) => (v ?? '').trim()))].filter(
+      (v) => v.length > 0,
+    );
+    if (unique.length === 0) {
+      throw new BadRequestException(
+        'Sebutkan minimal satu id listing. Rute ini SENGAJA tidak punya mode "semua baris".',
+      );
+    }
+    if (unique.length > 500) {
+      throw new BadRequestException(
+        `Maksimal 500 id per panggilan (diberikan ${unique.length}). Pecah jadi beberapa batch.`,
+      );
+    }
+
+    // Baris yang BENAR-BENAR akan berubah — dibaca DULU supaya responsnya bisa menyebut mana
+    // yang dilewati dan KENAPA, bukan cuma mengembalikan sebuah angka.
+    const eligible = await this.prisma.listing.findMany({
+      where: {
+        id: { in: unique },
+        source: { not: ListingSource.COLLECTORCRYPT },
+        sellerId: null,
+        status: ListingStatus.ACTIVE,
+      },
+      select: {
+        id: true,
+        name: true,
+        priceIdrx: true,
+        sellable: true,
+        source: true,
+        status: true,
+      },
+    });
+    const eligibleIds = new Set(eligible.map((r) => r.id));
+    const skipped = unique.filter((id) => !eligibleIds.has(id));
+
+    // Tulisan BERPAGAR: predikatnya mengulang SELURUH pagar bentuk, jadi keputusan di atas
+    // tidak bisa basi karena balapan (mis. baris terjual tepat di antara baca dan tulis).
+    const changed = await this.prisma.listing.updateMany({
+      where: {
+        id: { in: [...eligibleIds] },
+        source: { not: ListingSource.COLLECTORCRYPT },
+        sellerId: null,
+        status: ListingStatus.ACTIVE,
+        sellable: !sellable,
+      },
+      data: { sellable },
+    });
+
+    this.logger.warn(
+      `ADMIN sellable=${sellable} oleh ${admin.id} (${admin.walletAddress}): ` +
+        `${changed.count} baris diubah dari ${unique.length} id yang diminta ` +
+        `(dilewati: ${skipped.length}). Ids diubah: ${[...eligibleIds].join(', ') || '(tidak ada)'}. ` +
+        (sellable
+          ? 'Baris ini SEKARANG BISA DIBELI — pastikan kartunya benar-benar ada di rak.'
+          : 'Baris ini sekarang TIDAK bisa dibeli lagi.'),
+    );
+
+    // B4 — BEDAKAN "tidak berubah karena sudah benar" dari "tidak berubah karena ditolak pagar".
+    // Tanpa ini sebuah UI hanya melihat `changed: 0` dan tidak bisa tahu apakah panggilannya
+    // sukses-idempoten atau gagal diam-diam — dan retry pun jadi menakutkan.
+    const alreadyCorrect = eligible
+      .filter((r) => r.sellable === sellable)
+      .map((r) => r.id);
+
+    return {
+      requested: unique.length,
+      changed: changed.count,
+      /** Baris yang cocok pagar bentuk (termasuk yang flag-nya sudah sesuai → tidak ikut diubah). */
+      eligible,
+      /**
+       * Id yang memenuhi pagar bentuk TAPI flag-nya SUDAH sama dengan yang diminta. Ini yang
+       * membuat rute ini aman di-retry: memanggilnya dua kali dengan body yang sama menghasilkan
+       * `changed: 0` + id-nya di sini, BUKAN error dan bukan perubahan kedua.
+       */
+      alreadyCorrect,
+      /** Id yang TIDAK memenuhi pagar bentuk (tidak ada, katalog CC, listing user, atau bukan ACTIVE). */
+      skipped,
+      warning:
+        sellable
+          ? 'Baris yang diubah kini BISA DIBELI pembeli. Flag ini satu-satunya yang menahan ' +
+            'baris seed/placeholder agar tidak bisa dibeli — jangan pernah menaikkannya untuk ' +
+            'baris yang kartunya tidak benar-benar ada di rak Hoshi.'
+          : 'Baris yang diubah kini TIDAK bisa dibeli. Order yang sudah PENDING untuk baris itu ' +
+            'akan gagal di settlement dan perlu di-refund manual — cek /admin/transactions.',
+    };
+  }
+
+  /**
+   * READ-ONLY: stok Hoshi yang TIDAK bisa dibeli karena `sellable=false`. Inilah permukaan yang
+   * dulu tidak ada sama sekali — 200 kartu terpajang, nol Rupiah masuk, dan tidak ada apa pun di
+   * dashboard yang menjelaskan kenapa.
+   *
+   * BACA INI DULU sebelum memanggil setListingsSellable. Query SQL yang setara (untuk dijalankan
+   * langsung di Postgres kalau lebih enak):
+   *
+   *   SELECT id, name, "priceIdrx", status, source, "sellerId", "listedAt"
+   *   FROM "listings"
+   *   WHERE sellable = false
+   *     AND source <> 'COLLECTORCRYPT'
+   *     AND "sellerId" IS NULL
+   *     AND status = 'ACTIVE'
+   *   ORDER BY "listedAt" DESC;
+   *
+   * Hasilnya mencampur stok sungguhan dengan baris seed/chart-filler — MEMANG TIDAK BISA
+   * dibedakan otomatis (bentuknya identik). Operator yang memutuskan baris mana yang nyata.
+   */
+  async listUnsellableStock(limit = 200, offset = 0) {
+    // Angka dari query string bisa berbentuk apa saja (NaN, negatif, 1e9). Dijepit DI SINI supaya
+    // rute ini aman dipanggil UI berulang kali tanpa bisa menarik seluruh tabel sekaligus.
+    const take = Math.min(Math.max(Math.trunc(limit) || 200, 1), 1000);
+    const skip = Math.max(Math.trunc(offset) || 0, 0);
+    const where: Prisma.ListingWhereInput = {
+      sellable: false,
+      source: { not: ListingSource.COLLECTORCRYPT },
+      sellerId: null,
+      status: ListingStatus.ACTIVE,
+    };
+    const [data, total] = await Promise.all([
+      this.prisma.listing.findMany({
+        where,
+        orderBy: { listedAt: 'desc' },
+        take,
+        skip,
+        select: {
+          id: true,
+          name: true,
+          set: true,
+          priceIdrx: true,
+          status: true,
+          source: true,
+          sellable: true,
+          vaultLocation: true,
+          listedAt: true,
+        },
+      }),
+      this.prisma.listing.count({ where }),
+    ]);
+
+    // B4 — daftar KOSONG di sini artinya "tidak ada yang tertahan", jadi `actionRequired` yang
+    // kosong memang benar. Yang TIDAK boleh terjadi adalah sebaliknya: ratusan baris tertahan dan
+    // dashboard tidak mengatakan apa-apa karena ia cuma merender tabel.
+    const actionRequired: string[] =
+      total > 0
+        ? [
+            `${total} listing stok Hoshi TIDAK BISA DIBELI (sellable=false) — nol Rupiah bisa ` +
+              'masuk untuk kartu-kartu itu. Tandai baris yang kartunya BENAR-BENAR ada di rak ' +
+              'lewat POST /admin/listings/sellable (daftar id eksplisit, maks 500 per panggilan). ' +
+              'Daftar ini MENCAMPUR stok sungguhan dengan baris seed/placeholder — hanya manusia ' +
+              'yang bisa membedakannya.',
+          ]
+        : [];
+
+    return {
+      total,
+      returned: data.length,
+      /** Nilai yang BENAR-BENAR dipakai sesudah dijepit — bukan yang dikirim klien. */
+      limit: take,
+      offset: skip,
+      hasMore: skip + data.length < total,
+      data,
+      actionRequired,
+      /**
+       * TIDAK ADA predikat otomatis yang bisa menandai baris seed: `source=HOSHI` + `sellerId=null`
+       * adalah bentuk DEFAULT setiap listing, jadi bentuk baris seed IDENTIK dengan stok nyata.
+       * Itu sebabnya rute penandanya per-id dan bukan sapuan massal.
+       */
+      placeholderDetection: 'MANUAL_ONLY',
+      note:
+        'Baris di sini TIDAK BISA DIBELI (sellable=false), jadi tidak ada Rupiah yang bisa masuk ' +
+        'untuk kartunya. Daftar ini MENCAMPUR stok sungguhan dengan baris seed/placeholder — ' +
+        'bentuknya identik dan tidak bisa dibedakan otomatis. Tandai HANYA baris yang kartunya ' +
+        'benar-benar ada di rak, lewat POST /admin/listings/sellable dengan daftar id eksplisit.',
+    };
+  }
+
+  /**
+   * Hapus listing. FK `card_redemptions.listingId` ber-ON DELETE RESTRICT, jadi baris yang masih
+   * punya permintaan kirim domestik TIDAK BISA dihapus — dan itu disengaja: menghapusnya akan
+   * menghilangkan IDENTITAS kartu di baris redemption yang sedang berjalan. Prisma melaporkannya
+   * sebagai P2003; kita terjemahkan jadi kalimat yang memberi tahu operator apa yang harus
+   * dilakukan, bukan 500.
+   */
   async deleteListing(id: string) {
     const existing = await this.prisma.listing.findUnique({ where: { id } });
     if (!existing) throw new NotFoundException('Listing not found.');
-    await this.prisma.listing.delete({ where: { id } });
+    try {
+      await this.prisma.listing.delete({ where: { id } });
+    } catch (err) {
+      if (
+        err instanceof Prisma.PrismaClientKnownRequestError &&
+        (err.code === 'P2003' || err.code === 'P2014')
+      ) {
+        throw new BadRequestException(
+          'Listing ini masih dirujuk permintaan kirim fisik (kirim domestik). Selesaikan atau ' +
+            'batalkan permintaan kirimnya dulu di /admin/redemptions — baru listing-nya bisa ' +
+            'dihapus. (Menghapusnya sekarang akan menghilangkan identitas kartu pada permintaan ' +
+            'kirim yang sedang berjalan.)',
+        );
+      }
+      throw err;
+    }
     return { deleted: true, id };
   }
 

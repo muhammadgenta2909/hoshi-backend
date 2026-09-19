@@ -89,6 +89,9 @@ describe('CcShippingService', () => {
     cardImage: null,
     cardSet: null,
     source: 'PACK',
+    // Jalur CC Vault: listingId NULL. Sebuah baris DOMESTIK (listingId non-null) tidak bisa
+    // masuk ke jalur ini sama sekali — ownedRedemption menolaknya (assertCcRail).
+    listingId: null,
     shippingAddressId: null,
     recipientName: 'Budi',
     country: 'ID',

@@ -266,7 +266,32 @@ model CardRedemption {
   /// ASAL kartu (di-snapshot saat request) → membantu admin tahu SIAPA yang kirim fisik:
   /// PACK / CC_CATALOG / P2P (semua fisiknya di gudang CC → CC kirim) vs HOSHI (stok fisik Hoshi
   /// sendiri → Hoshi kirim). null = data lama sebelum kolom ini ada.
+  ///
+  /// ⚠️ INI LABEL, BUKAN GERBANG. Free-form, nullable untuk baris lama, dan baris WARISAN bisa
+  /// berbunyi 'HOSHI' padahal identitasnya alamat NFT sungguhan. Yang menentukan RAIL adalah
+  /// `listingId` di bawah — lihat src/common/hoshi-domestic-shipping.ts.
   source String?
+
+  /// ╔════════════════════════════════════════════════════════════════════════════════════════╗
+  /// ║ DISKRIMINATOR RAIL — SATU-SATUNYA fakta yang memisahkan kirim DOMESTIK dari kirim CC.  ║
+  /// ╚════════════════════════════════════════════════════════════════════════════════════════╝
+  /// NON-NULL = jalur DOMESTIK: kartu STOK HOSHI yang fisiknya disimpan Hoshi di Indonesia dan
+  /// dikirim kurir lokal. NOL NFT, NOL burn, NOL USDC treasury, NOL panggilan CollectorCrypt,
+  /// NOL tanda tangan wallet. Nilainya = id Listing stok Hoshi yang SOLD ke user ini, dan
+  /// sekaligus IDENTITAS kartunya (kolom `nftAddress` menyimpan turunan `hoshi-listing:<id>`,
+  /// karena kartu ini memang tidak punya alamat NFT — settlement-nya database-only).
+  /// NULL = jalur CC Vault (pack / katalog CC / P2P): identitasnya alamat NFT sungguhan.
+  ///
+  /// IMMUTABLE setelah create — tidak ada satu pun kode yang menulisnya lagi. Itu yang membuat
+  /// "baca rail lalu tulis berpagar" tidak bisa balapan. Tulisan rail-sensitif TETAP memasang
+  /// railnya sebagai predikat supaya properti itu ditegakkan Postgres, bukan cuma oleh konvensi.
+  ///
+  /// onDelete: Restrict DENGAN SENGAJA (bukan SetNull): SetNull akan menjelmakan baris DOMESTIK
+  /// jadi baris yang TERLIHAT seperti jalur CC begitu listingnya dihapus — rail bocor, identitas
+  /// hilang, dan gerbang anti-dobel kehilangan kuncinya. Lebih baik penghapusan listing DITOLAK
+  /// selama masih ada permintaan kirim yang menunjuknya.
+  listingId String?
+  listing   Listing? @relation("ListingRedemptions", fields: [listingId], references: [id], onDelete: Restrict)
 
   /// Alamat tujuan — FK opsional (jejak) + snapshot penuh (sumber kebenaran pesanan).
   shippingAddressId String?
@@ -313,11 +338,19 @@ model CardRedemption {
 
   @@index([userId, createdAt])
   @@index([nftAddress])
+  @@index([listingId])
   // CATATAN: ada juga PARTIAL UNIQUE INDEX "card_redemptions_active_nft_uniq" pada (nftAddress)
   // WHERE status IN (semua status IN-FLIGHT — lihat ACTIVE_STATUSES di redemption.service.ts)
   // — anti dobel-kirim fisik. Prisma tak bisa memodelkan partial unique di schema, jadi ia hidup
   // di migration SQL (di-apply migrate deploy). Migration 20260916000100 MELEBARKAN daftar itu
   // dari 3 status (REQUESTED,PACKING,SHIPPED) ke seluruh status in-flight.
+  //
+  // DAN partial unique index KEDUA "card_redemptions_active_listing_uniq" pada (listingId) WHERE
+  // status IN (daftar yang SAMA) — migration 20260921000100. Kartu stok Hoshi tidak punya alamat
+  // NFT, jadi kunci anti-dobelnya adalah id listing. Baris jalur CC punya listingId NULL, dan di
+  // Postgres NULL tidak pernah bentrok di unique index, jadi index ini TIDAK menyentuh mereka.
+  // Dua index ini TIDAK redundan: yang pertama menjaga identitas NFT, yang kedua menjaga
+  // identitas listing kalau suatu hari turunan `hoshi-listing:<id>` berubah bentuk.
   @@map("card_redemptions")
 }
 
@@ -544,6 +577,11 @@ model Listing {
 
   // Baris feed aktivitas yang menyebut listing ini.
   activities Activity[]
+
+  // Permintaan kirim fisik DOMESTIK yang menunjuk baris ini (stok Hoshi; kurir lokal).
+  // onDelete: Restrict di sisi CardRedemption.listing → listing TIDAK BISA dihapus selama masih
+  // ada permintaan kirim yang menunjuknya (identitas kartu jalur domestik = id listing ini).
+  redemptions CardRedemption[] @relation("ListingRedemptions")
 
   // Tautan opsional ke katalog kartu (buat masa depan; POC boleh null).
   cardId String?
@@ -1215,4 +1253,94 @@ model EscrowRecovery {
   @@index([listingId])
   @@index([createdAt])
   @@map("escrow_recoveries")
+}
+
+/// ╔══════════════════════════════════════════════════════════════════════════════════════════════╗
+/// ║ TARIF ONGKIR KIRIM DOMESTIK (stok Hoshi, kurir lokal Indonesia).                             ║
+/// ╚══════════════════════════════════════════════════════════════════════════════════════════════╝
+///
+/// KENAPA TABEL DAN BUKAN ENV: pemilik produk BELUM memutuskan model maupun angkanya, dan angka
+/// yang belum diputuskan tidak boleh mengunci deploy. Baris di sini diubah admin lewat
+/// PUT /api/admin/shipping/domestic-rates — tanpa deploy, tanpa restart.
+///
+/// SIAP UNTUK TIER PER-WILAYAH TANPA DITULIS ULANG: kuncinya `scope`. Hari ini hanya scope '*'
+/// (FLAT NASIONAL) yang pernah dicari. Menambah tier nanti = menambah kandidat scope di
+/// `scopeCandidates()` (src/payments/domestic-shipping-rate.ts) + memasukkan barisnya lewat rute
+/// admin yang sudah ada. Bentuk yang direncanakan: 'CITY:<kota>', 'STATE:<provinsi>', lalu '*'.
+///
+/// NOL DANA TREASURY: baris ini hanya menentukan nominal RUPIAH yang ditagihkan ke user. Tidak ada
+/// USDC, tidak ada plafon treasury yang relevan (jalur domestik tidak pernah mendanai apa pun).
+model DomesticShippingRate {
+  id String @id @default(cuid())
+
+  /// Kunci baris ini. TIGA bentuk yang dikenali resolusi (src/payments/domestic-shipping-rate.ts):
+  ///   'TIER:<NAMA>'     → satu TIER wilayah. Provinsi miliknya ada di `provinces` di bawah.
+  ///                       Bentuk inilah yang dipakai model bertingkat (mis. 'TIER:JAWA').
+  ///   'STATE:<provinsi>' → harga KHUSUS satu provinsi (pembelahan paling halus). Dicocokkan
+  ///                       setelah dinormalkan, jadi 'STATE:DKI Jakarta' = 'STATE:dki jakarta'.
+  ///   '*'               → FLAT NASIONAL (bentuk LAMA, tetap sah; dipakai kalau tidak ada tier).
+  /// @unique → satu baris per scope, dan rute admin meng-UPSERT di kunci ini (bukan menumpuk
+  /// baris yang saling bertentangan).
+  scope String @unique
+
+  /// Ongkir Rupiah UTUH. Divalidasi ke batas mint IDRX (Rp 20.000–Rp 1.000.000.000) di DUA titik:
+  /// saat admin menulis DAN saat jalur bayar membaca — tarif di bawah minimum IDRX menghasilkan
+  /// invoice yang tidak akan pernah bisa terbit.
+  priceIdr Int
+
+  /// false = baris disimpan tapi tidak dipakai (resolusi jatuh ke lapis berikutnya). Cara aman
+  /// menonaktifkan tarif tanpa kehilangan jejak angkanya.
+  active Boolean @default(true)
+
+  /// ╔══════════════════════════════════════════════════════════════════════════════════════════╗
+  /// ║ DAFTAR PROVINSI MILIK TIER INI — inilah yang membuat TIER jadi DATA, bukan kode.         ║
+  /// ╚══════════════════════════════════════════════════════════════════════════════════════════╝
+  /// Nama provinsi yang SUDAH DINORMALKAN (huruf kecil, tanpa tanda baca — normalizeRegionKey).
+  /// Boleh memuat BANYAK EJAAN untuk satu provinsi ('jawa barat', 'jabar', 'west java'), karena
+  /// kolom `state` pada alamat diisi dari dropdown geo (yang untuk Indonesia memakai sebagian nama
+  /// INGGRIS) ATAU diketik bebas user saat CSC_API_KEY kosong.
+  ///
+  /// Menambah tier = INSERT satu baris dengan daftarnya sendiri. Memindah provinsi = edit dua
+  /// baris. Keduanya lewat PUT /api/admin/shipping/domestic-rates — NOL perubahan kode, NOL
+  /// migrasi, NOL restart. Itu syarat yang diminta pemilik produk: daftar tier bisa diperhalus
+  /// kapan saja tanpa deploy.
+  ///
+  /// Kosong untuk baris 'STATE:...' (provinsinya sudah disebut scope) dan untuk tier PENAMPUNG
+  /// (lihat `fallback`).
+  provinces String[]
+
+  /// TIER PENAMPUNG: dipakai untuk provinsi yang TIDAK cocok ke tier mana pun, termasuk alamat
+  /// yang tidak menyebut provinsi sama sekali (`state` memang nullable).
+  ///
+  /// SEHARUSNYA TEPAT SATU baris aktif bernilai true; kalau lebih, resolusi memakai yang TERMAHAL
+  /// dan meng-error-log konfliknya. Arah itu disengaja: penampung yang lebih mahal tidak pernah
+  /// menagih kurang dan tidak pernah mengirim gratis.
+  ///
+  /// Bawaan yang disarankan: tier LUAR JAWA. Ia sengaja TIDAK mendaftar 32 provinsi non-Jawa satu
+  /// per satu — daftar sepanjang itu pasti melupakan satu ejaan, dan yang terlupa akan jatuh entah
+  /// ke mana. Dengan luar Jawa sebagai penampung, apa pun yang tidak terbaca sebagai Jawa otomatis
+  /// masuk tier yang lebih mahal.
+  fallback Boolean @default(false)
+
+  /// Nama manusiawi tier ini ("Jawa", "Luar Jawa", "Papua & Maluku") — ikut ditampilkan di
+  /// dashboard admin dan di taksiran ongkir yang dilihat user. Label bawaan dari kode memuat kata
+  /// PENAMPUNG dengan sengaja, supaya angka yang belum diputuskan tidak menyamar jadi angka final.
+  label String?
+
+  /// true = angkanya masih PENAMPUNG (belum pernah di-set manusia). Di-set false otomatis begitu
+  /// seorang admin menulis harganya lewat PUT /api/admin/shipping/domestic-rates.
+  /// GET rute yang sama melaporkan sisa baris ber-`placeholder=true` di field `actionRequired`,
+  /// supaya "pemilik produk belum menetapkan ongkirnya" TERLIHAT alih-alih diam-diam berlaku.
+  placeholder Boolean @default(false)
+
+  /// Catatan operator (mis. "flat JNE REG 2026 Q4").
+  note String?
+
+  /// Id admin yang terakhir mengubahnya — jejak audit, bukan FK (admin bisa dihapus).
+  updatedBy String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("domestic_shipping_rates")
 }

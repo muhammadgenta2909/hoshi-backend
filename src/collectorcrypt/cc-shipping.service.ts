@@ -25,6 +25,7 @@ import {
   CC_SHIPPING_DELIST_ERRORS_KEY,
   readCcShippingErrorMeta,
 } from './cc-shipping.types';
+import { assertCcRail } from '../common/hoshi-domestic-shipping';
 import {
   SHIPPING_ERROR_CODE,
   SHIPPING_STAGE,
@@ -1055,6 +1056,17 @@ export class CcShippingService {
         'Redemption ini bukan milik Anda.',
       );
     }
+    // ╔══════════════════════════════════════════════════════════════════════════════════════╗
+    // ║ GERBANG RAIL — SATU chokepoint untuk SELURUH jalur CC Vault.                         ║
+    // ╚══════════════════════════════════════════════════════════════════════════════════════╝
+    // Setiap rute money-critical jalur CC (estimate / fundAndPrepare / reprepareBurn /
+    // submitBurn / refreshStatus) memuat barisnya LEWAT SINI. Sebuah baris jalur DOMESTIK
+    // (listingId non-null) tidak punya NFT untuk dibakar dan tidak punya ongkir CC untuk
+    // ditaksir; membiarkannya masuk berarti kita mengirim `nftAddress` bernilai
+    // `hoshi-listing:<id>` ke CollectorCrypt dan — lebih buruk — membuka kemungkinan USDC
+    // treasury didanai untuk kartu yang pengirimannya sudah dibayar lewat ongkir Rupiah.
+    // Ditolak DI SINI, sekali, bukan di lima rute yang bisa lupa satu-satu.
+    assertCcRail(row);
     return row;
   }
 

@@ -42,6 +42,19 @@ import {
   type P2pMode,
 } from '../marketplace/p2p.gate';
 import { PrismaService } from '../prisma/prisma.service';
+import { isHoshiSellableStock } from '../common/hoshi-stock';
+import {
+  DOMESTIC_ERROR_CODE,
+  assertCcRail,
+  assertDomesticRail,
+  domesticError,
+  isDomesticRedemption,
+} from '../common/hoshi-domestic-shipping';
+import {
+  resolveDomesticShippingIdr,
+  type DomesticShippingQuote,
+} from './domestic-shipping-rate';
+import { IDRX_MAX_MINT_IDR, IDRX_MIN_MINT_IDR } from './idrx-mint-bounds';
 import { CreatePackOrderDto } from './dto/create-pack-order.dto';
 import { IdrxClient } from './idrx.client';
 
@@ -60,9 +73,10 @@ const BPS_DENOMINATOR = 10_000;
  */
 const QRIS_FEE_BPS = 70;
 
-/** Batas nominal mint-request milik IDRX. Di luar ini permintaan pasti ditolak mereka. */
-const IDRX_MIN_MINT_IDR = 20_000;
-const IDRX_MAX_MINT_IDR = 1_000_000_000;
+/* Batas nominal mint-request IDRX (IDRX_MIN_MINT_IDR / IDRX_MAX_MINT_IDR) kini hidup di
+   ./idrx-mint-bounds.ts — jalur ONGKIR DOMESTIK harus memvalidasi tarif yang di-set ADMIN
+   terhadap batas yang SAMA, dan dua salinan konstanta uang adalah dua salinan yang bisa
+   melenceng. Nilainya TIDAK berubah. */
 
 /**
  * SOL minimum (lamports) yang harus tetap dipegang treasury untuk fee tx + kemungkinan
@@ -294,6 +308,58 @@ type PinResult = { refund: boolean; reason: string } | null;
  */
 type PriceCheck = { permanent: boolean; reason: string } | null;
 
+/**
+ * B3 — SINYAL REFUND YANG DILIHAT USER. Turunan, bukan kolom mentah.
+ *
+ * ┌──── KENAPA TURUNAN DAN BUKAN `refundSafe` APA ADANYA ─────────────────────────────────────┐
+ * │ `refundSafe` adalah kolom OPERASIONAL: ia menjawab "boleh tidak operator mentransfer uang  │
+ * │ ini sekarang", dan `false` punya dua sebab yang keduanya bicara tentang KAMI, bukan tentang │
+ * │ user (posisi USDC treasury yang belum diverifikasi on-chain; pin IDRX yang menyimpang       │
+ * │ sehingga Rupiah-nya belum terbukti kami terima). User tidak butuh — dan tidak berhak —      │
+ * │ membaca alasan internal itu; ia butuh SATU hal: uangnya kembali, sedang diperiksa, atau     │
+ * │ perlu menghubungi kami.                                                                     │
+ * │                                                                                             │
+ * │ Dan ada alasan yang lebih keras: membocorkan kolomnya berarti bentuk respons publik kita    │
+ * │ ikut berubah setiap kali kebijakan refund internal berubah. Turunan ini menahan perubahan   │
+ * │ itu di satu fungsi (`deriveRefundState`) alih-alih menyebarkannya ke klien.                 │
+ * └─────────────────────────────────────────────────────────────────────────────────────────────┘
+ *
+ *  NONE         : bukan kasus refund sama sekali (status apa pun selain REFUND_DUE).
+ *  IN_PROGRESS  : REFUND_DUE + refundSafe=true → utangnya TERCATAT dan operator memang diminta
+ *                 mengembalikannya. Ini SATU-SATUNYA keadaan yang boleh berbunyi "dana kembali".
+ *  UNDER_REVIEW : REFUND_DUE + refundSafe=false → reconciler secara EKSPLISIT menyuruh operator
+ *                 JANGAN mengirim uang sampai diverifikasi di luar sistem. Tidak boleh pernah
+ *                 dirender sebagai refund yang sedang berjalan.
+ */
+export type PaymentRefundState = 'NONE' | 'IN_PROGRESS' | 'UNDER_REVIEW';
+
+/**
+ * Kalimat siap-tampil untuk tiap keadaan. DITARUH DI SERVER dengan sengaja: kalau klien yang
+ * mengarangnya, satu salah-pasang cabang cukup untuk menjanjikan refund kepada user yang justru
+ * sedang ditahan operator. Nada NONE = null (tidak ada yang perlu dikatakan).
+ */
+const REFUND_NOTICE: Record<PaymentRefundState, string | null> = {
+  NONE: null,
+  IN_PROGRESS:
+    'Pembayaran ini tercatat sebagai refund dan sedang kami proses manual — dananya dikembalikan ' +
+    'ke sumber pembayaranmu. Kalau setelah 3 hari kerja belum masuk, hubungi support sambil ' +
+    'menyebut kode order ini.',
+  UNDER_REVIEW:
+    'Pembayaran ini sedang KAMI PERIKSA dulu, jadi belum ada refund yang dijadwalkan. Hubungi ' +
+    'support sambil menyebut kode order ini supaya bisa kami cek lebih cepat.',
+};
+
+/** Satu-satunya tempat kolom operasional `refundSafe` diterjemahkan jadi sinyal publik. */
+function deriveRefundState(order: {
+  status: PaymentStatus;
+  refundSafe: boolean;
+}): PaymentRefundState {
+  if (order.status !== PaymentStatus.REFUND_DUE) return 'NONE';
+  // FAIL-CLOSED: apa pun selain `true` yang eksplisit dianggap "tahan dulu". Kolomnya non-null di
+  // schema, tapi gerbang uang tidak boleh bergantung pada janji itu.
+  return order.refundSafe === true ? 'IN_PROGRESS' : 'UNDER_REVIEW';
+}
+
 /** Bentuk order yang aman dikirim ke klien. `error` sengaja TIDAK diekspos. */
 export interface PaymentOrderDto {
   merchantOrderId: string;
@@ -312,6 +378,14 @@ export interface PaymentOrderDto {
   createdAt: Date;
   paidAt: Date | null;
   fulfilledAt: Date | null;
+  /**
+   * B3 — sinyal refund TURUNAN. Kolom `refundSafe` sendiri TIDAK PERNAH diekspos. Riwayat
+   * pembayaran WAJIB membedakan IN_PROGRESS dari UNDER_REVIEW: sebelum ini SETIAP user REFUND_DUE
+   * diberi tahu refundnya sedang diproses — termasuk yang operatornya justru dilarang membayar.
+   */
+  refundState: PaymentRefundState;
+  /** Kalimat siap-tampil untuk `refundState`. null ⇔ NONE. Ditentukan server, bukan klien. */
+  refundNotice: string | null;
 }
 
 export interface ReconcileSummary {
@@ -552,10 +626,10 @@ export class PaymentsService {
     // DEFAULT tiap listing (termasuk seed/chart-filler placeholder) — tanpa flag ini kartu hantu ikut
     // buyable & pembeli bayar rupiah untuk barang tak terkirim. Hoshi = penjual+platform → seluruh
     // harga pendapatan Hoshi, TIDAK beli di CC, priceUsdc 0. Settlement cuma DB (klaim SOLD).
-    const isHoshiInventory =
-      listing.source !== 'COLLECTORCRYPT' &&
-      listing.sellerId == null &&
-      listing.sellable === true;
+    // SATU DEFINISI, dipakai bersama jalur KIRIM DOMESTIK (redemption.service.ts). Kalau
+    // predikat ini dan predikat kirim berbeda, kita menjual kartu yang tak bisa dikirim (atau
+    // sebaliknya) — lihat src/common/hoshi-stock.ts.
+    const isHoshiInventory = isHoshiSellableStock(listing);
     if (!isUserListing && !isCcCatalog && !isHoshiInventory) {
       throw new BadRequestException(
         'Kartu ini belum bisa dibeli lewat jalur ini.',
@@ -933,6 +1007,10 @@ export class PaymentsService {
     if (redemption.userId !== user.id) {
       throw new ForbiddenException('Redemption ini bukan milik Anda.');
     }
+    // GERBANG RAIL. Baris jalur DOMESTIK (stok Hoshi) tidak punya ongkir CC untuk ditaksir dan
+    // tidak boleh pernah sampai ke assertTreasuryCapacity di bawah — ongkirnya sudah dibayar
+    // lewat createDomesticShippingOrder dan NOL USDC akan pernah didanai untuknya.
+    assertCcRail(redemption);
     // B1 — DUA status boleh MASUK ke rute ini, dan URUTAN di bawah ini adalah perbaikannya.
     // DULU: cek status (hanya REQUESTED) berjalan SEBELUM cabang idempoten, jadi begitu baris
     // pindah ke AWAITING_PAYMENT cabang idempoten itu TIDAK PERNAH TERCAPAI — user yang kembali ke
@@ -1131,6 +1209,262 @@ export class PaymentsService {
       `Redemption ${redemptionId}: invoice ongkir mati → klaim AWAITING_PAYMENT dilepas balik ke ` +
         'REQUESTED. Nol Rupiah masuk; tagihan baru boleh diterbitkan.',
     );
+  }
+
+  /* ══════════════════════ ONGKIR KIRIM DOMESTIK (STOK HOSHI) ══════════════════════ */
+
+  /**
+   * Taksiran ongkir DOMESTIK untuk satu redemption. READ-ONLY: nol uang, nol order, nol efek
+   * samping — aman dipanggil layar mana pun sebelum user memutuskan membayar. Sumber angkanya
+   * PERSIS sama dengan yang dipakai `createDomesticShippingOrder`, jadi yang dilihat user dan
+   * yang ditagihkan tidak bisa lahir dari dua kalkulasi berbeda.
+   *
+   * Termasuk yang sama: GERBANG NEGARA. Alamat di luar Indonesia ditolak DI SINI (400
+   * HOSHI_DOMESTIC_ADDRESS_UNSUPPORTED), jadi user tahu alamatnya perlu dibetulkan SEBELUM ia
+   * menekan tombol bayar — bukan sesudahnya.
+   */
+  async quoteDomesticShipping(
+    redemptionId: string,
+    user: AuthUser,
+  ): Promise<DomesticShippingQuote> {
+    const redemption = await this.ownedDomesticRedemption(redemptionId, user);
+    const quote = await resolveDomesticShippingIdr({
+      prisma: this.prisma,
+      logger: this.logger,
+      dest: {
+        city: redemption.city,
+        state: redemption.state,
+        country: redemption.country,
+      },
+      env: (k) => this.config.get<string>(k),
+    });
+    return quote;
+  }
+
+  /**
+   * ╔══════════════════════════════════════════════════════════════════════════════════════╗
+   * ║ Terbitkan tagihan Rupiah ONGKIR KIRIM DOMESTIK (stok fisik Hoshi, kurir lokal).      ║
+   * ╚══════════════════════════════════════════════════════════════════════════════════════╝
+   *
+   * RAIL PEMBAYARANNYA SAMA (packType='SHIPPING' + redemptionId): IDRX hosted checkout,
+   * callback, reconciler, sapuan kedaluwarsa, pelepasan klaim — semuanya sudah bekerja dan
+   * TIDAK ada rail pembayaran kedua yang dibangun di sini.
+   *
+   * ┌──── APA YANG BEDA DARI `createShippingOrder` (CC Vault), DAN KENAPA ────────────────┐
+   * │ 1. TIDAK memanggil ccShipping.assertEnabled(): jalur ini tidak menyentuh CC sama     │
+   * │    sekali, jadi ia TIDAK boleh mati bersama gerbang CC (dan TIDAK ikut terblokir     │
+   * │    oleh kredensial CC yang masih ditunggu).                                         │
+   * │ 2. TIDAK butuh x-cc-access-token. Tidak ada sesi CC yang relevan.                   │
+   * │ 3. Harga dari TARIF ADMIN (domestic_shipping_rates), BUKAN dari estimate CC.        │
+   * │    `priceUsdc` DITULIS 0 dan itu JUJUR: nol USDC akan pernah bergerak untuk baris ini.│
+   * │ 4. TIDAK memanggil assertTreasuryCapacity. Itu BUKAN kelonggaran: fungsi itu menguji │
+   * │    apakah treasury sanggup MENDANAI USDC ongkir, dan jalur ini tidak pernah mendanai │
+   * │    apa pun. Memanggilnya akan MENOLAK pengiriman domestik gara-gara plafon dana yang │
+   * │    tak pernah dipakai. Plafon per-tx + cap 24 jam treasury tetap UTUH dan tetap      │
+   * │    ditegakkan di setiap jalur yang benar-benar memindahkan USDC.                     │
+   * └─────────────────────────────────────────────────────────────────────────────────────┘
+   *
+   * POSISI refundSafe DI SINI: order lahir PENDING dengan refundSafe default `true`, dan baris
+   * redemption-nya tetap `refundSafe=true` / `fundingSignature=null` — dua kolom itu DIBACA
+   * sebagai predikat, TIDAK PERNAH ditulis. Tidak ada satu pun titik di jalur domestik yang
+   * bisa membuat ongkir Rupiah TIDAK aman di-refund, karena tidak ada langkah pasca-belanja:
+   * tak ada USDC yang keluar, tak ada NFT yang dibakar.
+   *
+   * Urutan = properti keamanannya:
+   *   0. validasi milik user + RAIL DOMESTIK + status REQUESTED/AWAITING_PAYMENT
+   *   1. resolusi tarif ongkir (admin → env → penampung), divalidasi ke batas mint IDRX
+   *   2. mint-request IDRX → merchantOrderId lahir di sana
+   *   3. persist PaymentOrder + klaim REQUESTED → AWAITING_PAYMENT dalam SATU transaksi
+   */
+  async createDomesticShippingOrder(
+    redemptionId: string,
+    user: AuthUser,
+  ): Promise<PaymentOrderDto> {
+    const treasuryAddress = this.treasuryAddressOrRefuse();
+    const redemption = await this.ownedDomesticRedemption(redemptionId, user);
+
+    // Dua status boleh MASUK — sama seperti jalur CC, dan alasannya sama: user yang kembali ke
+    // invoice-nya sendiri harus mendapat invoice yang SAMA, bukan 400 selamanya.
+    if (
+      redemption.status !== RedemptionStatus.REQUESTED &&
+      redemption.status !== RedemptionStatus.AWAITING_PAYMENT
+    ) {
+      throw domesticError({
+        status: 400,
+        code: DOMESTIC_ERROR_CODE.NOT_BILLABLE,
+        message:
+          'Permintaan kirim ini tidak dalam status yang bisa dibuatkan tagihan ongkir ' +
+          `(status ${redemption.status}).`,
+        redemptionId,
+      });
+    }
+
+    // IDEMPOTEN + RE-ENTRY: order ongkir PENDING yang belum kedaluwarsa → kembalikan yang itu.
+    const existingPending = await this.prisma.paymentOrder.findFirst({
+      where: {
+        userId: user.id,
+        redemptionId,
+        packType: 'SHIPPING',
+        status: PaymentStatus.PENDING,
+        expiresAt: { gt: new Date() },
+      },
+      orderBy: { createdAt: 'desc' },
+    });
+    if (existingPending) return toPaymentOrderDto(existingPending);
+
+    // AWAITING_PAYMENT tanpa invoice hidup = invoice-nya mati. Helper yang SAMA dengan jalur CC
+    // melepas klaimnya balik ke REQUESTED — dan MENOLAK KERAS kalau ada pembayaran yang mendarat,
+    // supaya user tidak pernah ditagih dua kali untuk satu pengiriman.
+    if (redemption.status === RedemptionStatus.AWAITING_PAYMENT) {
+      await this.releaseAbandonedShippingClaim(redemptionId);
+    }
+
+    await this.assertOrderQuota(user.id);
+
+    // 1. TARIF. Dari baris admin kalau ada, lalu env, lalu penampung sementara — dan selalu
+    //    divalidasi ke batas mint IDRX (resolveDomesticShippingIdr yang menegakkannya).
+    const rate = await resolveDomesticShippingIdr({
+      prisma: this.prisma,
+      logger: this.logger,
+      dest: {
+        city: redemption.city,
+        state: redemption.state,
+        country: redemption.country,
+      },
+      env: (k) => this.config.get<string>(k),
+    });
+    const priceIdr = rate.priceIdr;
+    if (priceIdr < IDRX_MIN_MINT_IDR || priceIdr > IDRX_MAX_MINT_IDR) {
+      // Sabuk KEDUA (resolveDomesticShippingIdr sudah memeriksanya). Murah, dan menutup
+      // kemungkinan lapis resolusi baru ditambahkan nanti tanpa validasinya sendiri.
+      throw domesticError({
+        status: 503,
+        code: DOMESTIC_ERROR_CODE.RATE_UNAVAILABLE,
+        message:
+          'Tarif ongkir domestik belum bisa dipakai. Hubungi support — jangan bayar apa pun.',
+        redemptionId,
+      });
+    }
+
+    // 2. mint-request IDRX. Sesudah bayar, user kembali ke /withdraw (halaman yang memuat
+    //    daftar pengiriman + melanjutkan sesinya). SENGAJA BUKAN /vault: /vault me-resume modal
+    //    kirim CC, dan dua sesi resume yang berbeda tidak boleh mendarat di satu halaman.
+    const expiryMinutes = this.intConfig(
+      'HOSHI_ORDER_EXPIRY_MINUTES',
+      DEFAULT_EXPIRY_MINUTES,
+      1,
+    );
+    const returnUrl = new URL(
+      '/withdraw',
+      this.requiredConfig('HOSHI_PAYMENT_RETURN_URL'),
+    ).toString();
+    const mint = await this.idrx.mintRequest({
+      toBeMinted: String(priceIdr),
+      destinationWalletAddress: treasuryAddress,
+      networkChainId: this.requiredConfig('IDRX_NETWORK_CHAIN_ID'),
+      returnUrl,
+      expiryPeriod: expiryMinutes,
+      productDetails: `Hoshi ongkir kirim domestik ${redemption.cardName}`.slice(
+        0,
+        255,
+      ),
+    });
+    const data = mint.data;
+    if (
+      !data ||
+      typeof data.merchantOrderId !== 'string' ||
+      !data.merchantOrderId
+    ) {
+      throw new ServiceUnavailableException(
+        'IDRX tidak mengembalikan merchantOrderId. Order tidak dibuat — coba lagi.',
+      );
+    }
+
+    // 3. Persist order + klaim REQUESTED → AWAITING_PAYMENT dalam SATU transaksi. Predikat klaim
+    //    memasang RAIL-nya (`listingId: { not: null }`) supaya sebuah baris jalur CC tidak bisa
+    //    diklaim dari sini walau pun pembacaan di atas entah bagaimana basi. Kalah klaim →
+    //    rollback, order tak dibuat (mint-request yatim akan kedaluwarsa sendiri).
+    const created = await this.prisma.$transaction(async (tx) => {
+      const claim = await tx.cardRedemption.updateMany({
+        where: {
+          id: redemptionId,
+          status: RedemptionStatus.REQUESTED,
+          listingId: { not: null },
+        },
+        data: { status: RedemptionStatus.AWAITING_PAYMENT },
+      });
+      if (claim.count !== 1) return null;
+      const order = await tx.paymentOrder.create({
+        data: {
+          merchantOrderId: data.merchantOrderId,
+          idrxRequestId: data.id != null ? String(data.id) : null,
+          reference: data.reference ?? null,
+          userId: user.id,
+          packType: 'SHIPPING',
+          redemptionId,
+          priceIdr,
+          // 0 dan itu JUJUR: jalur domestik tidak pernah mendanai USDC. Setiap gerbang yang
+          // membaca priceUsdc (plafon slippage CC, assertCostWithinPaid) hidup di jalur CC,
+          // dan jalur itu tidak bisa dimasuki baris ber-listingId (assertCcRail).
+          priceUsdc: 0,
+          paymentMethod: 'HOSTED',
+          qrContent: data.qrContent ?? null,
+          virtualAccountNo: data.virtualAccountNo ?? null,
+          paymentUrl: data.paymentUrl ?? null,
+          expiresAt: new Date(Date.now() + expiryMinutes * 60_000),
+          status: PaymentStatus.PENDING,
+        },
+      });
+      await tx.cardRedemption.update({
+        where: { id: redemptionId },
+        data: { paymentOrderId: order.id },
+      });
+      return order;
+    });
+    if (!created) {
+      throw domesticError({
+        status: 400,
+        code: DOMESTIC_ERROR_CODE.ORDER_IN_PROGRESS,
+        message:
+          'Permintaan kirim ini sudah dalam proses pembayaran ongkir. Cek tagihanmu.',
+        redemptionId,
+      });
+    }
+
+    this.logger.log(
+      `Order ongkir DOMESTIK ${created.merchantOrderId} dibuat: redemption ${redemptionId} ` +
+        `(${redemption.cardName}, listing ${redemption.listingId}), Rp ${priceIdr} ` +
+        `(tarif scope ${rate.scope}, sumber ${rate.source}, wilayah ${rate.region}, ` +
+        `provinsi '${rate.province}'). NOL USDC, NOL CC, NOL burn.`,
+    );
+    // Provinsi yang TIDAK terpetakan ke tier mana pun ditagih tarif PENAMPUNG. Bukan kegagalan —
+    // tapi ia harus TERLIHAT, karena artinya ada ejaan provinsi yang belum masuk daftar tier dan
+    // pembelinya mungkin ditagih lebih mahal dari seharusnya.
+    if (rate.regionUnresolved) {
+      this.logger.warn(
+        `Ongkir domestik ${created.merchantOrderId}: provinsi '${rate.province}' (kota ` +
+          `'${redemption.city}') TIDAK cocok ke tier mana pun — dipakai tarif penampung ` +
+          `${rate.scope} Rp ${priceIdr}. Tambahkan ejaan itu ke \`provinces\` tier yang benar ` +
+          'lewat PUT /api/admin/shipping/domestic-rates.',
+      );
+    }
+    return toPaymentOrderDto(created);
+  }
+
+  /**
+   * Muat redemption milik user DAN pastikan ia jalur DOMESTIK. Chokepoint tunggal untuk semua
+   * rute domestik — cerminan `ownedRedemption` + `assertCcRail` di sisi CC.
+   */
+  private async ownedDomesticRedemption(redemptionId: string, user: AuthUser) {
+    const row = await this.prisma.cardRedemption.findUnique({
+      where: { id: redemptionId },
+    });
+    if (!row) throw new NotFoundException('Redemption tidak ditemukan.');
+    if (row.userId !== user.id) {
+      throw new ForbiddenException('Redemption ini bukan milik Anda.');
+    }
+    assertDomesticRail(row);
+    return row;
   }
 
   /* ─────────────────────────── Callback IDRX ─────────────────────────── */
@@ -1883,11 +2217,22 @@ export class PaymentsService {
   /**
    * Fulfilment ONGKIR KIRIM-FISIK untuk order yang sudah diklaim (FULFILLING) — PARUH AMAN saja.
    *
-   * TIDAK ADA belanja/pendanaan USDC di sini, dan TIDAK memanggil CC: ia HANYA menandai redemption
-   * AWAITING_PAYMENT → READY_TO_FUND + order FULFILLED, dalam SATU transaksi. Pendanaan USDC + CC
-   * prepare/burn dikerjakan MALAS di sesi tanda-tangan user (CcShippingService.fundAndPrepare),
-   * BUKAN di sini — supaya jalur fulfilment ini tetap sepenuhnya refund-safe (I2): satu-satunya hal
-   * yang sudah terjadi sampai titik ini adalah Rupiah masuk; belum ada satu pun USDC yang bergerak.
+   * TIDAK ADA belanja/pendanaan USDC di sini, dan TIDAK memanggil CC: ia HANYA MENGGERAKKAN
+   * STATUS redemption + menandai order FULFILLED, dalam SATU transaksi.
+   *
+   * ┌──────────── DUA RAIL, DUA TUJUAN STATUS. TIDAK BOLEH TERTUKAR. ──────────────────────────┐
+   * │ CC VAULT (listingId NULL)  : AWAITING_PAYMENT → READY_TO_FUND. Pendanaan USDC + CC       │
+   * │   prepare/burn dikerjakan MALAS di sesi tanda-tangan user (fundAndPrepare), BUKAN di     │
+   * │   sini — itulah yang membuat jalur fulfilment ini tetap refund-safe (I2).                │
+   * │ DOMESTIK (listingId NON-NULL): AWAITING_PAYMENT → PACKING. Ongkir Rupiah LUNAS dan       │
+   * │   yang tersisa hanyalah Hoshi mengemas paketnya. READY_TO_FUND berarti "siap danai USDC" │
+   * │   dan TIDAK PERNAH BOLEH tertulis di baris domestik: ia akan mengundang fundAndPrepare   │
+   * │   memindahkan USDC treasury untuk kartu yang tidak punya NFT untuk dibakar.              │
+   * └─────────────────────────────────────────────────────────────────────────────────────────┘
+   *
+   * Rail dibaca dari kolom `listingId` yang IMMUTABLE sesudah create, jadi pembacaan di bawah
+   * tidak bisa basi. Walau begitu railnya TETAP dipasang sebagai PREDIKAT di updateMany, supaya
+   * pemisahan dua rail ditegakkan Postgres dan bukan hanya oleh urutan baca kita.
    *
    * Penanganan gagalnya seperti fulfilTopup: nol treasury → TIDAK PERNAH REFUND_DUE pasca-belanja.
    * Kegagalan transien → lepas klaim ke PAID (reconciler mengulang). Kalau redemption sudah tidak
@@ -1904,15 +2249,37 @@ export class PaymentsService {
         `Order SHIPPING ${order.merchantOrderId} tanpa redemptionId — refund manual.`,
       );
     }
+    // RAIL. Dibaca dari FAKTA yang tersimpan (kolom immutable), bukan dari flag/konfigurasi.
+    // Baris yang hilang → utang refund (Rupiah masuk, nol yang diserahkan, nol USDC bergerak).
+    const railRow = await this.prisma.cardRedemption.findUnique({
+      where: { id: redemptionId },
+      select: { listingId: true },
+    });
+    if (!railRow) {
+      return this.failToRefund(
+        order,
+        `Redemption ${redemptionId} hilang — ongkir Rupiah perlu di-refund manual.`,
+      );
+    }
+    const domestic = isDomesticRedemption(railRow);
+    const nextStatus = domestic
+      ? RedemptionStatus.PACKING
+      : RedemptionStatus.READY_TO_FUND;
+
     try {
-      // Klaim AWAITING_PAYMENT → READY_TO_FUND + order FULFILLED, ALL-OR-NOTHING dalam SATU tx.
-      // count!==1 = redemption bukan lagi AWAITING_PAYMENT (dibatalkan / sudah maju) → jangan
-      // diam-diam menandai order FULFILLED; lempar untuk memicu penanganan di bawah.
+      // Klaim AWAITING_PAYMENT → (READY_TO_FUND | PACKING) + order FULFILLED, ALL-OR-NOTHING
+      // dalam SATU tx. count!==1 = redemption bukan lagi AWAITING_PAYMENT milik order ini
+      // (dibatalkan / sudah maju / rail-nya bukan yang kita baca) → jangan diam-diam menandai
+      // order FULFILLED; lempar untuk memicu penanganan di bawah.
       const claimed = await this.prisma.$transaction(async (tx) => {
         const c = await tx.cardRedemption.updateMany({
           where: {
             id: redemptionId,
             status: RedemptionStatus.AWAITING_PAYMENT,
+            // PIN RAIL. Tanpa ini, sebuah pembacaan basi bisa menulis READY_TO_FUND ke baris
+            // domestik (mengundang pendanaan USDC untuk kartu tanpa NFT) atau PACKING ke baris
+            // CC (kartunya tak pernah dibakar tapi dianggap sedang dikemas).
+            listingId: domestic ? { not: null } : null,
             // B1 — PIN KE ORDER INI. Sejak klaim AWAITING_PAYMENT BISA DILEPAS (invoice
             // kedaluwarsa / batal user), baris yang sama bisa berjalan lagi dengan invoice BARU.
             // Tanpa pin ini, invoice LAMA yang dibayar telat akan MEMBAJAK baris yang sudah
@@ -1922,7 +2289,7 @@ export class PaymentsService {
             // tidak pernah meleset untuk baris yang lahir dari jalur itu.
             paymentOrderId: order.id,
           },
-          data: { status: RedemptionStatus.READY_TO_FUND },
+          data: { status: nextStatus },
         });
         if (c.count !== 1) return 0;
         await tx.paymentOrder.update({
@@ -1950,8 +2317,11 @@ export class PaymentsService {
         );
       }
       this.logger.log(
-        `Ongkir ${order.merchantOrderId} FULFILLED → redemption ${redemptionId} READY_TO_FUND ` +
-          `(user ${order.userId}). Pendanaan USDC ditunda ke sesi TTD user.`,
+        `Ongkir ${order.merchantOrderId} FULFILLED → redemption ${redemptionId} ${nextStatus} ` +
+          `(user ${order.userId}). ` +
+          (domestic
+            ? 'Jalur DOMESTIK: paket dikemas Hoshi; NOL USDC, NOL burn, NOL CC.'
+            : 'Pendanaan USDC ditunda ke sesi TTD user.'),
       );
       return 'FULFILLED';
     } catch (err) {
@@ -1999,10 +2369,11 @@ export class PaymentsService {
       // Defense-in-depth: hanya stok yang DITANDAI sellable. Guard di createListingOrder sudah
       // menolak yang tidak sellable, tapi kalau toh ada order (mis. dibuat sebelum flag ini),
       // JANGAN tandai baris seed/placeholder terjual — refund manual.
-      if (!listing.sellable) {
+      if (!isHoshiSellableStock(listing)) {
         return this.failToRefund(
           order,
-          `Listing ${listing.id} bukan stok Hoshi yang dijual (sellable=false) — refund manual.`,
+          `Listing ${listing.id} bukan stok Hoshi yang dijual (sellable=${listing.sellable}, ` +
+            `source=${listing.source}, sellerId=${listing.sellerId ?? 'null'}) — refund manual.`,
         );
       }
       return this.fulfilHoshiInventory(order, listing, user);
@@ -3447,8 +3818,14 @@ function applyBps(value: number, bps: number): number {
   return remainder === 0 ? quotient : quotient + 1;
 }
 
-/** Baris order → bentuk publik. `error` sengaja tidak ikut: isinya untuk log kita, bukan untuk klien. */
+/**
+ * Baris order → bentuk publik. `error` sengaja tidak ikut: isinya untuk log kita, bukan untuk klien.
+ *
+ * B3 — `refundSafe` juga TIDAK ikut. Yang ikut adalah TURUNANNYA (`refundState`/`refundNotice`),
+ * sehingga user tahu apakah uangnya kembali TANPA membaca alasan operasional kita.
+ */
 function toPaymentOrderDto(order: PaymentOrder): PaymentOrderDto {
+  const refundState = deriveRefundState(order);
   return {
     merchantOrderId: order.merchantOrderId,
     packType: order.packType,
@@ -3464,5 +3841,7 @@ function toPaymentOrderDto(order: PaymentOrder): PaymentOrderDto {
     createdAt: order.createdAt,
     paidAt: order.paidAt,
     fulfilledAt: order.fulfilledAt,
+    refundState,
+    refundNotice: REFUND_NOTICE[refundState],
   };
 }

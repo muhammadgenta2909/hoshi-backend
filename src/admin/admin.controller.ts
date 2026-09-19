@@ -47,6 +47,8 @@ import {
   QueryAdminMessagesDto,
 } from './dto/contact-message.dto';
 import { ImportListingsDto } from './dto/import-listings.dto';
+import { SetListingsSellableDto } from './dto/set-listings-sellable.dto';
+import { SetDomesticShippingRateDto } from './dto/set-domestic-shipping-rate.dto';
 import { UpdateVaultItemDto } from './dto/update-vault-item.dto';
 import {
   QueryAdminEscrowDto,
@@ -228,10 +230,121 @@ export class AdminController {
     return this.withdrawal.adminReject(id, dto.note);
   }
 
+  /**
+   * A — BACA DULU SEBELUM MENANDAI. Stok Hoshi yang TIDAK bisa dibeli (`sellable=false`).
+   * Inilah permukaan yang dulu tidak ada: kartu terpajang, nol Rupiah bisa masuk, dan tidak
+   * ada apa pun di dashboard yang menjelaskan kenapa.
+   */
+  @Get('listings/unsellable')
+  @ApiBearerAuth()
+  @UseGuards(AdminGuard)
+  @ApiOperation({
+    summary:
+      'READ-ONLY: listing stok Hoshi yang TIDAK BISA DIBELI karena sellable=false (ACTIVE, ' +
+      'bukan katalog CC, tanpa penjual user). Daftar ini MENCAMPUR stok sungguhan dengan ' +
+      'baris seed/placeholder — bentuknya identik dan tidak bisa dibedakan otomatis. Baca ' +
+      'ini dulu, lalu tandai HANYA baris yang kartunya benar-benar ada di rak. Respons membawa ' +
+      '`total`/`returned`/`limit`/`offset`/`hasMore` untuk paging, `actionRequired` (kosong = ' +
+      'tidak ada stok yang tertahan), dan `placeholderDetection: "MANUAL_ONLY"` — tidak ada ' +
+      'predikat otomatis yang bisa memisahkan baris seed dari stok nyata.',
+  })
+  unsellableListings(
+    @Query('limit') limit?: string,
+    @Query('offset') offset?: string,
+  ) {
+    return this.admin.listUnsellableStock(
+      Number(limit) || 200,
+      Number(offset) || 0,
+    );
+  }
+
+  /**
+   * A — PERBAIKAN DATA untuk baris yang diimpor SEBELUM `importListings` menulis
+   * `sellable: true`. Tanpa rute ini satu-satunya jalan keluar adalah mengedit Postgres.
+   *
+   * SENGAJA per-id (maks 500), BUKAN sapuan massal: default `sellable=false` ada untuk menahan
+   * baris seed/placeholder, dan bentuk baris seed IDENTIK dengan bentuk stok sungguhan. Hanya
+   * manusia yang tahu mana yang nyata.
+   */
+  @Post('listings/sellable')
+  @ApiBearerAuth()
+  @UseGuards(AdminGuard)
+  @ApiOperation({
+    summary:
+      'Tandai baris listing tertentu BISA / TIDAK BISA dibeli (flag sellable), per daftar id ' +
+      'eksplisit (maks 500). Menaikkan flag = baris itu SEKARANG bisa dibeli pembeli — pakai ' +
+      'HANYA untuk kartu yang fisiknya benar-benar ada di rak Hoshi. Reversibel ' +
+      '(sellable=false). Setiap perubahan di-log dengan id admin-nya. IDEMPOTEN: memanggilnya ' +
+      'dua kali dengan body yang sama menghasilkan `changed: 0` dan id-nya muncul di ' +
+      '`alreadyCorrect` — bukan error, bukan perubahan kedua. `skipped` = id yang ditolak pagar ' +
+      'bentuk (tidak ada / katalog CC / listing user / bukan ACTIVE).',
+  })
+  setListingsSellable(
+    @Body() dto: SetListingsSellableDto,
+    @CurrentUser() user: AuthUser,
+  ) {
+    return this.admin.setListingsSellable(dto.ids, dto.sellable, user);
+  }
+
+  /* ─────── TARIF ONGKIR KIRIM DOMESTIK (stok Hoshi, kurir lokal Indonesia) ─────── */
+
+  @Get('shipping/domestic-rates')
+  @ApiBearerAuth()
+  @UseGuards(AdminGuard)
+  @ApiOperation({
+    summary:
+      'Tarif ongkir kirim DOMESTIK: tier yang SEDANG berlaku, urutan resolusinya, contoh ' +
+      'siap-tempel, dan `actionRequired` — daftar hal yang masih harus diputuskan pemilik ' +
+      'produk (mis. tier yang angkanya masih PENAMPUNG dan SEDANG ditagihkan ke pembeli). ' +
+      'Tabel KOSONG bukan berarti "tidak ada yang perlu dilakukan": artinya jalur bayar sedang ' +
+      'memakai tier penampung di kode — dan itulah yang dikatakan `usingDefaults: true` + ' +
+      '`placeholderCount`. Respons juga membawa `limits` (batas nominal yang ditegakkan ' +
+      'assertSaneRate — pakai untuk memvalidasi form SEBELUM submit) dan `placeholderPricesIdr` ' +
+      '(angka penampung yang SEDANG ditagihkan). READ-ONLY.',
+  })
+  domesticShippingRates() {
+    return this.admin.listDomesticShippingRates();
+  }
+
+  @Put('shipping/domestic-rates')
+  @ApiBearerAuth()
+  @UseGuards(AdminGuard)
+  @ApiOperation({
+    summary:
+      'Set SATU TIER ongkir kirim DOMESTIK tanpa deploy (upsert per scope). INI TEMPAT PEMILIK ' +
+      'PRODUK MENETAPKAN ONGKIRNYA, dan tempat TIER BARU LAHIR: satu baris = satu tier yang ' +
+      'membawa harganya SEKALIGUS daftar provinsinya (`provinces`), jadi menambah/memperhalus ' +
+      'tier tidak pernah butuh perubahan kode. scope "TIER:<NAMA>" = tier wilayah, ' +
+      '"STATE:<provinsi>" = harga khusus satu provinsi, "*" = flat nasional (bentuk lama). ' +
+      'fallback=true menandai tier PENAMPUNG untuk provinsi tak dikenal — otomatis dimatikan di ' +
+      'tier lain. NOL dana treasury: ini hanya nominal Rupiah yang ditagihkan ke pembeli. ' +
+      'Berlaku untuk tagihan BERIKUTNYA; tagihan yang sudah terbit memakai nominal yang ' +
+      'di-snapshot di PaymentOrder-nya. IDEMPOTEN (upsert per `scope`): body yang sama dikirim ' +
+      'dua kali menghasilkan baris yang sama, aman di-retry. Field yang TIDAK disebut tidak ' +
+      'diubah. Responsnya membawa `effective`/`actionRequired`/`usingDefaults` yang SUDAH ' +
+      'diperbarui — bentuknya identik dengan GET, jadi dashboard bisa merender ulang tanpa ' +
+      'memanggil GET lagi.',
+  })
+  setDomesticShippingRate(
+    @Body() dto: SetDomesticShippingRateDto,
+    @CurrentUser() user: AuthUser,
+  ) {
+    return this.admin.setDomesticShippingRate(dto, user);
+  }
+
   @Get('redemptions')
   @ApiBearerAuth()
   @UseGuards(AdminGuard)
-  @ApiOperation({ summary: 'Daftar permintaan kirim kartu fisik (redemption)' })
+  @ApiOperation({
+    summary:
+      'Daftar permintaan kirim kartu fisik (redemption). Field `rail` membedakan ' +
+      'HOSHI_DOMESTIC (kemas & kirim sendiri lewat kurir lokal; isi resinya di sini) dari ' +
+      'CC_VAULT (burn + shipment CollectorCrypt; resi datang dari poll CC). Setiap baris juga ' +
+      'membawa `ongkir` (required/paid/inFlight/refundDue/refundSafe/paidIdr/orders — keadaan ' +
+      'tagihan ongkir Rupiah-nya), `allowedNextStatuses` + `blockedNextStatuses` (tombol yang ' +
+      'boleh dirender, SUDAH dikurangi pagar ongkir), dan `actionRequired` (daftar kalimat; ' +
+      'kosong = tidak ada yang tertunggak).',
+  })
   redemptions() {
     return this.admin.listRedemptions();
   }
@@ -246,13 +359,30 @@ export class AdminController {
       '(sesudah USDC direklaim; refundSafe TETAP false — BUKAN izin refund Rupiah), ' +
       'SHIP_FAILED_POST_BURN→DELIVERED, IN_TRANSIT→DELIVERED (penutupan manual bila CC memarkir ' +
       'kiriman di Shipped dan poll status tak pernah menjawab Delivered). ' +
-      'READY_TO_FUND dan BURN_SUBMITTED punya rute sendiri.',
+      'READY_TO_FUND dan BURN_SUBMITTED punya rute sendiri. ' +
+      'RAIL HOSHI_DOMESTIC (stok Hoshi, kurir lokal): AWAITING_PAYMENT → PACKING dilakukan ' +
+      'OTOMATIS begitu ongkir Rupiah lunas; dari sini admin mengisi resi (trackingIds/' +
+      'trackingUrls, HANYA rail ini) lalu PACKING → SHIPPED → DELIVERED. Membatalkan baris ' +
+      'DOMESTIK yang ongkirnya sudah lunas otomatis mencatat utang refundnya dan ' +
+      'melaporkannya di `shippingDebts` pada respons. ' +
+      'B2: REQUESTED → PACKING/SHIPPED pada rail HOSHI_DOMESTIC DITOLAK (400) selama ongkirnya ' +
+      'belum lunas — kirim `absorbShippingFee: true` + `note` (≥10 karakter) kalau Hoshi memang ' +
+      'sengaja menanggung ongkirnya; pernyataan itu disimpan permanen di kolom `note`. Respons ' +
+      'membawa `rail`, `ongkir`, `allowedNextStatuses`, dan `actionRequired` yang sudah diperbarui.',
   })
   updateRedemption(
     @Param('id') id: string,
     @Body() dto: UpdateRedemptionStatusDto,
   ) {
-    return this.admin.updateRedemptionStatus(id, dto.status);
+    return this.admin.updateRedemptionStatus(
+      id,
+      dto.status,
+      {
+        trackingIds: dto.trackingIds,
+        trackingUrls: dto.trackingUrls,
+      },
+      { absorbShippingFee: dto.absorbShippingFee, note: dto.note },
+    );
   }
 
   /**

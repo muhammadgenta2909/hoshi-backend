@@ -30,11 +30,27 @@ import {
   type ShippingRefundDebt,
 } from '../payments/shipping-refund-debt';
 import { appendBoundedNote, NOTE_MAX } from '../common/append-note';
+import { isHoshiSellableStock } from '../common/hoshi-stock';
+import type { DomesticShippingQuote } from '../payments/domestic-shipping-rate';
+import {
+  DOMESTIC_ERROR_CODE,
+  domesticError,
+  hoshiListingRef,
+  isDomesticRedemption,
+} from '../common/hoshi-domestic-shipping';
 import { RequestRedemptionDto } from './dto/request-redemption.dto';
 
 export type CardRedemptionDto = {
   id: string;
+  /**
+   * IDENTITAS kartu. Jalur CC Vault: alamat NFT sungguhan. Jalur DOMESTIK (stok Hoshi): turunan
+   * `hoshi-listing:<listingId>` — kartu itu memang TIDAK punya alamat NFT (settlement-nya
+   * database-only). Alfabet base58 Solana tak memuat ':' maupun '-', jadi dua bentuk ini tidak
+   * bisa tertukar. Klien yang perlu tahu railnya membaca `listingId` di bawah, bukan mem-parse ini.
+   */
   nftAddress: string;
+  /** NON-NULL = jalur kirim DOMESTIK (stok Hoshi, kurir lokal). NULL = jalur CC Vault. */
+  listingId: string | null;
   cardName: string;
   cardImage: string | null;
   cardSet: string | null;
@@ -182,6 +198,7 @@ function toDto(r: CardRedemption): CardRedemptionDto {
   return {
     id: r.id,
     nftAddress: r.nftAddress,
+    listingId: r.listingId,
     cardName: r.cardName,
     cardImage: r.cardImage,
     cardSet: r.cardSet,
@@ -215,62 +232,153 @@ export class RedemptionService {
     dto: RequestRedemptionDto,
     user: AuthUser,
   ): Promise<CardRedemptionDto> {
-    // 1. Kepemilikan lewat LEDGER, bukan klaim klien. DUA sumber kartu vault yang sah:
-    //    (a) hasil PACK yang OPENED (ccPackPurchase), atau
-    //    (b) kartu yang DIBELI user di marketplace (Listing SOLD, buyerId = user).
-    //    Keduanya mewakili kartu fisik di vault CC → boleh diminta kirim. Info kartu (nama/gambar/
-    //    set) diambil dari sumber yang cocok, bukan dari body.
+    // ╔════════════════════════════════════════════════════════════════════════════════════════╗
+    // ║ 1. KEPEMILIKAN lewat LEDGER, bukan klaim klien — TIGA sumber kartu yang sah.           ║
+    // ╚════════════════════════════════════════════════════════════════════════════════════════╝
+    //   (a) hasil PACK yang OPENED (ccPackPurchase)                → fisiknya di gudang CC
+    //   (b) kartu DIBELI di marketplace (Listing SOLD, buyerId=user) yang punya alamat NFT
+    //                                                               → fisiknya di gudang CC / P2P
+    //   (c) STOK HOSHI yang DIBELI user (Listing SOLD, buyerId=user, sellable, tanpa penjual
+    //       user, source != COLLECTORCRYPT)                         → fisiknya DI HOSHI, Indonesia
+    //
+    // (c) adalah jalur DOMESTIK dan ia TIDAK PUNYA alamat NFT: fulfilHoshiInventory settle
+    // DATABASE-ONLY ("nol on-chain"). Sebelum jalur ini ada, kartu seperti itu ditolak
+    // CARD_NOT_YOURS — kepada orang yang benar-benar membeli dan membayarnya.
+    //
+    // Info kartu (nama/gambar/set) selalu diambil dari sumber yang cocok, bukan dari body.
     let cardName = 'Kartu';
     let cardImage: string | null = null;
     let cardSet: string | null = null;
     // ASAL kartu → petunjuk siapa yang kirim fisik. PACK/CC_CATALOG/P2P fisiknya di gudang CC (CC
     // kirim); HOSHI = stok fisik Hoshi sendiri (Hoshi kirim). Di-snapshot saat request.
+    // LABEL, BUKAN GERBANG: yang menentukan rail adalah `listingId` di bawah.
     let source = 'PACK';
+    /**
+     * IDENTITAS kartu yang ditulis ke kolom `nftAddress` — yaitu kunci PARTIAL UNIQUE INDEX
+     * anti-dobel-kirim. Jalur CC: alamat NFT sungguhan. Jalur domestik: `hoshi-listing:<id>`.
+     */
+    let identity: string;
+    /** NON-NULL ⇒ baris ini jalur DOMESTIK. Ditulis SEKALI, di sini, dan tidak pernah lagi. */
+    let listingId: string | null = null;
+    /** Alamat NFT WARISAN pada listing stok Hoshi (biasanya kosong) — ikut dicek anti-dobel. */
+    let legacyNftKeys: string[] = [];
 
-    const pull = await this.prisma.ccPackPurchase.findFirst({
-      where: {
-        userId: user.id,
-        nftAddress: dto.nftAddress,
-        status: CcPackStatus.OPENED,
-      },
-    });
-    if (pull) {
-      cardName = pull.ccItemName ?? pull.nftName ?? 'Kartu';
-      cardImage = pull.nftImage ?? null;
-      cardSet = pull.ccSet ?? pull.ccCategory ?? null;
-      source = 'PACK';
-    } else {
-      const bought = await this.prisma.listing.findFirst({
+    // 0. TARGET: TEPAT SATU dari nftAddress / listingId. Menerima keduanya akan membuat klien
+    //    memilih rail-nya sendiri, dan rail adalah keputusan SERVER (ia yang menentukan apakah
+    //    ada NFT yang dibakar dan USDC treasury yang berpindah).
+    const wantNft = (dto.nftAddress ?? '').trim();
+    const wantListing = (dto.listingId ?? '').trim();
+    if ((wantNft === '') === (wantListing === '')) {
+      throw domesticError({
+        status: HttpStatus.BAD_REQUEST,
+        code: DOMESTIC_ERROR_CODE.TARGET_REQUIRED,
+        message:
+          'Sebutkan TEPAT SATU: nftAddress (kartu vault CollectorCrypt / hasil pack) atau ' +
+          'listingId (kartu stok Hoshi yang kamu beli).',
+      });
+    }
+
+    if (wantListing !== '') {
+      // ── (c) STOK HOSHI — jalur DOMESTIK ────────────────────────────────────────────────────
+      const listing = await this.prisma.listing.findFirst({
         where: {
+          id: wantListing,
           buyerId: user.id,
           status: ListingStatus.SOLD,
-          OR: [
-            { ccNftAddress: dto.nftAddress },
-            { nft: { assetAddress: dto.nftAddress } },
-          ],
+        },
+        include: { nft: { select: { assetAddress: true } } },
+      });
+      // KETAT DENGAN SENGAJA. `isHoshiSellableStock` adalah predikat yang SAMA dengan gerbang
+      // BELI di payments.service (satu definisi, src/common/hoshi-stock.ts) — jadi tidak mungkin
+      // ada kartu yang bisa dibeli tapi tidak bisa dikirim, atau sebaliknya. Yang ditolak di
+      // sini: baris seed/placeholder (sellable=false), listing user lain (sellerId ada), katalog
+      // CC (source COLLECTORCRYPT → itu jalur CC, bukan kurir domestik), dan apa pun yang bukan
+      // SOLD ke pemanggil.
+      if (!listing || !isHoshiSellableStock(listing)) {
+        this.logger.warn(
+          `Redeem domestik ditolak: listing ${wantListing} bukan stok Hoshi sellable yang SOLD ` +
+            `ke user ${user.id}.`,
+        );
+        throw domesticError({
+          status: HttpStatus.FORBIDDEN,
+          code: DOMESTIC_ERROR_CODE.NOT_YOUR_STOCK,
+          message:
+            'Kartu ini bukan stok Hoshi milikmu (bukan pembelianmu, atau bukan kartu stok Hoshi ' +
+            'yang dijual).',
+        });
+      }
+      cardName = listing.name;
+      cardImage = listing.image ?? null;
+      cardSet = listing.set ?? listing.category ?? null;
+      source = 'HOSHI';
+      listingId = listing.id;
+      identity = hoshiListingRef(listing.id);
+      legacyNftKeys = [listing.ccNftAddress, listing.nft?.assetAddress].filter(
+        (v): v is string => typeof v === 'string' && v.length > 0,
+      );
+    } else {
+      // ── (a)/(b) jalur CC Vault ─────────────────────────────────────────────────────────────
+      const pull = await this.prisma.ccPackPurchase.findFirst({
+        where: {
+          userId: user.id,
+          nftAddress: wantNft,
+          status: CcPackStatus.OPENED,
         },
       });
-      if (!bought) {
-        this.logger.warn(
-          `Redeem ditolak: NFT ${dto.nftAddress} bukan pack/pembelian user ${user.id}.`,
-        );
-        throw noEffectError(
-          HttpStatus.FORBIDDEN,
-          SHIPPING_ERROR_CODE.CARD_NOT_YOURS,
-          'Kartu ini bukan milikmu di Hoshi (bukan hasil pack maupun pembelian).',
-        );
+      if (pull) {
+        cardName = pull.ccItemName ?? pull.nftName ?? 'Kartu';
+        cardImage = pull.nftImage ?? null;
+        cardSet = pull.ccSet ?? pull.ccCategory ?? null;
+        source = 'PACK';
+        identity = wantNft;
+      } else {
+        const bought = await this.prisma.listing.findFirst({
+          where: {
+            buyerId: user.id,
+            status: ListingStatus.SOLD,
+            OR: [{ ccNftAddress: wantNft }, { nft: { assetAddress: wantNft } }],
+          },
+          include: { nft: { select: { assetAddress: true } } },
+        });
+        if (!bought) {
+          this.logger.warn(
+            `Redeem ditolak: NFT ${wantNft} bukan pack/pembelian user ${user.id}.`,
+          );
+          throw noEffectError(
+            HttpStatus.FORBIDDEN,
+            SHIPPING_ERROR_CODE.CARD_NOT_YOURS,
+            'Kartu ini bukan milikmu di Hoshi (bukan hasil pack maupun pembelian).',
+          );
+        }
+        cardName = bought.name;
+        cardImage = bought.image ?? null;
+        cardSet = bought.set ?? bought.category ?? null;
+        if (isHoshiSellableStock(bought)) {
+          // NORMALISASI IDENTITAS — dan ini yang menutup lubang "satu kartu, dua identitas".
+          // Sebuah baris stok Hoshi bisa (dari jalur demo/warisan) punya alamat NFT. Kalau
+          // permintaan lewat alamat itu dibiarkan jadi baris jalur CC, kartu fisik yang SAMA
+          // punya DUA kunci anti-dobel berbeda (alamat NFT vs id listing) → dua permintaan kirim
+          // aktif sekaligus, dua paket, satu kartu. Jadi apa pun kunci yang dikirim klien, stok
+          // Hoshi SELALU mendarat di identitas domestik.
+          source = 'HOSHI';
+          listingId = bought.id;
+          identity = hoshiListingRef(bought.id);
+          legacyNftKeys = [bought.ccNftAddress, bought.nft?.assetAddress].filter(
+            (v): v is string => typeof v === 'string' && v.length > 0,
+          );
+        } else {
+          // Beli dari user lain (sellerId ada) = P2P; katalog CC (source CC, tanpa penjual) =
+          // CC_CATALOG; selain itu (source HOSHI tapi TIDAK sellable — baris warisan/demo) =
+          // HOSHI. Perilaku cabang ini TIDAK BERUBAH dari sebelum jalur domestik ada.
+          source =
+            bought.sellerId != null
+              ? 'P2P'
+              : bought.source === 'COLLECTORCRYPT'
+                ? 'CC_CATALOG'
+                : 'HOSHI';
+          identity = wantNft;
+        }
       }
-      cardName = bought.name;
-      cardImage = bought.image ?? null;
-      cardSet = bought.set ?? bought.category ?? null;
-      // Beli dari user lain (sellerId ada) = P2P; katalog CC (source CC, tanpa penjual) = CC_CATALOG;
-      // selain itu (source HOSHI) = stok fisik Hoshi sendiri.
-      source =
-        bought.sellerId != null
-          ? 'P2P'
-          : bought.source === 'COLLECTORCRYPT'
-            ? 'CC_CATALOG'
-            : 'HOSHI';
     }
 
     // 2. Alamat tujuan harus milik user.
@@ -286,12 +394,31 @@ export class RedemptionService {
     }
 
     // 3. Anti-dobel: satu kartu tidak boleh punya dua permintaan kirim yang masih aktif.
+    //    Kuncinya BEDA per rail, dan itu memang benar:
+    //      • jalur CC       → (userId, nftAddress). Sama seperti sebelumnya, byte-for-byte.
+    //      • jalur DOMESTIK → (listingId) SECARA GLOBAL, tanpa userId. Satu baris listing = satu
+    //        kartu FISIK di rak Hoshi; mengikat cek ini ke userId akan membiarkan dua paket
+    //        keluar untuk satu kartu kalau entah bagaimana ada dua pengklaim.
+    //    Untuk jalur domestik, alamat NFT WARISAN listing yang sama ikut diperiksa: baris jalur
+    //    CC yang lahir SEBELUM normalisasi identitas ada tetap harus memblokir.
     const active = await this.prisma.cardRedemption.findFirst({
-      where: {
-        userId: user.id,
-        nftAddress: dto.nftAddress,
-        status: { in: ACTIVE_STATUSES },
-      },
+      where:
+        listingId !== null
+          ? {
+              status: { in: ACTIVE_STATUSES },
+              OR: [
+                { listingId },
+                { nftAddress: identity },
+                ...(legacyNftKeys.length > 0
+                  ? [{ nftAddress: { in: legacyNftKeys } }]
+                  : []),
+              ],
+            }
+          : {
+              userId: user.id,
+              nftAddress: identity,
+              status: { in: ACTIVE_STATUSES },
+            },
     });
     if (active) {
       throw noEffectError(
@@ -302,8 +429,13 @@ export class RedemptionService {
     }
 
     // 4. Record + activity dalam SATU transaksi. NOL burn/transfer — murni catatan.
-    //    Gerbang anti-dobel yang SEBENARNYA = partial unique index (nftAddress WHERE status aktif)
-    //    di DB. Pre-check langkah 3 di atas cuma jalur cepat untuk error ramah di kasus berurutan;
+    //    Gerbang anti-dobel yang SEBENARNYA = DUA partial unique index di DB, keduanya atas
+    //    daftar status aktif yang SAMA:
+    //      • card_redemptions_active_nft_uniq     (nftAddress) — berlaku untuk KEDUA rail,
+    //        karena identitas domestik pun ditulis ke kolom itu (`hoshi-listing:<id>`).
+    //      • card_redemptions_active_listing_uniq (listingId)  — kunci SEBENARNYA jalur
+    //        domestik; baris jalur CC ber-listingId NULL dan NULL tak pernah bentrok.
+    //    Pre-check langkah 3 di atas cuma jalur cepat untuk error ramah di kasus berurutan;
     //    dua request PARALEL yang lolos pre-check kalah di sini (P2002) → tetap ditolak dengan pesan
     //    yang sama. Tanpa constraint DB ini, cek aplikasi TOCTOU bisa menghasilkan dobel-kirim fisik.
     let created: CardRedemption;
@@ -312,7 +444,10 @@ export class RedemptionService {
         const row = await tx.cardRedemption.create({
           data: {
             userId: user.id,
-            nftAddress: dto.nftAddress,
+            // Identitas yang DIPUTUSKAN SERVER (lihat blok 1), bukan string dari body.
+            nftAddress: identity,
+            // Ditulis SEKALI. NON-NULL = jalur domestik; ini satu-satunya penulisnya di repo.
+            listingId,
             cardName,
             cardImage,
             cardSet,
@@ -360,8 +495,11 @@ export class RedemptionService {
     }
 
     this.logger.log(
-      `Redemption ${created.id} REQUESTED: NFT ${dto.nftAddress} → ${addr.city} ` +
-        `(user ${user.id}). RECORD-ONLY — tidak ada burn/transfer.`,
+      `Redemption ${created.id} REQUESTED: ` +
+        (listingId !== null
+          ? `STOK HOSHI (kurir domestik) listing ${listingId}`
+          : `NFT ${identity}`) +
+        ` → ${addr.city} (user ${user.id}). RECORD-ONLY — tidak ada burn/transfer.`,
     );
     return toDto(created);
   }
@@ -530,6 +668,12 @@ export class RedemptionService {
       prisma: this.prisma,
       logger: this.logger,
       redemptionId: row.id,
+      // RAIL + STATUS-SEBELUM dibaca dari BARIS yang baru saja kami batalkan, bukan dari flag:
+      // keduanya menentukan apakah order ongkir FULFILLED adalah utang (rail domestik, pra-serah
+      // terima) atau anomali yang butuh mata manusia (rail CC). `listingId` immutable, jadi
+      // pembacaan ini tidak bisa basi.
+      rail: isDomesticRedemption(row) ? 'HOSHI_DOMESTIC' : 'CC_VAULT',
+      canceledFromStatus: row.status,
       actor: `user ${user.id}`,
       reason: trimmed || 'tanpa alasan',
     });
@@ -556,6 +700,20 @@ export class RedemptionService {
       take: 50,
     });
     return rows.map(toDto);
+  }
+
+  /* ──────────────── Jalur DOMESTIK (stok Hoshi, kurir lokal) ────────────────
+     TIDAK digerbang HOSHI_CC_SHIPPING_ENABLED: nol CC, nol USDC, nol burn, nol tanda tangan.
+     Penerbitan tagihan ongkirnya ada di PaymentsService.createDomesticShippingOrder
+     (POST /payments/shipping/domestic) — rail invoice IDRX yang SUDAH ADA, bukan rail kedua. */
+
+  /**
+   * Ongkir domestik untuk satu redemption. READ-ONLY (nol uang, nol order). Delegasi tipis ke
+   * PaymentsService supaya angka yang DILIHAT user dan angka yang DITAGIHKAN lahir dari satu
+   * fungsi resolusi tarif yang sama.
+   */
+  domesticQuote(id: string, user: AuthUser): Promise<DomesticShippingQuote> {
+    return this.payments.quoteDomesticShipping(id, user);
   }
 
   /* ---------------------- Jalur REAL (CC Vault Shipping) ---------------------- */

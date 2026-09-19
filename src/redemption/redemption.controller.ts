@@ -48,7 +48,11 @@ export class RedemptionController {
   @Throttle({ default: { ttl: 60000, limit: 10 } })
   @ApiOperation({
     summary:
-      'Minta kirim kartu fisik ke rumah (record-only: TIDAK burn/transfer NFT, NFT tetap di tempat)',
+      'Minta kirim kartu fisik ke rumah (record-only: TIDAK burn/transfer NFT, NFT tetap di ' +
+      'tempat). Body menyebut TEPAT SATU: `nftAddress` (kartu vault CollectorCrypt / hasil ' +
+      'pack → jalur CC) atau `listingId` (kartu STOK HOSHI yang kamu beli → jalur kurir ' +
+      'DOMESTIK, tanpa NFT/burn/USDC/CC sama sekali). Rail-nya diputuskan SERVER dan ' +
+      'di-snapshot permanen di baris redemption.',
   })
   request(
     @Body() dto: RequestRedemptionDto,
@@ -96,6 +100,30 @@ export class RedemptionController {
     @CurrentUser() user: AuthUser,
   ) {
     return this.redemption.cancel(id, user, dto?.reason);
+  }
+
+  /* ─────────── KIRIM DOMESTIK (stok Hoshi, kurir lokal) — TANPA CC, TANPA gerbang CC ───────────
+     Jalur ini TIDAK menyentuh CollectorCrypt: tidak ada NFT untuk dibakar, tidak ada USDC yang
+     didanai, tidak ada tanda tangan wallet, dan tidak ada header x-cc-access-token. Ia karena
+     itu TIDAK digerbang HOSHI_CC_SHIPPING_ENABLED dan TIDAK ikut terblokir oleh kredensial CC
+     yang masih ditunggu. Tagihan ongkirnya diterbitkan POST /payments/shipping/domestic. */
+
+  @Get(':id/domestic-quote')
+  @ApiBearerAuth()
+  @UseGuards(JwtAuthGuard)
+  @ApiOperation({
+    summary:
+      'Ongkir kirim DOMESTIK (Rupiah) untuk permintaan kirim stok Hoshi. READ-ONLY: nol uang, ' +
+      'nol order, nol efek samping. Sumber angkanya PERSIS sama dengan yang ditagihkan ' +
+      'POST /payments/shipping/domestic, jadi yang dilihat user dan yang ditagihkan tidak bisa ' +
+      'lahir dari dua kalkulasi berbeda. Ongkirnya BERTINGKAT PER WILAYAH: respons menyebut ' +
+      '`scope`/`label` tier yang menang, `province` yang dibaca dari alamat, dan ' +
+      '`regionUnresolved` (true = provinsinya tak dikenal → dipakai tarif penampung). Alamat di ' +
+      'luar Indonesia ditolak 400 (ADDRESS_UNSUPPORTED) — DI SINI, sebelum user menekan bayar. ' +
+      'Baris jalur CollectorCrypt ditolak 400 (WRONG_RAIL).',
+  })
+  domesticQuote(@Param('id') id: string, @CurrentUser() user: AuthUser) {
+    return this.redemption.domesticQuote(id, user);
   }
 
   /* ---------------- SIWS (Track B) — login wallet Phantom ke CC (digerbang HOSHI_CC_SHIPPING_ENABLED) ----------------

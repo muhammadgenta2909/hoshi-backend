@@ -1,4 +1,5 @@
 import { Activity, Listing, Nft, Offer, Prisma, User } from '@prisma/client';
+import { isHoshiSellableStock } from '../common/hoshi-stock';
 import { isEscrowBackedUserListing } from './p2p.gate';
 
 /**
@@ -159,6 +160,20 @@ export function toListingDto(row: ListingRow, opts: ListingDtoOpts = {}) {
       opts.p2pEscrowRequired === true &&
       row.sellerId != null &&
       !isEscrowBackedUserListing(row),
+    // ── STOK FISIK HOSHI (kirim DOMESTIK) ─────────────────────────────────────
+    // true = kartu ini STOK FISIK HOSHI yang ditandai dijual: fisiknya disimpan Hoshi di
+    // Indonesia, BUKAN di vault CollectorCrypt. Kalau user sudah membelinya, permintaan kirimnya
+    // lewat jalur DOMESTIK (kurir lokal): POST /redemptions { listingId } → ongkir Rupiah →
+    // Hoshi mengemas & mengirim. NOL NFT, NOL burn, NOL USDC, NOL tanda tangan wallet, dan
+    // TIDAK digerbang HOSHI_CC_SHIPPING_ENABLED.
+    //
+    // KENAPA FIELD SENDIRI, bukan disimpulkan UI dari `source`/`nft`/`ccNftAddress`: predikat
+    // sebenarnya juga menuntut `sellable === true` DAN `sellerId === null`, dan kedua kolom itu
+    // TIDAK ada di DTO ini. Sebuah tebakan UI ("source HOSHI dan tidak punya alamat NFT") akan
+    // memasukkan baris seed/placeholder — lalu menawarkan tombol kirim untuk kartu yang tidak
+    // ada, dan server menolaknya. Predikatnya SATU fungsi bersama dengan gerbang beli
+    // (payments.service) dan gerbang kirim (redemption.service): src/common/hoshi-stock.ts.
+    hoshiStock: isHoshiSellableStock(row),
     nft: row.nft ? toNftDto(row.nft) : null,
   };
 }

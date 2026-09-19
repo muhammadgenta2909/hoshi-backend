@@ -14,6 +14,13 @@ import { CC_SHIPPING_MOCK_MOUNT } from '../collectorcrypt/cc-shipping-mock.mount
 // Idem — file tanpa import sama sekali, SENGAJA, supaya aturan baca plafon sponsor gas yang
 // dipakai saat boot adalah aturan yang SAMA dengan yang dipakai saat memutuskan sponsor.
 import { sponsorCapEnvProblems } from '../escrow/sponsor-cap-env';
+// Idem — src/payments/idrx-mint-bounds.ts TIDAK mengimpor apa pun, dengan sengaja. Batas yang
+// dipakai saat boot untuk menolak ongkir domestik yang mustahil ditagih WAJIB batas yang SAMA
+// dengan yang dipakai saat menerbitkan mint-request IDRX.
+import {
+  IDRX_MAX_MINT_IDR,
+  IDRX_MIN_MINT_IDR,
+} from '../payments/idrx-mint-bounds';
 
 /**
  * Skema validasi environment. Dipanggil ConfigModule saat boot — kalau ada yang
@@ -323,6 +330,27 @@ class EnvironmentVariables {
   @IsString()
   HOSHI_MARKETPLACE_FEE_BPS?: string;
 
+  // ── KIRIM DOMESTIK (stok fisik Hoshi, kurir lokal Indonesia) ──────────────
+  // Opsional — ongkir FLAT NASIONAL dalam Rupiah UTUH, mis. "30000".
+  //
+  // INI LAPIS KELIMA, BUKAN SUMBER UTAMA. Sumber utamanya baris `domestic_shipping_rates` yang
+  // diubah admin TANPA deploy (PUT /api/admin/shipping/domestic-rates) — di situlah TIER
+  // PER-WILAYAH (Jawa / luar Jawa / lebih halus) ditetapkan. Env ini FLAT NASIONAL: ia tidak
+  // mengenal wilayah, jadi ia hanya dipakai kalau TIDAK ADA satu pun baris tarif aktif. Kalau env
+  // ini pun kosong, jalur bayar memakai TIER PENAMPUNG di
+  // src/payments/domestic-shipping-rate.ts (DOMESTIC_DEFAULT_TIERS).
+  //
+  // Nilainya WAJIB di dalam batas mint IDRX (Rp 20.000–Rp 1.000.000.000) — di bawah minimum IDRX,
+  // invoice ongkirnya tidak akan pernah bisa terbit. String (bukan @IsInt), mengikuti pola
+  // HOSHI_PACK_MARGIN_BPS: salah ketik tidak boleh diam-diam jadi angka. Batasnya ditegakkan SAAT
+  // BOOT (assertDomesticShippingRateSane di bawah) supaya salah ketik gagal di depan orang yang
+  // mengetiknya, BUKAN di depan pembeli pertama yang menekan "Bayar ongkir".
+  //
+  // TIDAK ADA hubungannya dengan treasury: jalur domestik tidak pernah mendanai USDC.
+  @IsOptional()
+  @IsString()
+  HOSHI_DOMESTIC_SHIPPING_FLAT_IDR?: string;
+
   // ── CC Vault Shipping: kirim kartu fisik keluar dari vault CC ─────────────
   // Opsional — "true" MENGAKTIFKAN jalur REAL kirim kartu fisik: user bayar ongkir Rupiah, treasury
   // MENDANAI USDC ongkir ke wallet user, user menandatangani burn+ship CC. Default MATI: redemption
@@ -514,6 +542,7 @@ export function validateEnv(config: Record<string, unknown>) {
     );
   }
   assertSponsorCapsReadable(config);
+  assertDomesticShippingRateSane(config);
   assertMainnetConsistency(config);
   return validated;
 }
@@ -535,6 +564,47 @@ export function validateEnv(config: Record<string, unknown>) {
  * interlock cutover mainnet di bawah: gagal saat BOOT jauh lebih murah daripada gagal — atau
  * membelanjakan — di tengah jalur uang.
  */
+/**
+ * ONGKIR DOMESTIK dari env — DITOLAK SAAT BOOT kalau nominalnya mustahil ditagih.
+ *
+ * ┌──── KENAPA SAAT BOOT DAN BUKAN SAAT DIPAKAI ────────────────────────────────────────────────┐
+ * │ Batas bawahnya BUKAN angka karangan: ia MINIMUM MINT IDRX (Rp 20.000). Sebuah nilai di      │
+ * │ bawahnya menghasilkan konfigurasi yang kelihatan benar di mana-mana — env terisi, dashboard │
+ * │ tenang, log bersih — lalu GAGAL pertama kali seorang pembeli menekan "Bayar ongkir",        │
+ * │ karena gateway menolak mint-request-nya. Itu kegagalan yang muncul di depan USER, berjam-   │
+ * │ jam atau berhari-hari sesudah salah ketiknya, dan yang menanggungnya orang yang sudah       │
+ * │ membeli kartu.                                                                              │
+ * │                                                                                             │
+ * │ Menolaknya saat BOOT memindahkan kegagalan itu ke depan orang yang MENGETIKNYA, detik itu   │
+ * │ juga, dengan pesan yang menyebut batasnya. Var ini OPSIONAL — tidak diisi = tidak ada yang  │
+ * │ dicek — jadi aturan ini tidak bisa menjatuhkan deploy yang tidak memakainya.                 │
+ * └─────────────────────────────────────────────────────────────────────────────────────────────┘
+ *
+ * Yang di DB (tabel `domestic_shipping_rates`) divalidasi di dua titik lain dengan batas yang
+ * SAMA: saat admin menulis (assertSaneRate di AdminService) dan saat jalur bayar membaca
+ * (fail-closed di resolveDomesticShippingIdr). Boot tidak bisa mengeceknya — DATABASE_URL belum
+ * tentu terjangkau saat validasi env, dan satu blip DB tidak boleh menggagalkan start.
+ */
+function assertDomesticShippingRateSane(config: Record<string, unknown>): void {
+  const raw = String(config.HOSHI_DOMESTIC_SHIPPING_FLAT_IDR ?? '').trim();
+  if (!raw) return; // tidak diisi = pakai tarif dashboard / tier penampung. Sah.
+  const parsed = Number(raw);
+  if (
+    !Number.isInteger(parsed) ||
+    parsed < IDRX_MIN_MINT_IDR ||
+    parsed > IDRX_MAX_MINT_IDR
+  ) {
+    throw new Error(
+      `HOSHI_DOMESTIC_SHIPPING_FLAT_IDR="${raw}" bukan ongkir yang bisa ditagihkan. Nilainya ` +
+        `harus bilangan bulat Rupiah UTUH antara ${IDRX_MIN_MINT_IDR} dan ${IDRX_MAX_MINT_IDR} ` +
+        '(batas mint IDRX). Di bawah minimum itu, invoice ongkirnya DITOLAK gateway dan jalur ' +
+        'kirim domestik mati di pembelian pertama — jadi backend menolak start alih-alih ' +
+        'membiarkan kegagalannya muncul di depan pembeli. Kosongkan var ini untuk memakai tarif ' +
+        'dari dashboard admin (PUT /api/admin/shipping/domestic-rates).',
+    );
+  }
+}
+
 function assertSponsorCapsReadable(config: Record<string, unknown>): void {
   const problems = sponsorCapEnvProblems(config);
   if (problems.length > 0) {

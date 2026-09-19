@@ -154,11 +154,51 @@ export class PaymentsController {
     );
   }
 
+  /**
+   * ONGKIR KIRIM DOMESTIK (stok fisik Hoshi, kurir lokal Indonesia).
+   *
+   * RUTE TERPISAH dari /payments/shipping DENGAN SENGAJA, walau rail pembayarannya sama
+   * (packType='SHIPPING' + IDRX + reconciler + sapuan kedaluwarsa yang sama):
+   *   • TIDAK butuh header x-cc-access-token — tidak ada sesi CollectorCrypt yang relevan, dan
+   *     @CcAccessToken() akan 400 kalau headernya kosong. Sebuah pengiriman domestik TIDAK
+   *     BOLEH butuh kredensial CC yang masih kita tunggu.
+   *   • TIDAK digerbang HOSHI_CC_SHIPPING_ENABLED — jalur ini tidak menyentuh CC sama sekali.
+   *   • Harganya dari TARIF ADMIN, bukan dari estimate CC.
+   * Dua gerbang rail (assertCcRail / assertDomesticRail) memastikan tidak ada baris yang bisa
+   * masuk rute yang salah.
+   */
+  @Post('shipping/domestic')
+  @ApiBearerAuth()
+  @UseGuards(JwtAuthGuard)
+  @Throttle({ default: { ttl: 60000, limit: 10 } })
+  @ApiOperation({
+    summary:
+      'Terbitkan tagihan rupiah ONGKIR kirim DOMESTIK (stok Hoshi, kurir lokal) → QR/VA/' +
+      'paymentUrl IDRX',
+    description:
+      'Untuk kartu STOK HOSHI yang fisiknya disimpan Hoshi di Indonesia. NOL NFT, NOL burn, ' +
+      'NOL USDC treasury, NOL panggilan CollectorCrypt, NOL tanda tangan wallet — satu-satunya ' +
+      'uang yang bergerak adalah ongkir Rupiah dari user ke treasury, dan ongkir itu SELALU ' +
+      'aman di-refund. Ongkirnya dari tarif admin (PUT /admin/shipping/domestic-rates), BUKAN ' +
+      'dari estimate CollectorCrypt. TIDAK butuh header x-cc-access-token.',
+  })
+  createDomesticShippingOrder(
+    @Body() dto: CreateShippingOrderDto,
+    @CurrentUser() user: AuthUser,
+  ) {
+    return this.payments.createDomesticShippingOrder(dto.redemptionId, user);
+  }
+
   @Get('me/orders')
   @ApiBearerAuth()
   @UseGuards(JwtAuthGuard)
   @ApiOperation({
-    summary: 'Riwayat order pembayaran milik user login (terbaru dulu)',
+    summary:
+      'Riwayat order pembayaran milik user login (terbaru dulu). B3: setiap baris membawa ' +
+      '`refundState` (NONE | IN_PROGRESS | UNDER_REVIEW) + `refundNotice` (kalimat siap-tampil). ' +
+      'HANYA IN_PROGRESS yang boleh dirender sebagai "dana sedang dikembalikan"; UNDER_REVIEW ' +
+      'berarti operator justru DILARANG mengirim uangnya sampai diverifikasi. Kolom operasional ' +
+      '`refundSafe` TIDAK diekspos.',
   })
   myOrders(@CurrentUser() user: AuthUser) {
     return this.payments.myOrders(user.id);

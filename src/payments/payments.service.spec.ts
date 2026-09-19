@@ -2996,4 +2996,97 @@ describe('PaymentsService', () => {
       expect(statuses).not.toContain(PaymentStatus.FULFILLED);
     });
   });
+
+  /* ══════════════════════════════════════════════════════════════════════════════════════════
+     B3 — RIWAYAT PEMBAYARAN HARUS MEMBEDAKAN "uangmu kembali" DARI "operator disuruh menahan".
+     ══════════════════════════════════════════════════════════════════════════════════════════
+     `PaymentOrderDto` dulu tidak membawa apa pun tentang refund, jadi halaman riwayat memberi
+     tahu SETIAP user REFUND_DUE bahwa refundnya sedang diproses — termasuk kasus refundSafe=false,
+     yaitu kasus di mana reconciler EKSPLISIT menyuruh operator JANGAN mengirim uang (barang sudah
+     diserahkan, atau pin IDRX menyimpang sehingga Rupiah-nya belum terbukti kami terima).
+
+     Yang diekspos SEKARANG adalah TURUNANNYA, bukan kolomnya: `refundState` + `refundNotice`.
+  */
+  describe('B3 — refundState / refundNotice pada riwayat order user', () => {
+    const baseOrder = {
+      merchantOrderId: MERCHANT_ORDER_ID,
+      packType: 'PACK',
+      priceIdr: 800_000,
+      priceUsdc: 50_000_000,
+      paymentMethod: 'QRIS',
+      qrContent: null,
+      virtualAccountNo: null,
+      paymentUrl: null,
+      packMemo: null,
+      expiresAt: null,
+      createdAt: now,
+      paidAt: null,
+      fulfilledAt: null,
+    };
+
+    const dtoFor = async (over: Record<string, unknown>) => {
+      prisma.paymentOrder.findMany.mockResolvedValue([
+        { ...baseOrder, ...over },
+      ]);
+      const [dto] = await service.myOrders(user.id);
+      return dto;
+    };
+
+    it('REFUND_DUE + refundSafe=true → IN_PROGRESS (satu-satunya yang boleh menjanjikan dana kembali)', async () => {
+      const dto = await dtoFor({
+        status: PaymentStatus.REFUND_DUE,
+        refundSafe: true,
+      });
+      expect(dto.refundState).toBe('IN_PROGRESS');
+      expect(dto.refundNotice).toMatch(/sedang kami proses/);
+    });
+
+    it('REFUND_DUE + refundSafe=false → UNDER_REVIEW, dan TIDAK PERNAH menjanjikan dana kembali', async () => {
+      const dto = await dtoFor({
+        status: PaymentStatus.REFUND_DUE,
+        refundSafe: false,
+      });
+      expect(dto.refundState).toBe('UNDER_REVIEW');
+      expect(dto.refundNotice).toMatch(/KAMI PERIKSA/);
+      // INI asersi intinya: kalimat "refundnya sedang diproses" tidak boleh muncul di sini.
+      expect(dto.refundNotice).not.toMatch(/sedang kami proses/);
+      expect(dto.refundNotice).not.toMatch(/dikembalikan/);
+    });
+
+    it.each([
+      PaymentStatus.PENDING,
+      PaymentStatus.PAID,
+      PaymentStatus.FULFILLING,
+      PaymentStatus.FULFILLED,
+      PaymentStatus.EXPIRED,
+      PaymentStatus.FAILED,
+    ])('status %s bukan kasus refund → NONE tanpa kalimat apa pun', async (status) => {
+      const dto = await dtoFor({ status, refundSafe: true });
+      expect(dto.refundState).toBe('NONE');
+      expect(dto.refundNotice).toBeNull();
+    });
+
+    /**
+     * FAIL-CLOSED. Kolomnya non-null di schema, tapi gerbang uang tidak boleh bergantung pada
+     * janji itu: baris warisan / mock yang kehilangan kolomnya harus jatuh ke "tahan dulu",
+     * bukan ke "dana sedang dikembalikan".
+     */
+    it('refundSafe yang hilang/undefined jatuh ke UNDER_REVIEW, bukan IN_PROGRESS', async () => {
+      const dto = await dtoFor({ status: PaymentStatus.REFUND_DUE });
+      expect(dto.refundState).toBe('UNDER_REVIEW');
+    });
+
+    /** Kolom operasionalnya sendiri TIDAK boleh ikut keluar — dan `error` juga tidak, seperti dulu. */
+    it('TIDAK membocorkan kolom operasional `refundSafe` maupun `error`', async () => {
+      const dto = await dtoFor({
+        status: PaymentStatus.REFUND_DUE,
+        refundSafe: false,
+        error: 'PASCA-BELANJA: treasury sudah bayar, cek on-chain',
+      });
+      expect(dto).not.toHaveProperty('refundSafe');
+      expect(dto).not.toHaveProperty('error');
+      expect(JSON.stringify(dto)).not.toContain('PASCA-BELANJA');
+    });
+  });
+
 });

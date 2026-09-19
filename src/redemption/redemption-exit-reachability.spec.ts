@@ -359,6 +359,13 @@ function seed(
       id: RED_ID,
       userId: USER.id,
       nftAddress: 'NftAddrBase58',
+      // RAIL: null = jalur CC Vault, yaitu rail yang SELURUH matriks ini menelusuri. Sebuah baris
+      // jalur DOMESTIK (listingId non-null) tidak bisa masuk ke satu pun rute di sini — dua
+      // gerbang rail (assertCcRail di ownedRedemption + predikat `listingId` pada setiap tulisan
+      // berpagar) menolaknya. Keterjangkauan jalan keluar jalur domestik diuji di
+      // hoshi-domestic-shipping.spec.ts, dan ia SENGAJA tidak menambah satu pun status baru:
+      // PACKING/SHIPPED sudah ada di tabel ini beserta driver-nya.
+      listingId: null,
       cardName: 'Charizard',
       cardImage: null,
       cardSet: 'Base',
