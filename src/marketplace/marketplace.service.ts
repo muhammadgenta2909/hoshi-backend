@@ -35,6 +35,7 @@ import { RelistListingDto } from './dto/relist-listing.dto';
 import { UpdateListingDto } from './dto/update-listing.dto';
 import { SubmitEscrowDto } from './dto/submit-escrow.dto';
 import { assertDemoOnly } from '../common/demo-mode';
+import { consignmentUnsupported } from '../common/consignment.gate';
 import { EscrowService } from '../escrow/escrow.service';
 import { MailService } from '../mail/mail.service';
 import {
@@ -368,6 +369,8 @@ export class MarketplaceService {
         // Fakta gerbang P2P (A/B): dipakai assertP2pSaleAvailable di bawah.
         ccNftAddress: true,
         escrowedAt: true,
+        // Diskriminator TITIPAN. Dibaca SEBELUM gerbang P2P — lihat penolakan di bawah.
+        consignmentId: true,
         // Selain label From/To, kita perlu preferensi notifikasi + email penjual
         // (penerima) untuk memutuskan apakah mengirim email offer.
         seller: {
@@ -394,6 +397,25 @@ export class MarketplaceService {
     if (listing.sellerId && listing.sellerId === buyer.id) {
       throw new BadRequestException(
         'Cannot make an offer on your own listing.',
+      );
+    }
+    // TITIPAN: menawar DIMATIKAN di fase ini, dan ditolak SEBELUM gerbang P2P di bawah — karena
+    // gerbang itu akan menolaknya dengan nasihat yang salah ("pajang ulang supaya kartunya
+    // dititipkan ke escrow") untuk kartu yang tidak punya dan tidak akan punya aset on-chain.
+    //
+    // Menawar tidak memindahkan uang, tapi ia langkah PERTAMA dari satu-satunya rantai yang
+    // berakhir di tagihan Rupiah (tawar → penjual menerima → "lanjut bayar"). Menutupnya di sini
+    // berarti kedua pihak tidak pernah menempuh rantai yang ujungnya ditolak.
+    //
+    // MENGHIDUPKANNYA NANTI: arahkan order offer ke `fulfilConsignment` (yang harus melakukan
+    // klaim offer ACCEPTED→PAID SEBELUM klaim listing, seperti `fulfilUserListing`), lalu hapus
+    // penolakan di EMPAT tempat (submitOffer, acceptOffer, createOfferOrder, dan ini).
+    // Tidak ada perubahan schema yang dibutuhkan.
+    if (listing.consignmentId != null) {
+      consignmentUnsupported(
+        'Kartu titipan belum menerima penawaran di fase ini. Kartunya bisa dibeli langsung pada ' +
+          'harga yang tertera.',
+        listing.id,
       );
     }
     // A — TOLAK DI TITIK PALING AWAL. Menawar itu sendiri tidak memindahkan uang, tapi ia adalah
@@ -616,6 +638,16 @@ export class MarketplaceService {
     if (!existing) throw new NotFoundException('Listing tidak ditemukan.');
     if (existing.status !== ListingStatus.ACTIVE) {
       throw new BadRequestException('Listing sudah tidak aktif / terjual.');
+    }
+    // TITIPAN: pagar KEDUA. Tidak terjangkau kalau `submitOffer` memegang janjinya (tak ada offer
+    // PENDING yang bisa lahir untuk kartu titipan), dan ditaruh di sini justru supaya kalau
+    // penolakan di sana pernah dilepas, yang terjadi adalah penolakan — bukan rantai menuju
+    // tagihan yang settlement-nya tidak tahu cara menyelesaikannya.
+    if (existing.consignmentId != null) {
+      consignmentUnsupported(
+        'Kartu titipan belum menerima penawaran di fase ini.',
+        existing.id,
+      );
     }
     // A — MENERIMA OFFER MENERBITKAN KEWAJIBAN, JADI IA IKUT DIGERBANG.
     //
@@ -1038,6 +1070,17 @@ export class MarketplaceService {
     if (existing.status !== ListingStatus.ACTIVE) {
       throw new BadRequestException('Only an active listing can be edited.');
     }
+    // TITIPAN: harganya bagian dari PERJANJIAN BERTANDA TANGAN, bukan angka yang boleh diubah
+    // sepihak lewat rute penjual biasa. Rute admin `PATCH /admin/consignments/:id/price` menulis
+    // `Consignment.askPriceIdr` dan `Listing.priceIdrx` dalam SATU transaksi, MEWAJIBKAN alasan,
+    // dan menyimpan alasannya sebagai baris audit permanen.
+    if (existing.consignmentId != null) {
+      consignmentUnsupported(
+        'Harga kartu titipan diubah lewat admin Hoshi, karena harganya bagian dari perjanjian ' +
+          'titipan. Hubungi admin dengan harga baru yang Anda inginkan.',
+        existing.id,
+      );
+    }
     if (
       dto.price === undefined &&
       dto.expectedValue === undefined &&
@@ -1094,6 +1137,24 @@ export class MarketplaceService {
     }
     if (existing.sellerId && existing.sellerId === user.id) {
       throw new BadRequestException('Cannot buy your own listing.');
+    }
+    // ╔════════════════════════════════════════════════════════════════════════════════════════╗
+    // ║ KARTU TITIPAN: DITOLAK DI SINI, DAN PENOLAKAN INI WAJIB — BUKAN BERLEBIHAN.            ║
+    // ╚════════════════════════════════════════════════════════════════════════════════════════╝
+    // Jalur demo instant-mint ini me-mint NFT BARU ke pembeli dan menandai listing SOLD TANPA
+    // MENGKREDIT PENJUAL SATU RUPIAH PUN. Untuk stok Hoshi itu jalur demo yang sah; untuk kartu
+    // TITIPAN itu MENCURI KARTU ORANG LAIN — kartunya "terjual", pemiliknya tidak dibayar.
+    //
+    // KENAPA `assertEscrowBackedIfRequired` di bawah TIDAK CUKUP: ia hanya menyala saat mode
+    // ARMED. Di mode OFF dan MOCK — yaitu keadaan NORMAL devnet dan staging, yang justru jalur
+    // ini ada untuk melayaninya — ia tidak menyala sama sekali, dan kartu titipan akan lolos.
+    if (existing.consignmentId != null) {
+      consignmentUnsupported(
+        'Kartu titipan hanya bisa dibeli lewat pembayaran Rupiah, bukan lewat jalur ini. ' +
+          'Pemilik kartunya harus menerima haknya dari penjualan, dan jalur ini tidak ' +
+          'membayarkan apa pun kepadanya.',
+        existing.id,
+      );
     }
     // Listing ber-escrow (kartu penjual dititip di escrow, real P2P) TIDAK boleh diselesaikan lewat
     // jalur demo instant-mint ini: ia akan me-mint NFT BARU ke pembeli + menandai SOLD TANPA memindah
@@ -1241,6 +1302,22 @@ export class MarketplaceService {
     if (!existing) throw new NotFoundException('Listing tidak ditemukan.');
     if (existing.sellerId !== user.id) {
       throw new ForbiddenException('Only the seller can cancel this listing.');
+    }
+    // ╔════════════════════════════════════════════════════════════════════════════════════════╗
+    // ║ TITIPAN: PEMILIKNYA LOLOS PEMERIKSAAN DI ATAS — ia MEMANG `sellerId`-nya.              ║
+    // ╚════════════════════════════════════════════════════════════════════════════════════════╝
+    // Tapi menurunkan pajangannya lewat rute ini akan meninggalkan catatan titipannya di status
+    // LISTED sementara listing-nya CANCELLED: dua sumber kebenaran yang langsung menyimpang, dan
+    // yang menyimpang itu adalah catatan tentang barang orang lain. Penarikan harus memindahkan
+    // KEDUANYA dalam SATU transaksi — itulah yang dilakukan rute titipan.
+    if (existing.consignmentId != null) {
+      consignmentUnsupported(
+        'Kartu ini dititipkan ke Hoshi, jadi penarikannya lewat "Minta kartu saya kembali" ' +
+          '(POST /consignments/:id/withdraw) — bukan dari sini. Lewat rute itu, pajangan dan ' +
+          'catatan titipannya turun bersamaan, dan kartunya disiapkan untuk dikembalikan. ' +
+          'Gratis, tanpa biaya apa pun.',
+        existing.id,
+      );
     }
     // Gate atomik ACTIVE|PENDING_ESCROW → CANCELLED. Ini MENUTUP jendela beli SEBELUM menyentuh
     // escrow: settlement REAL meng-klaim ACTIVE→SOLD lebih dulu, jadi kalau ada buy yang menang
@@ -1405,6 +1482,22 @@ export class MarketplaceService {
     if (!ownedByCaller) {
       throw new BadRequestException('Only the owner can list this card.');
     }
+    // TITIPAN: memajang ulang lewat rute ini akan membuat baris Listing ber-`consignmentId` hidup
+    // lagi TANPA melewati klaim custody — yaitu persis satu-satunya jalan yang boleh membuat
+    // listing titipan tayang. Saat ARMED ia bahkan akan dibalik ke PENDING_ESCROW: tidak masuk
+    // akal untuk kartu yang tidak punya aset on-chain.
+    //
+    // Memajang ulang kartu yang sudah pulang ke pemiliknya BUKAN operasi listing, melainkan
+    // SERAH-TERIMA BARU: kartunya harus diserahkan lagi, difoto lagi, dinilai lagi. Itu intake
+    // yang baru, dengan bukti yang baru.
+    if (existing.consignmentId != null) {
+      consignmentUnsupported(
+        'Kartu titipan tidak bisa dipajang ulang dari sini. Kalau kartunya masih di Hoshi, ' +
+          'hubungi admin untuk memajangnya kembali; kalau sudah kembali ke tangan Anda, ' +
+          'menitipkannya lagi berarti serah-terima baru — dengan foto dan penilaian yang baru.',
+        existing.id,
+      );
+    }
 
     // Real P2P armed → kartu harus (kembali) masuk escrow sebelum bisa dibeli →
     // PENDING_ESCROW. Mock/unarmed → langsung ACTIVE.
@@ -1564,6 +1657,16 @@ export class MarketplaceService {
         'Listing ini tidak sedang menunggu escrow.',
       );
     }
+    // TITIPAN: penjaga `ccNftAddress` di bawah SUDAH menolaknya (CHECK constraint memaku kolom
+    // itu NULL untuk baris titipan), tapi dengan kalimat tentang aset on-chain — kalimat yang
+    // menyuruh pemiliknya menempuh langkah yang tidak ada. Beri jawaban yang jujur.
+    if (listing.consignmentId != null) {
+      consignmentUnsupported(
+        'Kartu ini dititipkan FISIK ke Hoshi, jadi tidak ada aset on-chain yang perlu (atau ' +
+          'bisa) dititipkan ke brankas escrow. Kartunya sudah ada di penyimpanan kami.',
+        listing.id,
+      );
+    }
     if (!listing.ccNftAddress) {
       throw new BadRequestException(
         'Listing tidak punya aset on-chain untuk di-escrow.',
@@ -1601,6 +1704,15 @@ export class MarketplaceService {
     if (listing.status !== ListingStatus.PENDING_ESCROW) {
       throw new BadRequestException(
         'Listing ini tidak sedang menunggu escrow.',
+      );
+    }
+    // TITIPAN: sama seperti di prepareEscrow — tolak dengan kalimat yang benar, bukan dengan
+    // kalimat tentang aset on-chain yang tidak pernah ada.
+    if (listing.consignmentId != null) {
+      consignmentUnsupported(
+        'Kartu ini dititipkan FISIK ke Hoshi, jadi tidak ada aset on-chain yang perlu (atau ' +
+          'bisa) dititipkan ke brankas escrow. Kartunya sudah ada di penyimpanan kami.',
+        listing.id,
       );
     }
     if (!listing.ccNftAddress) {

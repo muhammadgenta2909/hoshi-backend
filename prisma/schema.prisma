@@ -133,6 +133,12 @@ model User {
   marketThreadsAsBuyer  MarketThread[] @relation("MarketThreadBuyer")
   marketThreadsAsSeller MarketThread[] @relation("MarketThreadSeller")
 
+  // Kartu TITIPAN: baris di mana user ini PEMILIK kartunya (consignor), dan baris di mana ia
+  // ORANG YANG MENERIMA kartunya secara fisik (admin/PM). Keduanya onDelete: Restrict di sisi
+  // Consignment — catatan tentang barang orang lain harus hidup lebih lama dari akunnya.
+  consignmentsConsigned Consignment[] @relation("ConsignmentConsignor")
+  consignmentsReceived  Consignment[] @relation("ConsignmentReceiver")
+
   @@map("users")
 }
 
@@ -602,6 +608,31 @@ model Listing {
   // kartu tak pernah masuk escrow (listing mock/unarmed, atau PENDING_ESCROW yang belum ditandatangani).
   // Cancel mengembalikan kartu HANYA jika ini ter-set; buy/acceptOffer demo menolak listing ber-escrow.
   escrowedAt DateTime?
+
+  /// ══ DISKRIMINATOR JENIS LISTING KEEMPAT: TITIPAN (konsinyasi) ══
+  ///
+  /// NON-NULL ⇒ kartu ini MILIK ORANG LAIN dan FISIKNYA ada di rak Hoshi.
+  ///
+  /// KENAPA KOLOM, BUKAN DISIMPULKAN DARI BENTUK. Listing titipan punya `sellerId != null` (si
+  /// pemilik adalah User sungguhan — harus, kalau tidak tak ada yang bisa dikredit dan feed
+  /// aktivitasnya berbohong) TAPI TIDAK punya NFT di escrow. Jadi ia MIRIP listing P2P bagi setiap
+  /// kode yang bertanya "sellerId ada?". Menebaknya dari bentuk (`sellerId != null &&
+  /// ccNftAddress == null`) adalah persis kesalahan yang didokumentasikan `CardRedemption.source`:
+  /// "INI LABEL, BUKAN GERBANG". Bentuk bukan fakta.
+  ///
+  /// IMMUTABLE SESUDAH CREATE. Satu-satunya penulisnya adalah `ConsignmentService.createListingFor`,
+  /// yang membuat baris ini DI DALAM transaksi yang SAMA dengan klaim atomik
+  /// `IN_CUSTODY → LISTED` yang berpredikat `custodyAcceptedAt != null`. Artinya: baris Listing
+  /// ber-consignmentId TIDAK BISA ADA tanpa custody yang tercatat — secara konstruksi.
+  ///
+  /// Postgres ikut menjaga BENTUKNYA (CHECK `listings_consignment_shape_chk`, migration
+  /// 20260922000000): baris ber-consignmentId WAJIB `ccNftAddress IS NULL`, `escrowedAt IS NULL`,
+  /// `sellerId IS NOT NULL`, `sellable = false`, `source <> 'COLLECTORCRYPT'`. Dua yang pertama
+  /// membuat "kartu titipan TIDAK BISA menempuh settlement escrow" jadi INVARIAN DATABASE, bukan
+  /// janji code-review: `isEscrowBackedUserListing` mustahil true untuk baris seperti itu.
+  consignmentId String?      @unique
+  /// Restrict: catatan titipan tidak boleh bisa dihapus selagi listing-nya masih menunjuknya.
+  consignment   Consignment? @relation(fields: [consignmentId], references: [id], onDelete: Restrict)
 
   @@index([status])
   @@index([sellerId])
@@ -1343,4 +1374,204 @@ model DomesticShippingRate {
   updatedAt DateTime @updatedAt
 
   @@map("domestic_shipping_rates")
+}
+
+/* ══════════════════════════════════════════════════════════════════════════════════════════════
+   KONSINYASI (TITIPAN) — kartu MILIK ORANG LAIN yang FISIKNYA ada di tangan Hoshi.
+   ══════════════════════════════════════════════════════════════════════════════════════════════
+
+   Ini pertama kalinya Hoshi memegang barang berharga milik orang lain. Risiko yang ditakutkan
+   pemilik produk, persis kalimatnya: "jangan sampai ada case misal kita jual kartu seseorang,
+   tapi dia ternyata jual pribadi ke orang lain."
+
+   Risiko itu ditutup oleh URUTAN, bukan kepintaran: KARTUNYA SUDAH DI TANGAN HOSHI SEBELUM
+   listing-nya tayang. Orang yang sudah menyerahkan kartunya tidak bisa menjualnya di tempat lain.
+
+   Terjemahan fisik dari `Listing.escrowedAt`: gerbang membaca FAKTA TERSIMPAN
+   (`custodyAcceptedAt`), bukan flag. Bedanya dari escrow — dan ini PENINGKATAN yang disengaja —
+   fakta di sini TIDAK PERNAH DIHAPUS oleh kode mana pun. Escrow boleh menghapus `escrowedAt`
+   karena rantai bisa MEMBUKTIKAN kartu sudah keluar (`assertCardLeftEscrow`). Di sini tidak ada
+   rantai: tak ada yang bisa membuktikan sebuah kartu fisik sudah turun dari rak selain manusia
+   yang menuliskannya. Maka custody memakai DUA fakta append-only — `custodyAcceptedAt` dan
+   `custodyReleasedAt` — dan kelas bug "satu aksi biasa menghapus satu-satunya petunjuk" jadi
+   TIDAK ADA SECARA STRUKTURAL: tidak ada tulisan yang menghapus apa pun.
+*/
+
+enum ConsignmentStatus {
+  /// Sudah disepakati, kartunya BELUM diterima. TIDAK ADA yang boleh dipajang.
+  INTAKE
+  /// Kartu ADA di tangan Hoshi. `custodyAcceptedAt` ter-set.
+  IN_CUSTODY
+  /// Ada baris Listing dan ia ACTIVE.
+  LISTED
+  /// Pembeli sudah bayar & settlement selesai. Kartu masih di rak, sekarang milik PEMBELI.
+  SOLD
+  /// Kartu FISIK sudah keluar dari Hoshi. Terminal.
+  RELEASED
+  /// Kartu hilang/rusak dalam pengawasan Hoshi. Terminal.
+  LOST
+  /// Kesepakatan batal SEBELUM serah-terima. Terminal. Hanya terjangkau dari INTAKE.
+  CANCELLED
+}
+
+/// Jenis foto bukti saat serah-terima. FRONT/BACK wajib; CERT wajib bila ada nomor sertifikat.
+enum ConsignmentPhotoKind {
+  FRONT
+  BACK
+  CERT
+  DAMAGE
+  HANDOVER
+  OTHER
+}
+
+/// Satu catatan TITIPAN: satu kartu fisik milik satu orang, yang dipegang Hoshi.
+model Consignment {
+  id String @id @default(cuid())
+
+  // ── SIAPA PEMILIKNYA ─────────────────────────────────────────────────────────────────────
+  consignorId String
+  /// Restrict, seperti BalanceEntry.userId: catatan tentang BARANG ORANG LAIN harus hidup lebih
+  /// lama dari fitur hapus-akun apa pun yang mungkin ditambahkan nanti.
+  consignor   User   @relation("ConsignmentConsignor", fields: [consignorId], references: [id], onDelete: Restrict)
+
+  /// SNAPSHOT saat serah-terima. `User.displayName`/telepon bisa berubah kemudian; apa yang benar
+  /// pada HARI penyerahan tidak bisa diturunkan ulang dari baris yang bisa berubah.
+  consignorNameAtIntake  String
+  consignorPhoneAtIntake String
+  consignorIdKind        String? // "KTP" | "SIM" | "PASPOR"
+  /// EMPAT DIGIT TERAKHIR SAJA. Nomor identitas lengkap TIDAK PERNAH disimpan.
+  consignorIdLast4       String?
+
+  // ── SIAPA YANG MENERIMA ──────────────────────────────────────────────────────────────────
+  receivedById    String
+  receivedBy      User   @relation("ConsignmentReceiver", fields: [receivedById], references: [id], onDelete: Restrict)
+  receivedAtPlace String // "Rumah pemilik, Bandung" / "Kantor Hoshi, Jakarta"
+
+  // ── APA YANG DITERIMA ────────────────────────────────────────────────────────────────────
+  cardName   String
+  cardSet    String?
+  cardNumber String?
+  language   String?
+  tcg        String?
+  grader     Grader? // null = mentah / belum di-grade
+  /// Nomor sertifikat PSA/CGC/BGS — bisa dicek di SITUS GRADER-nya sendiri, bukan di situs kami.
+  /// Ini bukti yang TIDAK bersandar pada "kata Hoshi", dan itulah gunanya.
+  certNumber String?
+  gradeLabel String? // "PSA 10"
+  gradeScore Float?
+
+  /// Kondisi SAAT DITERIMA, dengan kata-kata si penerima sendiri. WAJIB, bahkan untuk slab
+  /// ("slab utuh, tidak ada retak, label lurus") — kalimat inilah yang jadi tumpuan kalau ada
+  /// sengketa berbulan-bulan kemudian.
+  conditionNote String
+  rawCondition  String? // singkatan kartu mentah: "NM" | "LP" | "MP" | "HP" | "DMG"
+
+  // ── BUKTI ────────────────────────────────────────────────────────────────────────────────
+  photos ConsignmentPhoto[]
+
+  /// Kunci storage / id dokumen tanda terima serah-terima yang DITANDATANGANI KEDUA PIHAK.
+  /// Pemilik kartu memegang salinannya. Ini bukti MILIK PEMILIK, bukan milik Hoshi.
+  intakeReceiptRef String?
+  agreementRef     String?
+
+  // ── KESEPAKATAN ──────────────────────────────────────────────────────────────────────────
+  askPriceIdr     Int
+  reservePriceIdr Int?
+  /// SNAPSHOT komisi yang disepakati saat serah-terima (500 = 5%). SENGAJA TIDAK dibaca dari
+  /// HOSHI_MARKETPLACE_FEE_BPS saat payout: perjanjian bertanda tangan berbunyi 5%, dan perubahan
+  /// env TIDAK BOLEH mengubah apa yang sudah dijanjikan untuk kartu yang sudah ada di tangan kita.
+  commissionBps   Int @default(500)
+
+  // ── FAKTA CUSTODY (append-only) ──────────────────────────────────────────────────────────
+  status ConsignmentStatus @default(INTAKE)
+
+  /// ══ INVARIAN-NYA ══ Ditulis SEKALI oleh langkah accept, sesudah kartunya benar-benar ada di
+  /// tangan Hoshi dan buktinya tercatat. TIDAK PERNAH dikosongkan oleh kode mana pun.
+  custodyAcceptedAt DateTime?
+
+  /// Ditulis SEKALI saat kartunya benar-benar keluar. Custody SELESAI, apa pun sebabnya. Kolom
+  /// TERPISAH supaya "menerima" tidak pernah bisa "dibatalkan".
+  custodyReleasedAt DateTime?
+  releaseReason     String? // "WITHDRAWN" | "SHIPPED_TO_BUYER" | "LOST"
+  releaseReceiptRef String? // tanda terima pengembalian/penyerahan bertanda tangan
+
+  storageProvider StorageProvider @default(HOSHI)
+  storageLocation String? // "Rak A-3, Jakarta"
+
+  /// Pemilik meminta kartunya kembali. Bukan gerbang — gerbangnya `custodyReleasedAt`.
+  withdrawRequestedAt DateTime?
+
+  // ── HASIL ────────────────────────────────────────────────────────────────────────────────
+  /// Back-relation dari `Listing.consignmentId` (1-1). Baris Listing ber-consignmentId TIDAK BISA
+  /// lahir sebelum custody tercatat — lihat ConsignmentService.createListingFor.
+  listing Listing?
+
+  soldOrderId    String? // merchantOrderId yang menyelesaikannya
+  payoutIdrx     Int?
+  commissionIdrx Int?
+
+  /// Jejak audit append-only: SETIAP perubahan status menulis satu baris (siapa, kapan, apa).
+  events ConsignmentEvent[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status])
+  @@index([consignorId])
+  @@index([custodyReleasedAt])
+  /// PARTIAL UNIQUE INDEX (grader, certNumber) HANYA atas custody yang MASIH HIDUP — SQL mentah di
+  /// migration 20260922000000; Prisma tidak bisa menyatakan index parsial. Lihat file itu.
+  @@map("consignments")
+}
+
+/// Foto bukti. APPEND-ONLY: tidak ada endpoint update/delete untuk baris ini — foto yang bisa
+/// diam-diam diganti sesudah sengketa dimulai TIDAK ADA HARGANYA sebagai bukti.
+model ConsignmentPhoto {
+  id            String      @id @default(cuid())
+  consignmentId String
+  /// Cascade: sebuah foto tidak punya arti lepas dari catatan serah-terimanya.
+  consignment   Consignment @relation(fields: [consignmentId], references: [id], onDelete: Cascade)
+
+  url  String
+  kind ConsignmentPhotoKind
+  note String?
+
+  takenAt   DateTime @default(now())
+  /// Siapa yang mengunggah. Bukan FK (admin bisa dihapus); jejak audit.
+  addedBy   String?
+  createdAt DateTime @default(now())
+
+  @@index([consignmentId])
+  @@map("consignment_photos")
+}
+
+/// Jejak audit append-only tiap perubahan keadaan sebuah titipan: SIAPA melakukan APA dan KAPAN.
+/// Tidak ada update/delete. Koreksi ditulis sebagai baris BARU ber-`kind = 'CORRECTION'`, jadi
+/// koreksi TERLIHAT sebagai koreksi — bukan sebagai kolom yang diam-diam berubah isinya.
+model ConsignmentEvent {
+  id            String      @id @default(cuid())
+  consignmentId String
+  consignment   Consignment @relation(fields: [consignmentId], references: [id], onDelete: Cascade)
+
+  /// "INTAKE" | "ACCEPT_CUSTODY" | "LIST" | "PRICE" | "WITHDRAW_REQUEST" | "TAKE_DOWN" |
+  /// "SOLD" | "RELEASE" | "LOST" | "CANCEL" | "PHOTO" | "CORRECTION"
+  kind String
+
+  /// Status sebelum/sesudah. Null pada baris yang tidak memindahkan status (foto, koreksi).
+  fromStatus ConsignmentStatus?
+  toStatus   ConsignmentStatus?
+
+  /// SIAPA. Id user pelaku (admin atau consignor). Bukan FK: baris audit tidak boleh bisa
+  /// menghalangi apa pun, dan tidak boleh ikut terhapus.
+  actorId    String?
+  actorLabel String?
+
+  /// Catatan manusia (alasan koreksi, alasan pelepasan, dst).
+  note String?
+
+  createdAt DateTime @default(now())
+
+  @@index([consignmentId])
+  @@index([kind])
+  @@map("consignment_events")
 }

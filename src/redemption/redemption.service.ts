@@ -30,14 +30,15 @@ import {
   type ShippingRefundDebt,
 } from '../payments/shipping-refund-debt';
 import { appendBoundedNote, NOTE_MAX } from '../common/append-note';
-import { isHoshiSellableStock } from '../common/hoshi-stock';
 import type { DomesticShippingQuote } from '../payments/domestic-shipping-rate';
 import {
   DOMESTIC_ERROR_CODE,
   domesticError,
   hoshiListingRef,
   isDomesticRedemption,
+  isDomesticShippableStock,
 } from '../common/hoshi-domestic-shipping';
+import { isPhysicallyHeldByHoshi } from '../common/consignment.gate';
 import { RequestRedemptionDto } from './dto/request-redemption.dto';
 
 export type CardRedemptionDto = {
@@ -286,18 +287,50 @@ export class RedemptionService {
           buyerId: user.id,
           status: ListingStatus.SOLD,
         },
-        include: { nft: { select: { assetAddress: true } } },
+        include: {
+          nft: { select: { assetAddress: true } },
+          consignment: {
+            select: {
+              id: true,
+              status: true,
+              custodyAcceptedAt: true,
+              custodyReleasedAt: true,
+            },
+          },
+        },
       });
-      // KETAT DENGAN SENGAJA. `isHoshiSellableStock` adalah predikat yang SAMA dengan gerbang
-      // BELI di payments.service (satu definisi, src/common/hoshi-stock.ts) — jadi tidak mungkin
-      // ada kartu yang bisa dibeli tapi tidak bisa dikirim, atau sebaliknya. Yang ditolak di
-      // sini: baris seed/placeholder (sellable=false), listing user lain (sellerId ada), katalog
-      // CC (source COLLECTORCRYPT → itu jalur CC, bukan kurir domestik), dan apa pun yang bukan
-      // SOLD ke pemanggil.
-      if (!listing || !isHoshiSellableStock(listing)) {
+      // ╔════════════════════════════════════════════════════════════════════════════════════╗
+      // ║ DUA PERTANYAAN BERBEDA, DAN KEDUANYA HARUS DITANYAKAN.                             ║
+      // ╚════════════════════════════════════════════════════════════════════════════════════╝
+      //
+      // (1) DIKIRIMNYA LEWAT MANA — `isDomesticShippableStock`. SENGAJA LEBIH LUAS dari
+      //     `isHoshiSellableStock`: ia ikut memuat kartu TITIPAN, yang fisiknya juga ada di rak
+      //     Hoshi di Indonesia dan karenanya juga dikirim kurir lokal. Tanpa pelebaran ini,
+      //     PEMBELI KARTU TITIPAN MEMBAYAR RUPIAH LALU TIDAK BISA MEMINTA PENGIRIMAN, SELAMANYA:
+      //     `isHoshiSellableStock` menuntut `sellerId == null`, yang tidak pernah benar untuk
+      //     titipan.
+      //
+      //     Yang TIDAK dilakukan: melonggarkan `isHoshiSellableStock` itu sendiri. Predikat itu
+      //     DIPAKAI BERSAMA dengan gerbang BELI, dan melonggarkannya akan mengarahkan kartu
+      //     titipan ke `fulfilHoshiInventory` — Hoshi menyimpan 100%, pemilik kartunya tidak
+      //     dibayar sepeser pun. Lihat src/common/hoshi-domestic-shipping.ts.
+      //
+      // (2) MASIH ADA ATAU TIDAK — untuk titipan, `isPhysicallyHeldByHoshi`, BUKAN
+      //     `isInHoshiCustody`. Pertanyaannya di sini murni fisik: kartunya masih di rak atau
+      //     tidak. Kartu yang BARU SAJA TERJUAL statusnya SOLD dan memang tidak boleh dijual
+      //     lagi — tapi ia MASIH di rak, dan justru pembelinyalah yang sekarang berhak
+      //     memintanya dikirim. Memakai gerbang "boleh dijual" di sini menolak setiap pembeli
+      //     yang sudah membayar. Kartu yang sudah keluar
+      //     dari rak (ditarik, sudah dikirim, atau hilang) tidak bisa dijanjikan lagi ke siapa
+      //     pun. Ini FAKTA tersimpan, bukan flag.
+      //
+      // Yang tetap ditolak sama seperti sebelumnya: baris seed/placeholder (sellable=false),
+      // listing user lain yang BUKAN titipan, katalog CC (itu jalur CC Vault, bukan kurir
+      // domestik), dan apa pun yang bukan SOLD ke pemanggil.
+      if (!listing || !isDomesticShippableStock(listing)) {
         this.logger.warn(
-          `Redeem domestik ditolak: listing ${wantListing} bukan stok Hoshi sellable yang SOLD ` +
-            `ke user ${user.id}.`,
+          `Redeem domestik ditolak: listing ${wantListing} bukan stok Hoshi sellable / kartu ` +
+            `titipan yang SOLD ke user ${user.id}.`,
         );
         throw domesticError({
           status: HttpStatus.FORBIDDEN,
@@ -307,10 +340,33 @@ export class RedemptionService {
             'yang dijual).',
         });
       }
+      if (listing.consignmentId != null) {
+        if (
+          !listing.consignment ||
+          !isPhysicallyHeldByHoshi(listing.consignment)
+        ) {
+          this.logger.error(
+            `Redeem domestik ditolak: kartu titipan listing ${wantListing} sudah TIDAK ADA di ` +
+              `penyimpanan Hoshi (consignment ${listing.consignmentId ?? 'null'}). Pembeli ` +
+              `${user.id} sudah membayar — ini perlu diselesaikan manusia.`,
+          );
+          throw domesticError({
+            status: HttpStatus.CONFLICT,
+            code: DOMESTIC_ERROR_CODE.NOT_YOUR_STOCK,
+            message:
+              'Kartu ini sedang tidak berada di penyimpanan Hoshi, jadi permintaan kirim belum ' +
+              'bisa dibuat. Tidak ada biaya yang dibuat dan tidak ada uang yang diambil — ' +
+              'hubungi support Hoshi dengan menyebut ID kartu ini.',
+          });
+        }
+      }
       cardName = listing.name;
       cardImage = listing.image ?? null;
       cardSet = listing.set ?? listing.category ?? null;
-      source = 'HOSHI';
+      // LABEL, BUKAN GERBANG (railnya tetap `listingId`): operator perlu tahu kartu SIAPA yang
+      // dipegangnya. Stok Hoshi boleh diapakan saja; kartu titipan adalah barang orang lain dan
+      // pengirimannya menutup custody atas milik orang itu.
+      source = listing.consignmentId != null ? 'CONSIGNMENT' : 'HOSHI';
       listingId = listing.id;
       identity = hoshiListingRef(listing.id);
       legacyNftKeys = [listing.ccNftAddress, listing.nft?.assetAddress].filter(
@@ -353,14 +409,21 @@ export class RedemptionService {
         cardName = bought.name;
         cardImage = bought.image ?? null;
         cardSet = bought.set ?? bought.category ?? null;
-        if (isHoshiSellableStock(bought)) {
+        if (isDomesticShippableStock(bought)) {
           // NORMALISASI IDENTITAS — dan ini yang menutup lubang "satu kartu, dua identitas".
           // Sebuah baris stok Hoshi bisa (dari jalur demo/warisan) punya alamat NFT. Kalau
           // permintaan lewat alamat itu dibiarkan jadi baris jalur CC, kartu fisik yang SAMA
           // punya DUA kunci anti-dobel berbeda (alamat NFT vs id listing) → dua permintaan kirim
           // aktif sekaligus, dua paket, satu kartu. Jadi apa pun kunci yang dikirim klien, stok
           // Hoshi SELALU mendarat di identitas domestik.
-          source = 'HOSHI';
+          //
+          // Kartu TITIPAN ikut dinormalkan ke sini dengan predikat yang SAMA seperti di cabang
+          // (c) di atas. Ia TIDAK PUNYA alamat NFT (CHECK constraint memaku `ccNftAddress` NULL,
+          // dan settlement titipan tidak pernah me-mint), jadi cabang ini praktis tak terjangkau
+          // untuknya — tapi memakai predikat yang sama di kedua tempat berarti tidak ada kartu
+          // fisik yang bisa mendarat di rail yang berbeda tergantung kunci apa yang dikirim klien.
+          // LABEL-nya dibedakan supaya operator tahu kartu siapa yang dipegangnya.
+          source = bought.consignmentId != null ? 'CONSIGNMENT' : 'HOSHI';
           listingId = bought.id;
           identity = hoshiListingRef(bought.id);
           legacyNftKeys = [bought.ccNftAddress, bought.nft?.assetAddress].filter(
@@ -370,6 +433,7 @@ export class RedemptionService {
           // Beli dari user lain (sellerId ada) = P2P; katalog CC (source CC, tanpa penjual) =
           // CC_CATALOG; selain itu (source HOSHI tapi TIDAK sellable — baris warisan/demo) =
           // HOSHI. Perilaku cabang ini TIDAK BERUBAH dari sebelum jalur domestik ada.
+          // (Kartu titipan tidak pernah sampai ke sini: cabang di atas sudah menangkapnya.)
           source =
             bought.sellerId != null
               ? 'P2P'

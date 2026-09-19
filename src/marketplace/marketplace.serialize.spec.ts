@@ -79,8 +79,72 @@ describe('toCardDetailDto', () => {
       'details',
       'collectionLabel',
       'related',
+      // Kartu TITIPAN: frontend memakainya untuk memilih panel pemilik yang BENAR
+      // ("Minta kartu saya kembali", bukan "Cancel listing" — yang servernya tolak).
+      'consigned',
     ]) {
       expect(detail).toHaveProperty(key);
     }
+  });
+});
+
+/**
+ * ╔══════════════════════════════════════════════════════════════════════════════════════════════╗
+ * ║ KARTU TITIPAN di DTO. Dari luar, listing titipan TIDAK BISA dibedakan dari listing P2P:     ║
+ * ║ keduanya punya penjual, dan `sellerId` tidak ada di DTO. Jadi ia butuh field sendiri.       ║
+ * ╚══════════════════════════════════════════════════════════════════════════════════════════════╝
+ */
+describe('toListingDto — kartu titipan', () => {
+  const consigned = () =>
+    makeRow({
+      id: 'listing-consign-1',
+      source: 'HOSHI',
+      sellerId: 'user-7',
+      sellable: false,
+      // BENTUK YANG DIPAKU CHECK CONSTRAINT: titipan tidak punya aset on-chain dan tidak
+      // pernah masuk escrow.
+      ccNftAddress: null,
+      escrowedAt: null,
+      consignmentId: 'consign-1',
+    });
+
+  it('`consigned` true untuk baris titipan, false untuk semua yang lain', () => {
+    expect(toListingDto(consigned()).consigned).toBe(true);
+    expect(toListingDto(makeRow()).consigned).toBe(false);
+    expect(
+      toListingDto(makeRow({ sellerId: 'user-9', consignmentId: null })).consigned,
+    ).toBe(false);
+  });
+
+  it('ARMED: titipan TIDAK ditandai `needsEscrowDeposit` — nasihat itu tidak bisa berhasil', () => {
+    // Tanpa pengecualian ini, pemilik kartu titipan akan disuruh "pajang ulang untuk menitipkan
+    // ke escrow" — untuk kartu yang tidak punya dan tidak akan pernah punya aset on-chain.
+    // Kartunya sudah ada di rak Hoshi; itu penitipan terkuat yang dipunyai sistem ini.
+    expect(
+      toListingDto(consigned(), { p2pEscrowRequired: true }).needsEscrowDeposit,
+    ).toBe(false);
+    // Listing user BIASA tanpa escrow tetap ditandai — perilaku lama tidak berubah.
+    expect(
+      toListingDto(
+        makeRow({ sellerId: 'user-9', ccNftAddress: null, escrowedAt: null }),
+        { p2pEscrowRequired: true },
+      ).needsEscrowDeposit,
+    ).toBe(true);
+  });
+
+  it('`hoshiStock` tetap FALSE untuk titipan — kartunya bukan milik Hoshi', () => {
+    // Kalau ini pernah true, kartu titipan akan ditawarkan lewat jalur beli stok Hoshi, yang
+    // menyimpan 100% harga dan tidak membayar pemiliknya sepeser pun.
+    expect(toListingDto(consigned()).hoshiStock).toBe(false);
+  });
+
+  it('`sellerConsigned` true untuk titipan MAUPUN P2P — jadi ia BUKAN pembeda keduanya', () => {
+    const detailConsigned = toCardDetailDto(consigned(), []);
+    const detailP2p = toCardDetailDto(makeRow({ sellerId: 'user-9' }), []);
+    expect(detailConsigned.sellerConsigned).toBe(true);
+    expect(detailP2p.sellerConsigned).toBe(true);
+    // Yang membedakan adalah `consigned`.
+    expect(detailConsigned.consigned).toBe(true);
+    expect(detailP2p.consigned).toBe(false);
   });
 });

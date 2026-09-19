@@ -173,6 +173,13 @@ export function assertEscrowBackedIfRequired(
 /** Bentuk WHERE Prisma untuk "listing USER yang TIDAK escrow-backed". */
 export interface UnescrowedUserListingWhere {
   sellerId: { not: null };
+  /**
+   * KARTU TITIPAN DIKECUALIKAN. Ia punya `sellerId != null` dan (menurut CHECK constraint
+   * `listings_consignment_shape_chk`) SELALU `ccNftAddress` NULL dan `escrowedAt` NULL — jadi
+   * tanpa baris ini ia cocok SEMPURNA dengan klausa "listing user yang tidak escrow-backed".
+   * Lihat komentar panjang di `unescrowedUserListingWhere` untuk kedua bug yang ditutupnya.
+   */
+  consignmentId: null;
   OR: [{ ccNftAddress: null }, { escrowedAt: null }];
 }
 
@@ -191,10 +198,28 @@ export interface UnescrowedUserListingWhere {
  * SENGAJA fungsi, bukan konstanta: objek literal yang di-spread ke beberapa query Prisma akan
  * berbagi array `OR` yang SAMA, dan satu pemanggil yang memutasinya diam-diam mengubah pagar
  * pemanggil lain. Fungsi mengembalikan objek baru tiap kali.
+ *
+ * ┌──────────────────────────────────────────────────────────────────────────────────────────────┐
+ * │ `consignmentId: null` MENUTUP DUA BUG SEKALIGUS, dan keduanya nyata saat ARMED.              │
+ * │                                                                                              │
+ * │ Kartu TITIPAN punya `sellerId != null` dan — dipaku CHECK constraint                         │
+ * │ `listings_consignment_shape_chk` — SELALU `ccNftAddress` NULL dan `escrowedAt` NULL. Jadi ia │
+ * │ cocok SEMPURNA dengan klausa ini, padahal ia sama sekali bukan urusan escrow.                │
+ * │                                                                                              │
+ * │  1. FEED PUBLIK. `MarketplaceService.list()` memakai klausa ini sebagai `where.NOT` saat      │
+ * │     ARMED. Tanpa pengecualian ini, MENYALAKAN HOSHI_P2P_ENABLED akan MENGHILANGKAN SETIAP    │
+ * │     LISTING TITIPAN dari marketplace — kartu yang fisiknya ada di rak kami, yang paling      │
+ * │     pasti bisa kami serahkan, justru yang lenyap.                                            │
+ * │  2. ANGKA RADIUS LEDAKAN. `admin.escrowOverview().unescrowedActive` dibaca operator SEBELUM  │
+ * │     menyalakan flag. Tanpa pengecualian ini, ia menghitung kartu titipan sebagai "baris yang │
+ * │     akan rusak kalau di-arm" — melaporkan bahaya yang tidak ada, pada baris yang tidak bisa  │
+ * │     disembuhkan oleh tindakan escrow apa pun.                                                │
+ * └──────────────────────────────────────────────────────────────────────────────────────────────┘
  */
 export function unescrowedUserListingWhere(): UnescrowedUserListingWhere {
   return {
     sellerId: { not: null },
+    consignmentId: null,
     OR: [{ ccNftAddress: null }, { escrowedAt: null }],
   };
 }

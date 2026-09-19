@@ -1,5 +1,6 @@
 import { HttpStatus, HttpException } from '@nestjs/common';
 import { RedemptionStatus } from '@prisma/client';
+import { isHoshiSellableStock, type HoshiStockShape } from './hoshi-stock';
 import {
   SHIPPING_ERROR_CODE,
   SHIPPING_STAGE,
@@ -67,6 +68,58 @@ export function hoshiListingRef(listingId: string): string {
 /** true ⇔ string ini identitas stok Hoshi (bukan alamat NFT). */
 export function isHoshiListingRef(value: string | null | undefined): boolean {
   return typeof value === 'string' && value.startsWith(HOSHI_LISTING_REF_PREFIX);
+}
+
+/* ──────────────────── SIAPA YANG FISIKNYA DI INDONESIA (gerbang KIRIM) ──────────────────── */
+
+/**
+ * Bentuk minimal untuk menjawab "kartu ini ada di rak Hoshi di Indonesia?".
+ * `HoshiStockShape` + satu kolom diskriminator titipan.
+ */
+export interface DomesticShippableShape extends HoshiStockShape {
+  consignmentId: string | null;
+}
+
+/**
+ * ╔══════════════════════════════════════════════════════════════════════════════════════════════╗
+ * ║ "HOSHI MEMEGANG KARTU INI DI INDONESIA, JADI IA DIKIRIM LEWAT KURIR LOKAL."                  ║
+ * ║ SATU CALL-SITE SAJA: gerbang target `POST /redemptions`. BUKAN gerbang BELI.                 ║
+ * ╚══════════════════════════════════════════════════════════════════════════════════════════════╝
+ *
+ * MASALAH YANG INI PECAHKAN, dan ia adalah bug "pembeli terkunci" yang sesungguhnya:
+ *
+ * Kartu TITIPAN fisiknya ada di rak Hoshi di Indonesia, jadi pembelinya HARUS bisa menerimanya
+ * lewat kurir domestik. Tapi gerbang target di `redemption.service.ts` berbunyi
+ * `if (!listing || !isHoshiSellableStock(listing)) throw NOT_YOUR_STOCK`, dan
+ * `isHoshiSellableStock` menuntut `sellerId == null` — yang TIDAK PERNAH benar untuk kartu
+ * titipan. Tanpa fungsi ini: PEMBELI MEMBAYAR RUPIAH LALU TIDAK BISA MEMINTA PENGIRIMAN, SELAMANYA.
+ *
+ * ┌──────────────────────────────────────────────────────────────────────────────────────────────┐
+ * │ KENAPA FUNGSI BARU, DAN BUKAN MELONGGARKAN `isHoshiSellableStock`:                           │
+ * │                                                                                              │
+ * │ `isHoshiSellableStock` DIPAKAI BERSAMA oleh gerbang BELI (`payments.service.ts`) dan gerbang │
+ * │ KIRIM. Melonggarkan syarat `sellerId == null` di sana akan membuat kartu titipan lolos ke    │
+ * │ `fulfilHoshiInventory` — jalur yang menyelesaikan penjualan dengan HOSHI MENYIMPAN 100% DAN  │
+ * │ PEMILIK KARTUNYA TIDAK DIBAYAR SEPESER PUN. Itu bukan bug pengiriman; itu mencuri.           │
+ * │                                                                                              │
+ * │ Maka: predikat KIRIM dibuat SECARA SADAR LEBIH LUAS dari predikat BELI, dalam fungsi yang    │
+ * │ terpisah, dengan SATU pemanggil. Keduanya tetap SATU-SATUNYA definisi masing-masing.         │
+ * └──────────────────────────────────────────────────────────────────────────────────────────────┘
+ *
+ * CATATAN PENTING: fungsi ini menjawab "dikirimnya lewat mana", BUKAN "boleh dikirim sekarang".
+ * Apakah kartunya masih ada di rak adalah pertanyaan CUSTODY dan dijawab `isInHoshiCustody`
+ * (`src/common/consignment.gate.ts`) — call-site-nya WAJIB menanyakan keduanya.
+ *
+ * Yang hilir SUDAH bekerja tanpa perubahan apa pun: rail-nya tetap `CardRedemption.listingId`
+ * (`isDomesticRedemption`), identitasnya tetap `hoshiListingRef(listing.id)` yang memberi makan
+ * index anti-dobel `card_redemptions_active_nft_uniq`, dan `DOMESTIC_ALLOWED_STATUSES` tidak
+ * butuh satu pun nilai enum baru — jadi invariant keterjangkauan-jalan-keluar tetap utuh.
+ * NOL NFT, NOL burn, NOL USDC, NOL panggilan CC, NOL tanda tangan wallet.
+ */
+export function isDomesticShippableStock(
+  listing: DomesticShippableShape,
+): boolean {
+  return isHoshiSellableStock(listing) || listing.consignmentId != null;
 }
 
 /* ─────────────────────────────── DISKRIMINATOR RAIL ─────────────────────────────── */

@@ -955,6 +955,63 @@ export class AdminService {
     });
 
     // ╔════════════════════════════════════════════════════════════════════════════════════╗
+    // ║ KARTU TITIPAN YANG DISERAHKAN KE KURIR = CUSTODY SELESAI. CATAT SEKARANG.          ║
+    // ╚════════════════════════════════════════════════════════════════════════════════════╝
+    // SHIPPED berarti paketnya sudah keluar dari tangan Hoshi. Untuk kartu TITIPAN itu bukan
+    // sekadar perubahan status pengiriman: itu akhir dari custody atas barang orang lain, dan
+    // `custodyReleasedAt` adalah SATU-SATUNYA tempat fakta itu hidup. Tanpa baris ini, kartu yang
+    // sudah dikirim akan selamanya terlihat "masih di rak Hoshi" di dashboard dan di gerbang
+    // `isInHoshiCustody` — yaitu tepat kebalikan dari kenyataannya.
+    //
+    // BERPAGAR (`custodyReleasedAt: null`) dan BEST-EFFORT: baris redemption sudah commit di
+    // atas, jadi kegagalan mencatat di sini tidak boleh menggagalkan PATCH-nya — tapi ia di-LOG
+    // KERAS, karena yang hilang adalah kebenaran tentang barang orang lain.
+    if (domestic && status === RedemptionStatus.SHIPPED && row.listingId) {
+      try {
+        const listing = await this.prisma.listing.findUnique({
+          where: { id: row.listingId },
+          select: { consignmentId: true },
+        });
+        if (listing?.consignmentId) {
+          const closed = await this.prisma.$transaction(async (tx) => {
+            const c = await tx.consignment.updateMany({
+              where: { id: listing.consignmentId as string, custodyReleasedAt: null },
+              data: {
+                status: 'RELEASED',
+                custodyReleasedAt: new Date(),
+                releaseReason: 'SHIPPED_TO_BUYER',
+              },
+            });
+            if (c.count === 1) {
+              await tx.consignmentEvent.create({
+                data: {
+                  consignmentId: listing.consignmentId as string,
+                  kind: 'RELEASE',
+                  toStatus: 'RELEASED',
+                  actorId: null,
+                  actorLabel: 'admin (PATCH redemption → SHIPPED)',
+                  note: `Paket diserahkan ke kurir; redemption ${id}. Custody SELESAI.`,
+                },
+              });
+            }
+            return c.count;
+          });
+          this.logger.warn(
+            `Titipan ${listing.consignmentId}: custody DITUTUP (SHIPPED_TO_BUYER) lewat ` +
+              `redemption ${id} — ${closed} baris. Kartunya sudah keluar dari rak Hoshi.`,
+          );
+        }
+      } catch (err) {
+        this.logger.error(
+          `GAGAL menutup custody titipan untuk redemption ${id} (listing ${row.listingId}): ` +
+            `${err instanceof Error ? err.message : String(err)}. Paketnya SUDAH dikirim tapi ` +
+            'catatan titipannya masih berbunyi "di rak Hoshi" — PERBAIKI MANUAL lewat ' +
+            'POST /admin/consignments/:id/release.',
+        );
+      }
+    }
+
+    // ╔════════════════════════════════════════════════════════════════════════════════════╗
     // ║ PEMBUKUAN ONGKIR saat baris DOMESTIK dibatalkan admin. WAJIB, dan baru sejak       ║
     // ║ jalur domestik ada.                                                                 ║
     // ╚════════════════════════════════════════════════════════════════════════════════════╝

@@ -100,6 +100,8 @@ type Row = Record<string, any>;
 
 interface World {
   listing: Row | null;
+  /** Catatan TITIPAN (konsinyasi) yang ditunjuk `listing.consignmentId`. */
+  consignment?: Row | null;
   redemption: Row | null;
   order: Row | null;
   address: Row | null;
@@ -148,6 +150,11 @@ function matches(row: Row, where: Record<string, any> | undefined): boolean {
 function fakePrisma(world: World): PrismaService {
   const p: any = {
     listing: {
+      // Dipakai penutupan custody titipan saat paket diserahkan ke kurir (redemption → SHIPPED).
+      findUnique: async ({ where }: any) =>
+        world.listing && world.listing.id === where.id
+          ? { ...world.listing }
+          : null,
       findFirst: async ({ where }: any) =>
         world.listing && matches(world.listing, where)
           ? { ...world.listing }
@@ -277,6 +284,17 @@ function fakePrisma(world: World): PrismaService {
         return {};
       },
     },
+    // Tabel TITIPAN: dipakai penutupan custody saat paket diserahkan ke kurir (→ SHIPPED).
+    consignment: {
+      updateMany: async ({ where, data }: any) => {
+        if (!world.consignment || !matches(world.consignment, where)) {
+          return { count: 0 };
+        }
+        Object.assign(world.consignment, data);
+        return { count: 1 };
+      },
+    },
+    consignmentEvent: { create: async () => ({}) },
     $transaction: async (cb: any) => cb(p),
   };
   return p as PrismaService;
@@ -663,6 +681,145 @@ describe('POST /redemptions — jalur DOMESTIK (listingId)', () => {
   });
 });
 
+/* ══════════════════ 4b. KARTU TITIPAN IKUT JALUR DOMESTIK (dan harus) ══════════════════ */
+
+/**
+ * ╔══════════════════════════════════════════════════════════════════════════════════════════════╗
+ * ║ BUG YANG DITUTUP DI SINI: PEMBELI KARTU TITIPAN MEMBAYAR RUPIAH LALU TIDAK BISA MEMINTA      ║
+ * ║ PENGIRIMAN, SELAMANYA.                                                                       ║
+ * ╚══════════════════════════════════════════════════════════════════════════════════════════════╝
+ *
+ * Kartu titipan fisiknya di rak Hoshi di Indonesia, jadi ia dikirim kurir lokal — jalur yang SAMA
+ * dengan stok Hoshi. Tapi gerbang target dulu memakai `isHoshiSellableStock`, yang menuntut
+ * `sellerId == null`; kartu titipan SELALU punya penjual. Predikat kirim karena itu SECARA SADAR
+ * dibuat lebih luas (`isDomesticShippableStock`) — TANPA melonggarkan predikat BELI, karena
+ * melonggarkan yang itu akan mengarahkan kartu titipan ke `fulfilHoshiInventory`: Hoshi menyimpan
+ * 100% dan pemilik kartunya tidak dibayar sepeser pun.
+ */
+function consignedListingRow(over: Row = {}): Row {
+  return hoshiStockListing({
+    // BENTUK YANG DIPAKU CHECK CONSTRAINT `listings_consignment_shape_chk`.
+    sellerId: 'consignor-7',
+    sellable: false,
+    consignmentId: 'consign-1',
+    ccNftAddress: null,
+    escrowedAt: null,
+    // STATUS SOLD, BUKAN LISTED — dan ini bukan detail kosmetik.
+    //
+    // Baris ini sampai ke gerbang kirim HANYA sesudah pembeli membayar, dan settlement menulis
+    // consignment.status = 'SOLD' di transaksi yang SAMA dengan listing.status = 'SOLD'. Jadi
+    // "listing SOLD ke pemanggil + consignment LISTED" adalah keadaan yang TIDAK BISA TERJADI.
+    //
+    // Fixture versi lama memasang 'LISTED' di sini, dan itu menyembunyikan bug nyata: gerbangnya
+    // memakai `isInHoshiCustody` (yang menolak SOLD), sehingga setiap pembeli yang sudah membayar
+    // ditolak 409 selamanya — Hoshi memegang uang DAN kartunya. Test-nya tetap hijau karena
+    // mengarang keadaan yang tidak ada. Biarkan SOLD di sini; kalau seseorang mengubahnya kembali
+    // ke LISTED agar test lewat, yang diperbaiki adalah fixture-nya, bukan bug-nya.
+    consignment: {
+      id: 'consign-1',
+      status: 'SOLD',
+      custodyAcceptedAt: new Date('2026-09-01T00:00:00.000Z'),
+      custodyReleasedAt: null,
+    },
+    ...over,
+  });
+}
+
+describe('POST /redemptions — kartu TITIPAN (rail domestik)', () => {
+  it('DITERIMA: rail domestik, identitas hoshi-listing:<id>, label CONSIGNMENT, NOL NFT/burn/USDC', async () => {
+    const world = baseWorld({ listing: consignedListingRow() });
+
+    const dto = await redemptions(world).request(
+      { listingId: LISTING_ID, shippingAddressId: ADDR_ID },
+      USER,
+    );
+
+    expect(dto.listingId).toBe(LISTING_ID);
+    expect(dto.nftAddress).toBe(hoshiListingRef(LISTING_ID));
+    expect(world.created).toHaveLength(1);
+    expect(world.created[0]).toMatchObject({
+      listingId: LISTING_ID,
+      nftAddress: hoshiListingRef(LISTING_ID),
+      // LABEL (bukan gerbang): operator perlu tahu ini barang orang lain.
+      source: 'CONSIGNMENT',
+      status: RedemptionStatus.REQUESTED,
+    });
+  });
+
+  it('DITOLAK kalau kartunya sudah TIDAK di penyimpanan Hoshi (ditarik / dikirim / hilang)', async () => {
+    for (const consignment of [
+      {
+        id: 'consign-1',
+        status: 'RELEASED',
+        custodyAcceptedAt: new Date('2026-09-01T00:00:00.000Z'),
+        custodyReleasedAt: new Date('2026-09-10T00:00:00.000Z'),
+      },
+      {
+        id: 'consign-1',
+        status: 'LOST',
+        custodyAcceptedAt: new Date('2026-09-01T00:00:00.000Z'),
+        custodyReleasedAt: new Date('2026-09-10T00:00:00.000Z'),
+      },
+    ]) {
+      const world = baseWorld({ listing: consignedListingRow({ consignment }) });
+      await expect(
+        redemptions(world).request(
+          { listingId: LISTING_ID, shippingAddressId: ADDR_ID },
+          USER,
+        ),
+      ).rejects.toMatchObject({
+        response: { code: DOMESTIC_ERROR_CODE.NOT_YOUR_STOCK },
+      });
+      expect(world.created).toHaveLength(0);
+    }
+  });
+
+  it('DITOLAK kalau catatan titipannya hilang — fail-closed, bukan diam-diam dikirim', async () => {
+    const world = baseWorld({
+      listing: consignedListingRow({ consignment: null }),
+    });
+    await expect(
+      redemptions(world).request(
+        { listingId: LISTING_ID, shippingAddressId: ADDR_ID },
+        USER,
+      ),
+    ).rejects.toMatchObject({
+      response: { code: DOMESTIC_ERROR_CODE.NOT_YOUR_STOCK },
+    });
+    expect(world.created).toHaveLength(0);
+  });
+
+  it('DITOLAK kalau bukan pembelian pemanggil — pagar kepemilikan tidak melonggar untuk titipan', async () => {
+    const world = baseWorld({
+      listing: consignedListingRow({ buyerId: 'user-lain' }),
+    });
+    await expect(
+      redemptions(world).request(
+        { listingId: LISTING_ID, shippingAddressId: ADDR_ID },
+        USER,
+      ),
+    ).rejects.toMatchObject({
+      response: { code: DOMESTIC_ERROR_CODE.NOT_YOUR_STOCK },
+    });
+    expect(world.created).toHaveLength(0);
+  });
+
+  it('listing P2P BIASA (bukan titipan) TETAP DITOLAK — pelebarannya bukan "semua yang punya penjual"', async () => {
+    const world = baseWorld({
+      listing: hoshiStockListing({ sellerId: 'user-lain', sellable: false }),
+    });
+    await expect(
+      redemptions(world).request(
+        { listingId: LISTING_ID, shippingAddressId: ADDR_ID },
+        USER,
+      ),
+    ).rejects.toMatchObject({
+      response: { code: DOMESTIC_ERROR_CODE.NOT_YOUR_STOCK },
+    });
+    expect(world.created).toHaveLength(0);
+  });
+});
+
 /* ══════════════════════════ 5. PEMISAHAN RAIL (DUA ARAH) ══════════════════════════ */
 
 describe('dua rail tidak bisa tertukar', () => {
@@ -816,6 +973,47 @@ describe('ongkir domestik LUNAS → PACKING (bukan READY_TO_FUND)', () => {
 /* ══════════════════════════ 8. PEMENUHAN ADMIN ══════════════════════════ */
 
 describe('antrean admin — pemenuhan domestik', () => {
+/**
+   * ╔══════════════════════════════════════════════════════════════════════════════════════════╗
+   * ║ PAKET TITIPAN DISERAHKAN KE KURIR = CUSTODY ATAS BARANG ORANG LAIN SELESAI.             ║
+   * ╚══════════════════════════════════════════════════════════════════════════════════════════╝
+   *
+   * Tanpa ini, kartu yang sudah dikirim akan selamanya terlihat 'masih di rak Hoshi' di
+   * dashboard dan di gerbang isInHoshiCustody — yaitu tepat kebalikan dari kenyataannya.
+   */
+  it('PACKING → SHIPPED pada kartu TITIPAN menutup custody (RELEASED, SHIPPED_TO_BUYER)', async () => {
+    const world = baseWorld({
+      listing: consignedListingRow(),
+      consignment: {
+        id: 'consign-1',
+        status: 'SOLD',
+        custodyAcceptedAt: new Date('2026-09-01T00:00:00.000Z'),
+        custodyReleasedAt: null,
+      },
+      redemption: domesticRow(RedemptionStatus.PACKING),
+    });
+
+    await admin(world).updateRedemptionStatus(RED_ID, RedemptionStatus.SHIPPED);
+
+    expect(world.redemption!.status).toBe(RedemptionStatus.SHIPPED);
+    expect(world.consignment!.status).toBe('RELEASED');
+    expect(world.consignment!.custodyReleasedAt).toEqual(expect.any(Date));
+    expect(world.consignment!.releaseReason).toBe('SHIPPED_TO_BUYER');
+  });
+
+  it('SHIPPED pada stok Hoshi BIASA tidak menyentuh tabel titipan sama sekali', async () => {
+    const world = baseWorld({
+      redemption: domesticRow(RedemptionStatus.PACKING),
+      consignment: null,
+    });
+
+    await admin(world).updateRedemptionStatus(RED_ID, RedemptionStatus.SHIPPED);
+
+    expect(world.redemption!.status).toBe(RedemptionStatus.SHIPPED);
+    expect(world.consignment).toBeNull();
+  });
+
+
   it('PACKING → SHIPPED menerima resi kurir', async () => {
     const world = baseWorld({
       redemption: domesticRow(RedemptionStatus.PACKING),

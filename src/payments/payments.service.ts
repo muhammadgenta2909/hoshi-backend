@@ -1,6 +1,7 @@
 import {
   BadRequestException,
   ForbiddenException,
+  HttpStatus,
   Injectable,
   Logger,
   NotFoundException,
@@ -43,6 +44,17 @@ import {
 } from '../marketplace/p2p.gate';
 import { PrismaService } from '../prisma/prisma.service';
 import { isHoshiSellableStock } from '../common/hoshi-stock';
+import { listingKindOf, type ListingKind } from '../common/listing-kind';
+import {
+  CONSIGNMENT_SALE_REASON,
+  assertConsignmentSaleAvailable,
+  consignmentSaleClaimWhere,
+  isInHoshiCustody,
+} from '../common/consignment.gate';
+import {
+  CONSIGNMENT_ERROR_CODE,
+  consignmentError,
+} from '../common/consignment.errors';
 import {
   DOMESTIC_ERROR_CODE,
   assertCcRail,
@@ -88,6 +100,25 @@ const TREASURY_MIN_GAS_LAMPORTS = 10_000_000;
 
 /** Margin Hoshi. Default 0 = jual seharga modal — angka bisnis harus DIPILIH sadar, bukan diwarisi. */
 const DEFAULT_MARGIN_BPS = 0;
+
+/**
+ * Sinyal INTERNAL `fulfilConsignment`: klaim custody `LISTED → SOLD` kalah balapan melawan
+ * penarikan oleh pemilik (atau penandaan hilang) yang terjadi PERSIS di tengah settlement.
+ *
+ * KENAPA LEMPAR, DAN BUKAN `return`: kedua klaimnya berada di dalam satu `$transaction`, dan
+ * melempar adalah SATU-SATUNYA cara membatalkan klaim listing `ACTIVE → SOLD` yang sudah menang
+ * di langkah sebelumnya. `return` akan meninggalkan listing SOLD atas nama pembeli sementara
+ * kartunya justru pulang ke pemiliknya — persis bentuk half-state yang aturan
+ * "pilih secara sadar antara rollback dan tidak" ada untuk mencegahnya.
+ */
+class ConsignmentCustodyRaceLost extends Error {
+  constructor(readonly consignmentId: string) {
+    super(
+      `Custody titipan ${consignmentId} berubah di tengah settlement — transaksi dibatalkan.`,
+    );
+    this.name = 'ConsignmentCustodyRaceLost';
+  }
+}
 
 /**
  * Umur order. Sengaja jauh lebih pendek dari default IDRX (120 menit): jendela bayar =
@@ -591,11 +622,51 @@ export class PaymentsService {
         'Listing tidak ditemukan atau sudah tidak dijual.',
       );
     }
-    const isUserListing = listing.sellerId != null;
-    if (isUserListing && listing.sellerId === user.id) {
+    // ╔══════════════════════════════════════════════════════════════════════════════════════╗
+    // ║ JENIS LISTING DIBACA DARI SATU KOLOM, SEBELUM PERTANYAAN BENTUK APA PUN DIAJUKAN.    ║
+    // ╚══════════════════════════════════════════════════════════════════════════════════════╝
+    // Kartu TITIPAN punya `sellerId != null` (pemiliknya User sungguhan — harus, kalau tidak
+    // tidak ada yang bisa dikredit) TAPI tidak punya NFT di escrow, dan tidak akan pernah punya.
+    // Jadi bagi `isUserListing` di bawah ia TAMPAK PERSIS SEPERTI listing P2P — dan kalau ia
+    // menempuh gerbang P2P, `assertP2pSaleAvailable` akan menolaknya dengan nasihat "pajang
+    // ulang supaya kartunya dititipkan ke escrow": nasihat yang tidak bisa berhasil.
+    // `listingKindOf` (src/common/listing-kind.ts) menjawab TITIPAN lebih dulu, dari kolom.
+    const kind = listingKindOf(listing);
+    const isConsignment = kind === 'CONSIGNMENT';
+    const isUserListing = !isConsignment && listing.sellerId != null;
+    // Larangan beli-sendiri berlaku untuk KEDUANYA — kartu titipan juga punya penjual sungguhan.
+    if (listing.sellerId != null && listing.sellerId === user.id) {
       throw new BadRequestException(
         'Tidak bisa membeli kartu yang Anda jual sendiri.',
       );
+    }
+    // ╔══════════════════════════════════════════════════════════════════════════════════════╗
+    // ║ GERBANG TITIPAN, DI DEPAN — SEBELUM SATU RUPIAH PUN DIMINTA.                         ║
+    // ╚══════════════════════════════════════════════════════════════════════════════════════╝
+    // Pertanyaannya cuma satu, dan ia FAKTA, bukan flag: apakah kartunya ada di rak Hoshi
+    // SEKARANG. Penarikan oleh pemiliknya, pengiriman ke pembeli sebelumnya, atau kartu yang
+    // hilang — ketiganya membuat `custodyReleasedAt` terisi dan gerbang ini menolak dengan
+    // stage NO_EFFECT: NOL Rupiah diambil, jadi tidak ada utang refund yang lahir di sini.
+    //
+    // Posisinya SEBELUM cabang idempoten di bawah, dengan alasan yang SAMA seperti gerbang P2P:
+    // order PENDING yang lahir ketika kartunya masih ada akan tetap dikembalikan (beserta
+    // paymentUrl IDRX-nya yang masih hidup) sesudah kartunya ditarik pemiliknya.
+    if (isConsignment) {
+      const c = await this.prisma.consignment.findUnique({
+        where: { id: listing.consignmentId as string },
+        select: {
+          id: true,
+          status: true,
+          custodyAcceptedAt: true,
+          custodyReleasedAt: true,
+        },
+      });
+      if (!c) {
+        throw new BadRequestException(
+          'Kartu titipan ini tidak punya catatan serah-terima — tidak bisa dibeli.',
+        );
+      }
+      assertConsignmentSaleAvailable(c, listing.id);
     }
     // ╔══════════════════════════════════════════════════════════════════════════════════════╗
     // ║ A — GERBANG P2P, DI DEPAN. Ini perbaikan inti pass ini.                             ║
@@ -630,7 +701,7 @@ export class PaymentsService {
     // predikat ini dan predikat kirim berbeda, kita menjual kartu yang tak bisa dikirim (atau
     // sebaliknya) — lihat src/common/hoshi-stock.ts.
     const isHoshiInventory = isHoshiSellableStock(listing);
-    if (!isUserListing && !isCcCatalog && !isHoshiInventory) {
+    if (!isConsignment && !isUserListing && !isCcCatalog && !isHoshiInventory) {
       throw new BadRequestException(
         'Kartu ini belum bisa dibeli lewat jalur ini.',
       );
@@ -885,6 +956,22 @@ export class PaymentsService {
     }
     if (listing.sellerId === user.id) {
       throw new BadRequestException('Tidak bisa membeli kartu yang Anda jual sendiri.');
+    }
+    // TITIPAN: menawar dimatikan di slice 1 (ditolak di `submitOffer`), jadi seharusnya tidak ada
+    // offer ACCEPTED untuk kartu titipan yang bisa sampai ke sini. Pagar KEDUA, dan ia ditaruh
+    // SEBELUM gerbang P2P di bawah — karena gerbang itu akan menolak kartu titipan dengan nasihat
+    // yang salah ("pajang ulang supaya kartunya dititipkan ke escrow"), dan nasihat yang salah
+    // mengirim pemiliknya menempuh langkah yang tidak akan pernah berhasil.
+    if (listing.consignmentId != null) {
+      throw consignmentError({
+        status: HttpStatus.CONFLICT,
+        code: CONSIGNMENT_ERROR_CODE.UNSUPPORTED_ACTION,
+        message:
+          'Kartu titipan belum menerima penawaran di fase ini, jadi penawaran ini tidak bisa ' +
+          'dibayar. Tidak ada pembayaran yang dibuat dan tidak ada uang yang diambil. Belilah ' +
+          'pada harga yang tertera.',
+        listingId: listing.id,
+      });
     }
     // A — gerbang yang SAMA, jalur bayar-offer. Ini rail kedua menuju uang pembeli: "lanjut ke
     // pembayaran" atas offer yang sudah diterima penjual. Ia SELALU menyangkut listing user
@@ -2356,6 +2443,18 @@ export class PaymentsService {
       );
     }
 
+    // ╔══════════════════════════════════════════════════════════════════════════════════════╗
+    // ║ URUTAN CABANG DI BAWAH ADALAH KONTRAKNYA. TITIPAN HARUS PERTAMA.                     ║
+    // ╚══════════════════════════════════════════════════════════════════════════════════════╝
+    // Kartu titipan punya `sellerId != null`, jadi cabang P2P di bawah akan MENANGKAPNYA kalau ia
+    // ditaruh lebih dulu — dan cabang itu menuntut NFT di escrow yang tidak akan pernah ada, jadi
+    // ia gagal SESUDAH pembeli membayar. `listingKindOf` menjawab dari KOLOM `consignmentId`,
+    // bukan dari bentuk.
+    const kind: ListingKind = listingKindOf(listing);
+    if (kind === 'CONSIGNMENT') {
+      return this.fulfilConsignment(order, listing, user);
+    }
+
     // Order untuk listing USER (P2P Flow B) → settlement BEDA: escrow kirim kartu ke pembeli +
     // kredit saldo penjual. BUKAN beli-di-CC. Dicek SEBELUM gerbang reseller CC.
     if (listing.sellerId != null) {
@@ -2523,11 +2622,242 @@ export class PaymentsService {
    * Klaim ACTIVE→SOLD + FULFILLED + baris feed SALE_CARD dalam SATU transaksi (gerbang konkurensi:
    * dua order untuk satu kartu → tepat satu menang; yang kalah = refund manual tanpa efek).
    */
+  /**
+   * ╔════════════════════════════════════════════════════════════════════════════════════════════╗
+   * ║ SETTLEMENT KARTU TITIPAN — kartu ORANG LAIN yang fisiknya di rak Hoshi.                    ║
+   * ╚════════════════════════════════════════════════════════════════════════════════════════════╝
+   *
+   * Pembeli sudah membayar Rupiah (harga + fee QRIS) → treasury menerima. Di sini: tandai listing
+   * SOLD, tandai titipannya SOLD, dan KREDIT SALDO PEMILIK sebesar (yang dibayar − komisi).
+   *
+   *   NOL USDC · NOL SOL · NOL on-chain · NOL escrow · NOL burn · NOL panggilan CollectorCrypt
+   *
+   * ┌────────────────────────────────────────────────────────────────────────────────────────────┐
+   * │ RAIL INI SECARA STRUKTURAL TIDAK BISA MELAHIRKAN ORDER YANG AMBIGU.                        │
+   * │                                                                                            │
+   * │ Tidak ada panggilan on-chain, tidak ada API pihak ketiga, tidak ada burn, tidak ada tanda  │
+   * │ tangan — tidak ada apa pun yang bisa "berhasil tapi tak terkonfirmasi". Setiap kegagalan    │
+   * │ adalah "tidak ada yang commit" atau "semuanya commit". Karena itu aturan JANGAN-PERNAH-     │
+   * │ MEMENUHI-ULANG-ORDER-AMBIGU tidak pernah sampai diuji di sini, dan `refundSafe` tetap TRUE │
+   * │ pada SETIAP REFUND_DUE yang bisa dilahirkan rail ini: di semua kasus itu, Rupiah pembeli    │
+   * │ TERBUKTI ada di treasury dan TERBUKTI tidak membeli apa pun.                                │
+   * │ (Properti yang sama yang didokumentasikan jalur kirim domestik tentang dirinya sendiri.)   │
+   * └────────────────────────────────────────────────────────────────────────────────────────────┘
+   */
+  private async fulfilConsignment(
+    order: PaymentOrder,
+    listing: Listing,
+    user: { id: string; walletAddress: string },
+  ): Promise<FulfilOutcome> {
+    const consignmentId = listing.consignmentId;
+    const sellerId = listing.sellerId;
+    if (!consignmentId || !sellerId) {
+      return this.failToRefund(
+        order,
+        `Listing ${listing.id} masuk jalur titipan tanpa consignmentId/sellerId yang lengkap — ` +
+          'tidak diselesaikan; refund manual.',
+      );
+    }
+
+    // 1. GERBANG CUSTODY, SEBELUM SATU BARIS PUN DIKLAIM. Predikat yang SAMA dengan gerbang
+    //    penerbitan tagihan (`assertConsignmentSaleAvailable`), jadi keduanya tidak bisa
+    //    melenceng. Menolak DI SINI berarti listing tidak pernah menyentuh SOLD dan pemilik tidak
+    //    pernah dikredit — jadi Rupiah pembeli aman di-refund seutuhnya.
+    const c = await this.prisma.consignment.findUnique({
+      where: { id: consignmentId },
+      select: {
+        id: true,
+        status: true,
+        custodyAcceptedAt: true,
+        custodyReleasedAt: true,
+        commissionBps: true,
+        consignorId: true,
+      },
+    });
+    if (!c) {
+      return this.failToRefund(
+        order,
+        `Catatan titipan ${consignmentId} hilang — listing ${listing.id} tidak bisa ` +
+          'diselesaikan. NOL kartu bergerak; Rupiah pembeli aman di-refund.',
+      );
+    }
+    if (!isInHoshiCustody(c)) {
+      return this.failToRefund(
+        order,
+        `Kartu titipan ${consignmentId} TIDAK LAGI di penyimpanan Hoshi saat pembayaran mendarat ` +
+          `(status ${c.status}, custodyAcceptedAt=${c.custodyAcceptedAt ? 'ada' : 'null'}, ` +
+          `custodyReleasedAt=${c.custodyReleasedAt ? 'ada' : 'null'}) — ditarik pemiliknya, ` +
+          'sudah keluar, atau hilang. Listing TIDAK diklaim SOLD, pemilik TIDAK dikredit. ' +
+          'Rupiah pembeli aman di-refund seluruhnya.',
+      );
+    }
+
+    // 2. BASIS PAYOUT = HARGA YANG PEMBELI BENAR-BENAR BAYAR, di-backout dari `order.priceIdr`
+    //    (dikunci saat order dibuat) — BUKAN `listing.priceIdrx`, yang bisa diubah admin SESUDAH
+    //    invoice terbit. Alasannya identik dengan jalur P2P: tanpa ini, perubahan harga di tengah
+    //    invoice membuat treasury menerima harga lama sementara pemilik dikredit harga baru →
+    //    treasury terkuras + kredit berlebih. order.priceIdr = base × (1 + QRIS).
+    const paidBaseIdrx = Math.floor(
+      (order.priceIdr * BPS_DENOMINATOR) / (BPS_DENOMINATOR + QRIS_FEE_BPS),
+    );
+    // 3. KOMISI DARI SNAPSHOT PERJANJIAN, BUKAN DARI ENV. `HOSHI_MARKETPLACE_FEE_BPS` sengaja
+    //    TIDAK dibaca di sini: perjanjian bertanda tangan berbunyi 5%, dan mengubah env tidak
+    //    boleh mengubah apa yang dijanjikan untuk kartu yang SUDAH ada di tangan kita.
+    //    Clamp 0..100% supaya nilai intake yang salah tidak bisa membuat payout NEGATIF.
+    const feeBps = Math.min(Math.max(c.commissionBps, 0), BPS_DENOMINATOR);
+    const commission = Math.floor((paidBaseIdrx * feeBps) / BPS_DENOMINATOR);
+    const payout = paidBaseIdrx - commission;
+
+    // 4. SATU TRANSAKSI, SEMUA-ATAU-TIDAK SAMA SEKALI.
+    let settled = false;
+    try {
+      await this.prisma.$transaction(async (tx) => {
+        // (a) GERBANG KONKURENSI listing: dua order untuk satu kartu → tepat satu menang.
+        const claimListing = await tx.listing.updateMany({
+          where: { id: listing.id, status: ListingStatus.ACTIVE },
+          data: {
+            status: ListingStatus.SOLD,
+            buyerId: user.id,
+            soldAt: new Date(),
+          },
+        });
+        if (claimListing.count !== 1) return; // kalah → settled tetap false → rollback bersih
+
+        // (b) GERBANG CUSTODY yang DITEGAKKAN, bukan cuma dibaca. Predikatnya menamai
+        //     `status: LISTED` — status sumber yang SAMA yang dinamai klaim penarikan
+        //     (`takeDownClaimWhere`). Itulah sebabnya "ditarik" dan "terjual" tidak mungkin
+        //     dua-duanya berhasil, berapa pun rapatnya balapannya.
+        const claimConsignment = await tx.consignment.updateMany({
+          where: consignmentSaleClaimWhere(consignmentId),
+          data: {
+            status: 'SOLD',
+            soldOrderId: order.merchantOrderId,
+            payoutIdrx: payout,
+            commissionIdrx: commission,
+          },
+        });
+        if (claimConsignment.count !== 1) {
+          // Penarikan / kehilangan menang balapan di antara (a) dan (b). BATALKAN SELURUHNYA —
+          // klaim listing di (a) ikut ter-rollback karena kita melempar di dalam transaksi.
+          throw new ConsignmentCustodyRaceLost(consignmentId);
+        }
+
+        // (c) KREDIT PEMILIK. Ledger yang SUDAH ADA, bukan buku besar kedua. Idempotensi
+        //     `@@unique([reason, refId])` adalah pagar KEDUA; pagar pertama adalah klaim (a).
+        if (payout > 0) {
+          await this.balance.credit(
+            {
+              userId: sellerId,
+              amountIdrx: payout,
+              reason: CONSIGNMENT_SALE_REASON,
+              refId: order.merchantOrderId,
+            },
+            tx,
+          );
+        }
+
+        // (d) Order FULFILLED.
+        await tx.paymentOrder.update({
+          where: { merchantOrderId: order.merchantOrderId },
+          data: {
+            status: PaymentStatus.FULFILLED,
+            fulfilledAt: new Date(),
+            error: null,
+          },
+        });
+
+        // (e) Feed: kartu berpindah dari PEMILIK ke PEMBELI. Pemiliknya user sungguhan, jadi
+        //     baris ini benar apa adanya — itulah salah satu alasan consignor WAJIB non-null.
+        await tx.activity.create({
+          data: {
+            type: ActivityType.SALE_CARD,
+            listingId: listing.id,
+            itemName: listing.name,
+            itemImage: listing.image,
+            category: listing.category,
+            set: listing.set,
+            amount: paidBaseIdrx,
+            fromId: sellerId,
+            fromLabel: listing.sellerAddress,
+            toId: user.id,
+            toLabel: user.walletAddress,
+          },
+        });
+
+        // (f) JEJAK AUDIT: setiap perubahan keadaan titipan menulis siapa/kapan/apa.
+        await tx.consignmentEvent.create({
+          data: {
+            consignmentId,
+            kind: 'SOLD',
+            fromStatus: 'LISTED',
+            toStatus: 'SOLD',
+            actorId: user.id,
+            actorLabel: user.walletAddress,
+            note:
+              `Terjual lewat order ${order.merchantOrderId}. Dibayar Rp ${paidBaseIdrx} ` +
+              `(di luar fee QRIS); komisi ${feeBps} bps = Rp ${commission}; payout pemilik ` +
+              `Rp ${payout}.`,
+          },
+        });
+        settled = true;
+      });
+    } catch (err) {
+      if (err instanceof ConsignmentCustodyRaceLost) {
+        // Seluruh transaksi ter-rollback: listing TIDAK jadi SOLD, pemilik TIDAK dikredit.
+        return this.failToRefund(
+          order,
+          `Kartu titipan ${consignmentId} berpindah keadaan (ditarik pemiliknya / ditandai ` +
+            'hilang) tepat saat settlement berjalan. Seluruh transaksi dibatalkan: listing tetap ' +
+            'seperti semula, pemilik TIDAK dikredit, NOL kartu bergerak. Rupiah pembeli aman ' +
+            'di-refund seluruhnya.',
+        );
+      }
+      // Kegagalan DB transien: TIDAK ADA yang ter-commit (semuanya satu transaksi), jadi aman
+      // diulang. Lepas klaim order ke PAID supaya reconciler memungutnya lagi.
+      return this.releaseClaimForRetry(
+        order,
+        `Settlement titipan gagal: ${errorMessage(err)}`,
+      );
+    }
+
+    if (!settled) {
+      return this.failToRefund(
+        order,
+        `Listing ${listing.id} (titipan ${consignmentId}) sudah tidak ACTIVE — terjual lebih ` +
+          'dulu atau ditarik. Tidak ada yang diselesaikan dan pemilik tidak dikredit; Rupiah ' +
+          'pembeli aman di-refund.',
+      );
+    }
+
+    this.logger.log(
+      `TITIPAN TERJUAL: listing ${listing.id} ("${listing.name}", titipan ${consignmentId}) ke ` +
+        `user ${user.id}. Dibayar Rp ${paidBaseIdrx}; komisi Hoshi ${feeBps} bps = ` +
+        `Rp ${commission}; pemilik ${sellerId} dikredit Rp ${payout}. NOL USDC, NOL SOL, NOL ` +
+        `on-chain (order ${order.merchantOrderId} FULFILLED).`,
+    );
+    return 'FULFILLED';
+  }
+
   private async fulfilHoshiInventory(
     order: PaymentOrder,
     listing: Listing,
     user: { id: string; walletAddress: string },
   ): Promise<FulfilOutcome> {
+    // PERTAHANAN BERLAPIS. Jalur ini menyimpan SELURUH harga sebagai kas Hoshi. Menjalankannya
+    // untuk kartu TITIPAN berarti menjual kartu orang lain dan TIDAK MEMBAYARNYA SEPESER PUN.
+    // Harusnya tidak terjangkau: `isHoshiSellableStock` menuntut `sellerId == null` dan CHECK
+    // constraint memaku `sellerId IS NOT NULL` untuk baris titipan. Kalau baris ini pernah
+    // menyala, salah satu dari keduanya sudah dilonggarkan — dan yang benar adalah BERHENTI,
+    // bukan menyelesaikan penjualannya.
+    if (listing.consignmentId != null) {
+      return this.failToRefund(
+        order,
+        `Listing ${listing.id} adalah kartu TITIPAN (consignment ${listing.consignmentId}) tapi ` +
+          'mendarat di jalur inventaris Hoshi, yang menyimpan 100% harga dan TIDAK mengkredit ' +
+          'pemilik kartunya. TIDAK diselesaikan; Rupiah pembeli aman di-refund. Ini berarti ada ' +
+          'predikat yang dilonggarkan — periksa isHoshiSellableStock dan urutan cabang fulfilListing.',
+      );
+    }
     const claimedCount = await this.prisma.$transaction(async (tx) => {
       const claim = await tx.listing.updateMany({
         where: { id: listing.id, status: ListingStatus.ACTIVE },
@@ -2587,6 +2917,30 @@ export class PaymentsService {
     listing: Listing,
     user: { id: string; walletAddress: string },
   ): Promise<FulfilOutcome> {
+    // PERTAHANAN BERLAPIS, DAN INI YANG PALING PENTING DARI SEMUANYA.
+    //
+    // Jalur ini menyelesaikan penjualan dengan MEMINDAHKAN CORE ASSET KELUAR DARI WALLET ESCROW.
+    // Kartu titipan tidak punya aset on-chain dan tidak akan pernah punya, jadi menjalankannya di
+    // sini berarti gagal SESUDAH pembeli membayar — mode kegagalan paling mahal di repo ini.
+    //
+    // HARUSNYA TIDAK TERJANGKAU, dan berlapis tiga:
+    //   1. `fulfilListing` bercabang ke `fulfilConsignment` DI ATAS cabang `sellerId != null`;
+    //   2. CHECK constraint `listings_consignment_shape_chk` memaku `ccNftAddress` dan
+    //      `escrowedAt` NULL untuk baris titipan, sehingga `isEscrowBackedUserListing` MUSTAHIL
+    //      true dan gerbang ARMED di bawah menolak lebih dulu;
+    //   3. baris ini.
+    // Kalau baris ini pernah menyala, urutan cabang (1) sudah diubah — dan pesannya mengatakan itu.
+    if (listing.consignmentId != null) {
+      return this.failToRefund(
+        order,
+        `Listing ${listing.id} adalah kartu TITIPAN (consignment ${listing.consignmentId}) tapi ` +
+          'mendarat di jalur settlement P2P, yang menyerahkan kartu DARI WALLET ESCROW. Escrow ' +
+          'tidak memegang apa pun untuk kartu titipan dan tidak akan pernah. TIDAK diselesaikan, ' +
+          'listing TIDAK diklaim SOLD; Rupiah pembeli aman di-refund. Periksa urutan cabang di ' +
+          'fulfilListing — cabang CONSIGNMENT harus DI ATAS cabang sellerId != null.',
+      );
+    }
+
     const sellerId = listing.sellerId;
     if (!sellerId) {
       return this.failToRefund(

@@ -63,6 +63,9 @@ describe('PaymentsService', () => {
     listing: { findUnique: jest.Mock; updateMany: jest.Mock };
     offer: { updateMany: jest.Mock; findUnique: jest.Mock };
     activity: { create: jest.Mock };
+    // Jalur TITIPAN (konsinyasi): catatan custody + jejak auditnya.
+    consignment: { findUnique: jest.Mock; updateMany: jest.Mock };
+    consignmentEvent: { create: jest.Mock };
     $transaction: jest.Mock;
   };
   let idrx: {
@@ -309,6 +312,13 @@ describe('PaymentsService', () => {
       },
       // Feed aktivitas (SALE_CARD) — ditulis mis. saat settle inventaris Hoshi.
       activity: { create: jest.fn().mockResolvedValue({}) },
+      // Jalur TITIPAN. Default: findUnique kosong (tiap test mengisinya); klaim custody
+      // LISTED→SOLD MENANG. Test balapan penarikan menimpanya dengan count 0.
+      consignment: {
+        findUnique: jest.fn().mockResolvedValue(null),
+        updateMany: jest.fn().mockResolvedValue({ count: 1 }),
+      },
+      consignmentEvent: { create: jest.fn().mockResolvedValue({}) },
       $transaction: jest.fn((cb: (tx: typeof prisma) => unknown) => cb(prisma)),
     };
     idrx = {
@@ -1294,6 +1304,452 @@ describe('PaymentsService', () => {
       expect(balance.credit).not.toHaveBeenCalled();
     });
   });
+
+/**
+   * ╔════════════════════════════════════════════════════════════════════════════════════════════╗
+   * ║ JALUR TITIPAN (konsinyasi): kartu ORANG LAIN, fisiknya di rak Hoshi.                       ║
+   * ╚════════════════════════════════════════════════════════════════════════════════════════════╝
+   *
+   * Yang diuji di sini adalah SATU tabel: di mana posisi uang pembeli, kartunya, dan saldo
+   * pemiliknya pada SETIAP titik kegagalan. Rail ini tidak punya panggilan on-chain, API pihak
+   * ketiga, burn, maupun tanda tangan — jadi setiap kegagalan hanya bisa "tidak ada yang commit"
+   * atau "semuanya commit", dan `refundSafe` tetap TRUE di setiap REFUND_DUE yang bisa lahir.
+   */
+  describe('fulfilConsignment (jalur TITIPAN / konsinyasi)', () => {
+    const CONSIGNMENT_ID = 'consign-1';
+
+    /**
+     * Bentuk baris listing titipan, dan bentuk ini DIPAKU CHECK constraint
+     * `listings_consignment_shape_chk`: consignmentId ada ⇒ ccNftAddress NULL, escrowedAt NULL,
+     * sellerId NON-NULL, sellable false, source bukan COLLECTORCRYPT.
+     */
+    const consignedListing = {
+      id: 'listing-consign-1',
+      name: 'Charizard PSA 10 (titipan)',
+      source: 'HOSHI',
+      sellerId: 'consignor-7',
+      sellerAddress: 'Hoshi..7777',
+      sellable: false,
+      ccNftAddress: null as string | null,
+      escrowedAt: null as Date | null,
+      consignmentId: CONSIGNMENT_ID,
+      ccPriceUsd: null as number | null,
+      priceIdrx: 1_000_000,
+      image: null as string | null,
+      category: null as string | null,
+      set: null as string | null,
+      status: 'ACTIVE',
+    };
+
+    const consignedOrder: PaymentOrder = {
+      ...baseOrder,
+      packType: 'MARKETPLACE',
+      listingId: consignedListing.id,
+      priceUsdc: 0,
+      // priceIdr = 805.600 = yang PEMBELI benar-benar bayar, SENGAJA beda dari
+      // listing.priceIdrx (1.000.000): itulah yang membuktikan basis payout dibaca dari ORDER.
+    };
+
+    /** Catatan custody yang SEDANG hidup: diterima, belum dilepas, statusnya LISTED. */
+    const liveConsignment = {
+      id: CONSIGNMENT_ID,
+      status: 'LISTED' as const,
+      custodyAcceptedAt: new Date('2026-07-01T00:00:00.000Z'),
+      custodyReleasedAt: null as Date | null,
+      commissionBps: 500,
+      consignorId: consignedListing.sellerId,
+    };
+
+    // base = floor(805.600 × 10000 / 10070) = 800.000; komisi 5% = 40.000; payout = 760.000.
+    // (Kalau basisnya salah diambil dari listing.priceIdrx = 1.000.000 → payout jadi 950.000.)
+    const PAID_BASE = 800_000;
+    const COMMISSION = 40_000;
+    const PAYOUT = 760_000;
+
+    const wroteRefundDue = (): boolean =>
+      (
+        prisma.paymentOrder.updateMany.mock.calls as [
+          { data?: { status?: unknown } },
+        ][]
+      ).some(([a]) => a?.data?.status === PaymentStatus.REFUND_DUE);
+
+    const refundSafeWritten = (): unknown =>
+      (
+        prisma.paymentOrder.updateMany.mock.calls as [
+          { data?: { status?: unknown; refundSafe?: unknown } },
+        ][]
+      ).find(([a]) => a?.data?.status === PaymentStatus.REFUND_DUE)?.[0]?.data
+        ?.refundSafe;
+
+    it('LUNAS & semua klaim menang: listing SOLD, titipan SOLD, pemilik dikredit (harga − komisi snapshot), NOL on-chain', async () => {
+      prisma.paymentOrder.findUnique.mockResolvedValue(consignedOrder);
+      prisma.listing.findUnique.mockResolvedValue(consignedListing);
+      prisma.consignment.findUnique.mockResolvedValue(liveConsignment);
+
+      const outcome = await service.handleCallback({
+        merchantOrderId: MERCHANT_ORDER_ID,
+      });
+
+      expect(outcome).toBe('FULFILLED');
+
+      // NOL escrow, NOL beli-di-CC, NOL pack. Rail ini tidak menyentuh on-chain sama sekali.
+      expect(escrow.transferCoreAssetTo).not.toHaveBeenCalled();
+      expect(resellerSettlement.settle).not.toHaveBeenCalled();
+      expect(gacha.purchase).not.toHaveBeenCalled();
+
+      // Klaim listing ACTIVE→SOLD.
+      expect(prisma.listing.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: consignedListing.id, status: 'ACTIVE' },
+          data: expect.objectContaining({
+            status: 'SOLD',
+            buyerId: user.id,
+          }) as unknown,
+        }),
+      );
+      // Klaim custody LISTED→SOLD, BERPREDIKAT fakta custody — bukan sekadar id.
+      expect(prisma.consignment.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({
+            id: CONSIGNMENT_ID,
+            status: 'LISTED',
+            custodyAcceptedAt: { not: null },
+            custodyReleasedAt: null,
+          }) as unknown,
+          data: expect.objectContaining({
+            status: 'SOLD',
+            soldOrderId: MERCHANT_ORDER_ID,
+            payoutIdrx: PAYOUT,
+            commissionIdrx: COMMISSION,
+          }) as unknown,
+        }),
+      );
+      // KOMISI DARI YANG DIBAYAR PEMBELI (order.priceIdr), bukan dari listing.priceIdrx yang
+      // bisa diubah admin di tengah invoice — dan dari SNAPSHOT commissionBps, bukan dari env.
+      expect(balance.credit).toHaveBeenCalledWith(
+        expect.objectContaining({
+          userId: consignedListing.sellerId,
+          amountIdrx: PAYOUT,
+          reason: 'CONSIGNMENT_SALE',
+          refId: MERCHANT_ORDER_ID,
+        }),
+        expect.anything(),
+      );
+      expect(PAID_BASE - COMMISSION).toBe(PAYOUT);
+      // Order FULFILLED + feed + jejak audit titipan.
+      expect(prisma.paymentOrder.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            status: PaymentStatus.FULFILLED,
+          }) as unknown,
+        }),
+      );
+      expect(prisma.activity.create).toHaveBeenCalled();
+      expect(prisma.consignmentEvent.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            consignmentId: CONSIGNMENT_ID,
+            kind: 'SOLD',
+            fromStatus: 'LISTED',
+            toStatus: 'SOLD',
+          }) as unknown,
+        }),
+      );
+      expect(wroteRefundDue()).toBe(false);
+    });
+
+    it('KOMISI DARI SNAPSHOT, bukan env: HOSHI_MARKETPLACE_FEE_BPS diubah TIDAK mengubah payout', async () => {
+      // Perjanjian bertanda tangan berbunyi 5%. Kalau env dibaca saat payout, kartu yang SUDAH
+      // di tangan kita akan dibayar dengan angka yang tidak pernah disepakati siapa pun.
+      configValues.HOSHI_MARKETPLACE_FEE_BPS = 3_000; // 30% — tidak boleh berpengaruh
+      prisma.paymentOrder.findUnique.mockResolvedValue(consignedOrder);
+      prisma.listing.findUnique.mockResolvedValue(consignedListing);
+      prisma.consignment.findUnique.mockResolvedValue(liveConsignment);
+
+      await service.handleCallback({ merchantOrderId: MERCHANT_ORDER_ID });
+
+      expect(balance.credit).toHaveBeenCalledWith(
+        expect.objectContaining({ amountIdrx: PAYOUT }),
+        expect.anything(),
+      );
+    });
+
+    it('commissionBps di luar akal (negatif / > 100%) DI-CLAMP: payout tidak pernah negatif', async () => {
+      prisma.paymentOrder.findUnique.mockResolvedValue(consignedOrder);
+      prisma.listing.findUnique.mockResolvedValue(consignedListing);
+      prisma.consignment.findUnique.mockResolvedValue({
+        ...liveConsignment,
+        commissionBps: 99_999,
+      });
+
+      await service.handleCallback({ merchantOrderId: MERCHANT_ORDER_ID });
+
+      // Clamp ke 100% → komisi = seluruh basis, payout = 0 → TIDAK dikredit (dan tidak minus).
+      expect(balance.credit).not.toHaveBeenCalled();
+      expect(prisma.consignment.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ payoutIdrx: 0 }) as unknown,
+        }),
+      );
+    });
+
+    it('KARTU SUDAH DITARIK PEMILIKNYA sebelum pembayaran mendarat → REFUND_DUE, refundSafe TRUE, NOL kredit', async () => {
+      prisma.paymentOrder.findUnique.mockResolvedValue(consignedOrder);
+      prisma.listing.findUnique.mockResolvedValue(consignedListing);
+      // Ditarik: custody dilepas, status kembali/keluar dari LISTED.
+      prisma.consignment.findUnique.mockResolvedValue({
+        ...liveConsignment,
+        status: 'RELEASED',
+        custodyReleasedAt: new Date('2026-07-13T00:00:00.000Z'),
+      });
+
+      const outcome = await service.handleCallback({
+        merchantOrderId: MERCHANT_ORDER_ID,
+      });
+
+      expect(outcome).toBe('REFUND_DUE');
+      // Ditolak SEBELUM satu baris pun diklaim: listing tak pernah SOLD, pemilik tak dikredit.
+      expect(prisma.listing.updateMany).not.toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ status: 'SOLD' }) as unknown,
+        }),
+      );
+      expect(balance.credit).not.toHaveBeenCalled();
+      // Rupiah pembeli TERBUKTI di treasury dan TERBUKTI tidak membeli apa pun → aman di-refund.
+      expect(refundSafeWritten()).not.toBe(false);
+    });
+
+    it('SERAH-TERIMA BELUM PERNAH TERCATAT (custodyAcceptedAt null) → REFUND_DUE, NOL kredit', async () => {
+      prisma.paymentOrder.findUnique.mockResolvedValue(consignedOrder);
+      prisma.listing.findUnique.mockResolvedValue(consignedListing);
+      prisma.consignment.findUnique.mockResolvedValue({
+        ...liveConsignment,
+        status: 'INTAKE',
+        custodyAcceptedAt: null,
+      });
+
+      const outcome = await service.handleCallback({
+        merchantOrderId: MERCHANT_ORDER_ID,
+      });
+
+      expect(outcome).toBe('REFUND_DUE');
+      expect(balance.credit).not.toHaveBeenCalled();
+    });
+
+    it('KARTU HILANG antara invoice dan pembayaran → REFUND_DUE, NOL kredit', async () => {
+      prisma.paymentOrder.findUnique.mockResolvedValue(consignedOrder);
+      prisma.listing.findUnique.mockResolvedValue(consignedListing);
+      prisma.consignment.findUnique.mockResolvedValue({
+        ...liveConsignment,
+        status: 'LOST',
+        custodyReleasedAt: new Date('2026-07-13T00:00:00.000Z'),
+      });
+
+      const outcome = await service.handleCallback({
+        merchantOrderId: MERCHANT_ORDER_ID,
+      });
+
+      expect(outcome).toBe('REFUND_DUE');
+      expect(balance.credit).not.toHaveBeenCalled();
+    });
+
+    it('KALAH KLAIM LISTING (sudah terjual lebih dulu) → REFUND_DUE, pemilik TIDAK dikredit', async () => {
+      prisma.paymentOrder.findUnique.mockResolvedValue(consignedOrder);
+      prisma.listing.findUnique.mockResolvedValue(consignedListing);
+      prisma.consignment.findUnique.mockResolvedValue(liveConsignment);
+      prisma.listing.updateMany.mockResolvedValue({ count: 0 });
+
+      const outcome = await service.handleCallback({
+        merchantOrderId: MERCHANT_ORDER_ID,
+      });
+
+      expect(outcome).toBe('REFUND_DUE');
+      expect(balance.credit).not.toHaveBeenCalled();
+      expect(prisma.consignment.updateMany).not.toHaveBeenCalled();
+      expect(refundSafeWritten()).not.toBe(false);
+    });
+
+    it('PENARIKAN MENANG BALAPAN DI TENGAH SETTLEMENT (klaim custody count 0) → SELURUH transaksi batal, REFUND_DUE', async () => {
+      // Inilah jendela sesungguhnya: invoice pembeli hidup selagi listing masih ACTIVE.
+      // Klaim listing MENANG, lalu klaim custody KALAH karena penarikan commit di antaranya.
+      // Kalau ini di-`return` alih-alih dilempar, listing akan tertinggal SOLD atas nama pembeli
+      // sementara kartunya justru pulang ke pemiliknya.
+      prisma.paymentOrder.findUnique.mockResolvedValue(consignedOrder);
+      prisma.listing.findUnique.mockResolvedValue(consignedListing);
+      prisma.consignment.findUnique.mockResolvedValue(liveConsignment);
+      prisma.consignment.updateMany.mockResolvedValue({ count: 0 });
+
+      const outcome = await service.handleCallback({
+        merchantOrderId: MERCHANT_ORDER_ID,
+      });
+
+      expect(outcome).toBe('REFUND_DUE');
+      // Pemilik TIDAK dikredit, dan order TIDAK ditandai FULFILLED.
+      expect(balance.credit).not.toHaveBeenCalled();
+      expect(allStatusesWritten()).not.toContain(PaymentStatus.FULFILLED);
+      expect(refundSafeWritten()).not.toBe(false);
+    });
+
+    it('KREDIT SALDO MELEDAK di dalam transaksi → order dilepas untuk diulang, TIDAK dobel-kredit, TIDAK REFUND_DUE', async () => {
+      prisma.paymentOrder.findUnique.mockResolvedValue(consignedOrder);
+      prisma.listing.findUnique.mockResolvedValue(consignedListing);
+      prisma.consignment.findUnique.mockResolvedValue(liveConsignment);
+      balance.credit.mockRejectedValue(new Error('db down'));
+
+      const outcome = await service.handleCallback({
+        merchantOrderId: MERCHANT_ORDER_ID,
+      });
+
+      // Semuanya satu transaksi → NOL yang commit → aman diulang reconciler.
+      expect(outcome).toBe('VERIFY_FAILED');
+      expect(wroteRefundDue()).toBe(false);
+      expect(allStatusesWritten()).not.toContain(PaymentStatus.FULFILLED);
+    });
+
+    it('CATATAN TITIPAN HILANG → REFUND_DUE (fail-closed), NOL klaim', async () => {
+      prisma.paymentOrder.findUnique.mockResolvedValue(consignedOrder);
+      prisma.listing.findUnique.mockResolvedValue(consignedListing);
+      prisma.consignment.findUnique.mockResolvedValue(null);
+
+      const outcome = await service.handleCallback({
+        merchantOrderId: MERCHANT_ORDER_ID,
+      });
+
+      expect(outcome).toBe('REFUND_DUE');
+      expect(prisma.listing.updateMany).not.toHaveBeenCalled();
+      expect(balance.credit).not.toHaveBeenCalled();
+    });
+
+    /**
+     * ╔══════════════════════════════════════════════════════════════════════════════════════════╗
+     * ║ KARTU TITIPAN TIDAK BOLEH BISA MENEMPUH SETTLEMENT ESCROW — DIBUKTIKAN, BUKAN DIJANJIKAN.║
+     * ╚══════════════════════════════════════════════════════════════════════════════════════════╝
+     */
+    it('P2P ARMED: kartu titipan TETAP lewat jalur titipan — escrow TIDAK PERNAH dipanggil', async () => {
+      configValues.HOSHI_P2P_ENABLED = 'true';
+      prisma.paymentOrder.findUnique.mockResolvedValue(consignedOrder);
+      prisma.listing.findUnique.mockResolvedValue(consignedListing);
+      prisma.consignment.findUnique.mockResolvedValue(liveConsignment);
+
+      const outcome = await service.handleCallback({
+        merchantOrderId: MERCHANT_ORDER_ID,
+      });
+
+      expect(outcome).toBe('FULFILLED');
+      expect(escrow.transferCoreAssetTo).not.toHaveBeenCalled();
+      // Kreditnya memakai alasan ledger jalur TITIPAN, bukan P2P_SALE.
+      expect(balance.credit).toHaveBeenCalledWith(
+        expect.objectContaining({ reason: 'CONSIGNMENT_SALE' }),
+        expect.anything(),
+      );
+    });
+
+    it('P2P OFF (default): kartu titipan TETAP bisa diselesaikan — flag P2P tidak menyentuh rail ini', async () => {
+      prisma.paymentOrder.findUnique.mockResolvedValue(consignedOrder);
+      prisma.listing.findUnique.mockResolvedValue(consignedListing);
+      prisma.consignment.findUnique.mockResolvedValue(liveConsignment);
+
+      const outcome = await service.handleCallback({
+        merchantOrderId: MERCHANT_ORDER_ID,
+      });
+
+      expect(outcome).toBe('FULFILLED');
+    });
+
+    it('PERTAHANAN BERLAPIS: baris titipan yang entah bagaimana mendarat di jalur P2P ditolak SEBELUM klaim', async () => {
+      // Simulasikan urutan cabang yang tertukar: paksa lewat fulfilUserListing dengan memanggil
+      // method privat lewat indeks — yang diuji adalah PENJAGA-nya, bukan jalur normalnya.
+      configValues.HOSHI_P2P_ENABLED = 'true';
+      const outcome = await (
+        service as unknown as {
+          fulfilUserListing: (
+            o: PaymentOrder,
+            l: unknown,
+            u: { id: string; walletAddress: string },
+          ) => Promise<string>;
+        }
+      ).fulfilUserListing(consignedOrder, consignedListing, {
+        id: user.id,
+        walletAddress: user.walletAddress,
+      });
+
+      expect(outcome).toBe('REFUND_DUE');
+      expect(escrow.transferCoreAssetTo).not.toHaveBeenCalled();
+      expect(prisma.listing.updateMany).not.toHaveBeenCalled();
+      expect(balance.credit).not.toHaveBeenCalled();
+    });
+
+    it('PERTAHANAN BERLAPIS: baris titipan yang mendarat di jalur inventaris Hoshi ditolak (Hoshi tidak boleh simpan 100%)', async () => {
+      const outcome = await (
+        service as unknown as {
+          fulfilHoshiInventory: (
+            o: PaymentOrder,
+            l: unknown,
+            u: { id: string; walletAddress: string },
+          ) => Promise<string>;
+        }
+      ).fulfilHoshiInventory(consignedOrder, consignedListing, {
+        id: user.id,
+        walletAddress: user.walletAddress,
+      });
+
+      expect(outcome).toBe('REFUND_DUE');
+      expect(prisma.listing.updateMany).not.toHaveBeenCalled();
+    });
+
+    /* ───────────── GERBANG PENERBITAN TAGIHAN (sebelum satu Rupiah pun diminta) ───────────── */
+
+    it('createListingOrder: kartu yang SUDAH KELUAR dari penyimpanan ditolak TANPA menerbitkan invoice', async () => {
+      prisma.listing.findUnique.mockResolvedValue(consignedListing);
+      prisma.consignment.findUnique.mockResolvedValue({
+        ...liveConsignment,
+        status: 'RELEASED',
+        custodyReleasedAt: new Date(),
+      });
+
+      await expect(
+        service.createListingOrder(consignedListing.id, user),
+      ).rejects.toMatchObject({
+        response: expect.objectContaining({
+          code: 'CONSIGNMENT_NOT_IN_CUSTODY',
+          stage: 'NO_EFFECT',
+        }) as unknown,
+      });
+      // NOL Rupiah diminta: mint-request IDRX tidak pernah dibuat.
+      expect(idrx.mintRequest).not.toHaveBeenCalled();
+    });
+
+    it('createListingOrder: kartu titipan yang MASIH di rak → invoice terbit, plafon treasury TIDAK disentuh, priceUsdc 0', async () => {
+      prisma.listing.findUnique.mockResolvedValue(consignedListing);
+      prisma.consignment.findUnique.mockResolvedValue(liveConsignment);
+
+      await service.createListingOrder(consignedListing.id, user);
+
+      expect(idrx.mintRequest).toHaveBeenCalledTimes(1);
+      // Rail ini tidak membelanjakan USDC apa pun → tidak ada obligasi treasury yang lahir.
+      expect(prisma.paymentOrder.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            priceUsdc: 0,
+            listingId: consignedListing.id,
+          }) as unknown,
+        }),
+      );
+    });
+
+    it('createListingOrder: pemilik kartu TIDAK bisa membeli titipannya sendiri', async () => {
+      prisma.listing.findUnique.mockResolvedValue({
+        ...consignedListing,
+        sellerId: user.id,
+      });
+
+      await expect(
+        service.createListingOrder(consignedListing.id, user),
+      ).rejects.toThrow(BadRequestException);
+      expect(idrx.mintRequest).not.toHaveBeenCalled();
+    });
+  });
+
 
   describe('handleCallback / verifyAndFulfil (gerbang pembayaran)', () => {
     // Callback PALSU: penyerang tahu merchantOrderId (kita sendiri yang menyerahkannya ke frontend)

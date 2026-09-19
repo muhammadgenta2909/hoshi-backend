@@ -156,10 +156,28 @@ export function toListingDto(row: ListingRow, opts: ListingDtoOpts = {}) {
     // settlement (src/marketplace/p2p.gate.ts). Dulu ia ditulis ulang di sini DAN MELESET: ia
     // menuntut `ccNftAddress != null`, sehingga populasi yang paling mudah dibuat tidak pernah
     // ditandai kepada pemiliknya.
+    // KARTU TITIPAN DIKECUALIKAN (`row.consignmentId == null`). Ia punya `sellerId != null` dan
+    // — dipaku CHECK constraint `listings_consignment_shape_chk` — SELALU tanpa aset on-chain,
+    // jadi tanpa syarat ini pemiliknya akan diberi tahu "pajang ulang untuk menitipkan ke
+    // escrow": nasihat yang TIDAK BISA BERHASIL, karena tidak ada kartu on-chain untuk
+    // dititipkan dan memang tidak akan pernah ada. Kartunya sudah ada di rak Hoshi; itu justru
+    // bentuk penitipan yang paling kuat yang dipunyai sistem ini.
     needsEscrowDeposit:
       opts.p2pEscrowRequired === true &&
       row.sellerId != null &&
+      row.consignmentId == null &&
       !isEscrowBackedUserListing(row),
+    // ── KARTU TITIPAN (konsinyasi) ────────────────────────────────────────────
+    // true = kartu MILIK ORANG LAIN yang FISIKNYA ada di rak Hoshi di Indonesia. Komisi Hoshi
+    // 5%, sisanya masuk saldo pemiliknya saat terjual. Pengirimannya jalur DOMESTIK (kurir
+    // lokal), sama seperti stok Hoshi.
+    //
+    // KENAPA FIELD SENDIRI, bukan disimpulkan UI: dari luar, listing titipan TIDAK BISA
+    // dibedakan dari listing P2P biasa — dua-duanya punya penjual, dan `sellerId` tidak ada di
+    // DTO ini. Tebakan UI mana pun akan menawarkan tombol yang salah: "titipkan ke escrow" untuk
+    // kartu yang tidak punya NFT, atau "batalkan listing" untuk kartu yang penarikannya harus
+    // lewat rute titipan supaya listing dan catatan custody bergerak bersama.
+    consigned: row.consignmentId != null,
     // ── STOK FISIK HOSHI (kirim DOMESTIK) ─────────────────────────────────────
     // true = kartu ini STOK FISIK HOSHI yang ditandai dijual: fisiknya disimpan Hoshi di
     // Indonesia, BUKAN di vault CollectorCrypt. Kalau user sudah membelinya, permintaan kirimnya
@@ -222,9 +240,17 @@ export function toCardDetailDto(
     title: row.name,
     tags: [row.grade, languageTag, row.era] as [string, string, string],
     consignedBy: row.sellerAddress,
-    // true = ada PENJUAL USER (listing P2P) → fee 5% dipotong dari penjual. false = milik Hoshi
-    // sendiri / katalog CC (tak ada penjual eksternal). Sinyal andal (sellerAddress bisa apa saja).
+    // true = ada PENJUAL USER (listing P2P ATAU kartu titipan) → fee 5% dipotong dari penjual.
+    // false = milik Hoshi sendiri / katalog CC (tak ada penjual eksternal). Sinyal andal
+    // (sellerAddress bisa apa saja).
+    //
+    // ⚠️ JANGAN DIPAKAI untuk membedakan titipan dari P2P: keduanya true di sini. Yang membedakan
+    // adalah `listing.consigned` (di DTO listing di atas), yang membaca kolom `consignmentId`.
     sellerConsigned: row.sellerId != null,
+    // true = kartu TITIPAN: milik orang lain, fisiknya di rak Hoshi. Diulang di level detail
+    // supaya halaman detail tidak perlu menggali ke `listing.consigned` untuk keputusan yang
+    // diambilnya di level atas (panel pemilik: "Minta kartu saya kembali", bukan "Cancel listing").
+    consigned: row.consignmentId != null,
     // true = stok Hoshi genuine yang boleh dibeli (jalur Hoshi-inventory). Baris seed/placeholder
     // (source=HOSHI,sellerId=null tapi sellable=false) → false, jadi UI tak menawarkan beli.
     sellable: row.sellable,

@@ -257,8 +257,14 @@ describe('p2p gate', () => {
       // Bentuknya dipakai DUA kali dengan arti berlawanan: feed publik memakainya di dalam NOT
       // (kecualikan), dashboard admin memakainya langsung (tampilkan radius ledakan). Kalau
       // definisinya menyimpang dari predikatnya, salah satunya bohong.
+      // `consignmentId: null` adalah BAGIAN DARI terjemahannya, bukan tambahan kosmetik: kartu
+      // TITIPAN punya sellerId != null dan (dipaku CHECK constraint) ccNftAddress/escrowedAt
+      // selalu NULL, jadi tanpa itu ia cocok SEMPURNA di sini — dan akibatnya menyalakan
+      // HOSHI_P2P_ENABLED akan MENGHILANGKAN setiap listing titipan dari feed publik, sekaligus
+      // melaporkannya sebagai radius ledakan escrow yang tidak pernah bisa disembuhkan.
       expect(unescrowedUserListingWhere()).toEqual({
         sellerId: { not: null },
+        consignmentId: null,
         OR: [{ ccNftAddress: null }, { escrowedAt: null }],
       });
     });

@@ -1529,6 +1529,10 @@ describe('MarketplaceService', () => {
               status: ListingStatus.ACTIVE,
               NOT: {
                 sellerId: { not: null },
+                // Kartu TITIPAN dikecualikan dari pengecualian: fisiknya ada di rak Hoshi, jadi
+                // ia justru yang PALING pasti bisa diserahkan — menyembunyikannya saat armed
+                // adalah kebalikan dari maksud pagar ini.
+                consignmentId: null,
                 OR: [{ ccNftAddress: null }, { escrowedAt: null }],
               },
             }),
@@ -1783,6 +1787,164 @@ describe('MarketplaceService', () => {
 
         expect(nft.mintForUser).toHaveBeenCalled();
       });
+    });
+  });
+
+  /**
+   * ╔════════════════════════════════════════════════════════════════════════════════════════════╗
+   * ║ KARTU TITIPAN DI SURFACE MARKETPLACE: setiap rute PENJUAL/PENAWAR yang sah untuk listing   ║
+   * ║ biasa tapi SALAH untuk titipan, ditolak — dengan kalimat yang menyebut rute yang benar.    ║
+   * ╚════════════════════════════════════════════════════════════════════════════════════════════╝
+   *
+   * Jebakannya: pemilik kartu titipan ADALAH `sellerId` baris itu, jadi ia LOLOS setiap
+   * pemeriksaan kepemilikan. Yang salah bukan siapa yang memanggil, melainkan APA yang dilakukan
+   * rutenya terhadap kartu yang fisiknya ada di rak kami atas nama orang lain.
+   */
+  describe('kartu TITIPAN (konsinyasi) di rute marketplace', () => {
+    const consignedListing = {
+      ...listing,
+      id: 'listing-consign-1',
+      sellerId: 'consignor-7',
+      // BENTUK YANG DIPAKU CHECK CONSTRAINT `listings_consignment_shape_chk`.
+      consignmentId: 'consign-1',
+      ccNftAddress: null,
+      escrowedAt: null,
+      sellable: false,
+      source: 'HOSHI',
+    };
+    const owner = {
+      id: 'consignor-7',
+      walletAddress: 'ConsignorWalletBase58',
+      displayName: null,
+      role: 'USER',
+    };
+
+    const expectConsignmentRefusal = async (run: () => Promise<unknown>) => {
+      await expect(run()).rejects.toMatchObject({
+        response: expect.objectContaining({
+          code: 'CONSIGNMENT_UNSUPPORTED_ACTION',
+          stage: 'NO_EFFECT',
+        }) as unknown,
+      });
+    };
+
+    it('buy() demo instant-mint DITOLAK — jalur itu me-mint NFT baru TANPA membayar pemiliknya', async () => {
+      // Ini bukan penolakan berlebihan. `assertEscrowBackedIfRequired` hanya menyala saat ARMED;
+      // di OFF/MOCK — keadaan NORMAL devnet & staging yang justru jalur ini ada untuk melayaninya
+      // — kartu titipan akan lolos, "terjual", dan pemiliknya tidak dibayar sepeser pun.
+      prisma.listing.findUnique.mockResolvedValue({
+        ...consignedListing,
+        seller: null,
+      });
+
+      await expectConsignmentRefusal(() => service.buy(consignedListing.id, user));
+      expect(nft.mintForUser).not.toHaveBeenCalled();
+      expect(prisma.listing.updateMany).not.toHaveBeenCalled();
+    });
+
+    it('submitOffer DITOLAK (menawar dimatikan di fase ini) — dan SEBELUM gerbang P2P', async () => {
+      // Kalau gerbang P2P yang menolaknya, pesannya akan berbunyi "pajang ulang supaya kartunya
+      // dititipkan ke escrow" — langkah yang tidak akan pernah berhasil untuk kartu tanpa aset
+      // on-chain. Kode-nya harus CONSIGNMENT_*, bukan P2P_*.
+      prisma.listing.findUnique.mockResolvedValue({
+        ...consignedListing,
+        seller: null,
+      });
+
+      await expectConsignmentRefusal(() =>
+        service.submitOffer(consignedListing.id, user, 1_000_000),
+      );
+      expect(prisma.offer.create).not.toHaveBeenCalled();
+    });
+
+    it('acceptOffer DITOLAK (pagar kedua; tak terjangkau kalau submitOffer memegang janjinya)', async () => {
+      prisma.offer.findUnique.mockResolvedValue({
+        id: 'offer-1',
+        listingId: consignedListing.id,
+        buyerId: user.id,
+        status: 'PENDING',
+        amount: 1_000_000,
+        user: 'Buyer',
+        listing: { ...consignedListing, seller: null },
+        buyer: null,
+      });
+      prisma.listing.findUnique.mockResolvedValue(consignedListing);
+
+      await expectConsignmentRefusal(() => service.acceptOffer('offer-1', owner));
+      expect(prisma.$transaction).not.toHaveBeenCalled();
+    });
+
+    it('cancel() DITOLAK meski pemanggilnya MEMANG penjualnya — listing & catatan titipan harus turun bersamaan', async () => {
+      // Menurunkan pajangan lewat rute ini akan meninggalkan catatan titipan di status LISTED
+      // sementara listing-nya CANCELLED: dua sumber kebenaran yang langsung menyimpang, dan yang
+      // menyimpang itu adalah catatan tentang barang orang lain.
+      prisma.listing.findUnique.mockResolvedValue(consignedListing);
+
+      await expectConsignmentRefusal(() =>
+        service.cancel(consignedListing.id, owner),
+      );
+      expect(prisma.listing.updateMany).not.toHaveBeenCalled();
+      // Pesannya MENUNJUK rute yang benar, bukan sekadar menolak.
+      await service.cancel(consignedListing.id, owner).catch((e: unknown) => {
+        expect(
+          String((e as { response: { message: string } }).response.message),
+        ).toContain('/consignments/:id/withdraw');
+      });
+    });
+
+    it('relist() DITOLAK — memajang ulang kartu titipan adalah SERAH-TERIMA BARU, bukan operasi listing', async () => {
+      prisma.listing.findUnique.mockResolvedValue({
+        ...consignedListing,
+        status: ListingStatus.CANCELLED,
+        buyerId: null,
+      });
+
+      await expectConsignmentRefusal(() =>
+        service.relist(consignedListing.id, { price: 1_000_000 }, owner),
+      );
+      expect(prisma.listing.updateMany).not.toHaveBeenCalled();
+    });
+
+    it('PATCH harga DITOLAK — harga titipan bagian dari perjanjian bertanda tangan', async () => {
+      prisma.listing.findUnique.mockResolvedValue(consignedListing);
+
+      await expectConsignmentRefusal(() =>
+        service.updateListing(consignedListing.id, { price: 999 }, owner),
+      );
+      expect(prisma.listing.update).not.toHaveBeenCalled();
+    });
+
+    it('prepareEscrow / submitEscrow DITOLAK dengan kalimat yang JUJUR, bukan kalimat tentang aset on-chain', async () => {
+      prisma.listing.findUnique.mockResolvedValue({
+        ...consignedListing,
+        status: ListingStatus.PENDING_ESCROW,
+      });
+      await expectConsignmentRefusal(() =>
+        service.prepareEscrow(consignedListing.id, owner),
+      );
+      expect(escrow.buildTransferToEscrowTx).not.toHaveBeenCalled();
+
+      await expectConsignmentRefusal(() =>
+        service.submitEscrow(
+          consignedListing.id,
+          { signedTransaction: 'sig' },
+          owner,
+        ),
+      );
+      expect(escrow.broadcastSignedToEscrow).not.toHaveBeenCalled();
+    });
+
+    it('ARMED: listing titipan TETAP TAMPIL di feed publik — menyembunyikannya adalah kebalikan dari maksud pagar escrow', async () => {
+      armP2p();
+      prisma.listing.findMany.mockResolvedValue([]);
+
+      await service.list({});
+
+      const arg = prisma.listing.findMany.mock.calls[0][0] as {
+        where: { NOT?: { consignmentId?: unknown } };
+      };
+      // `consignmentId: null` di dalam NOT = "yang disembunyikan hanyalah baris NON-titipan".
+      expect(arg.where.NOT?.consignmentId).toBeNull();
     });
   });
 });
