@@ -51,6 +51,7 @@ import {
   consignmentSaleClaimWhere,
   isInHoshiCustody,
 } from '../common/consignment.gate';
+import { ConsignmentNotifyService } from '../consignment/consignment-notify.service';
 import {
   CONSIGNMENT_ERROR_CODE,
   consignmentError,
@@ -471,6 +472,10 @@ export class PaymentsService {
     private readonly escrow: EscrowService,
     private readonly balance: BalanceService,
     private readonly ccShipping: CcShippingService,
+    // Pemberitahuan ke PEMILIK KARTU TITIPAN. Di sinilah satu-satunya tempat yang tahu kartu
+    // seseorang BARU SAJA terjual dan berapa persisnya yang masuk ke saldonya. Method-nya `void`
+    // dan menelan errornya sendiri — email TIDAK PERNAH boleh menyentuh jalur uang.
+    private readonly consignmentNotify: ConsignmentNotifyService,
   ) {}
 
   /* ─────────────────────────── Bikin order ─────────────────────────── */
@@ -761,7 +766,10 @@ export class PaymentsService {
     }
 
     // 4. Pembeli bayar HARGA KITA + fee QRIS di atasnya (treasury tetap menerima priceIdrx).
-    const priceIdr = applyBps(listing.priceIdrx, BPS_DENOMINATOR + QRIS_FEE_BPS);
+    const priceIdr = applyBps(
+      listing.priceIdrx,
+      BPS_DENOMINATOR + QRIS_FEE_BPS,
+    );
     if (priceIdr < IDRX_MIN_MINT_IDR || priceIdr > IDRX_MAX_MINT_IDR) {
       throw new BadRequestException(
         `Harga kartu ini (Rp ${priceIdr}) di luar batas pembayaran IDRX ` +
@@ -955,7 +963,9 @@ export class PaymentsService {
       throw new BadRequestException('Listing ini tidak punya penjual.');
     }
     if (listing.sellerId === user.id) {
-      throw new BadRequestException('Tidak bisa membeli kartu yang Anda jual sendiri.');
+      throw new BadRequestException(
+        'Tidak bisa membeli kartu yang Anda jual sendiri.',
+      );
     }
     // TITIPAN: menawar dimatikan di slice 1 (ditolak di `submitOffer`), jadi seharusnya tidak ada
     // offer ACCEPTED untuk kartu titipan yang bisa sampai ke sini. Pagar KEDUA, dan ia ditaruh
@@ -1451,10 +1461,8 @@ export class PaymentsService {
       networkChainId: this.requiredConfig('IDRX_NETWORK_CHAIN_ID'),
       returnUrl,
       expiryPeriod: expiryMinutes,
-      productDetails: `Hoshi ongkir kirim domestik ${redemption.cardName}`.slice(
-        0,
-        255,
-      ),
+      productDetails:
+        `Hoshi ongkir kirim domestik ${redemption.cardName}`.slice(0, 255),
     });
     const data = mint.data;
     if (
@@ -2505,7 +2513,11 @@ export class PaymentsService {
       // (count != 1) → refund TANPA belanja apa pun.
       const claimed = await this.prisma.listing.updateMany({
         where: { id: listing.id, status: ListingStatus.ACTIVE },
-        data: { status: ListingStatus.SOLD, buyerId: user.id, soldAt: new Date() },
+        data: {
+          status: ListingStatus.SOLD,
+          buyerId: user.id,
+          soldAt: new Date(),
+        },
       });
       if (claimed.count !== 1) {
         return this.failToRefund(
@@ -2586,7 +2598,11 @@ export class PaymentsService {
     const claimedCount = await this.prisma.$transaction(async (tx) => {
       const claim = await tx.listing.updateMany({
         where: { id: listing.id, status: ListingStatus.ACTIVE },
-        data: { status: ListingStatus.SOLD, buyerId: user.id, soldAt: new Date() },
+        data: {
+          status: ListingStatus.SOLD,
+          buyerId: user.id,
+          soldAt: new Date(),
+        },
       });
       if (claim.count !== 1) return claim.count;
       await tx.paymentOrder.update({
@@ -2672,6 +2688,12 @@ export class PaymentsService {
         custodyReleasedAt: true,
         commissionBps: true,
         consignorId: true,
+        // Untuk email "kartumu terjual" di ujung method ini. `cardName` dipakai di subjeknya;
+        // kedua kolom snapshot serah-terima dipakai untuk LOG yang bisa ditindaklanjuti manusia
+        // ketika pemiliknya tidak punya email (jalur normal untuk titipan Path B).
+        cardName: true,
+        consignorNameAtIntake: true,
+        consignorPhoneAtIntake: true,
       },
     });
     if (!c) {
@@ -2688,6 +2710,37 @@ export class PaymentsService {
           `(status ${c.status}, custodyAcceptedAt=${c.custodyAcceptedAt ? 'ada' : 'null'}, ` +
           `custodyReleasedAt=${c.custodyReleasedAt ? 'ada' : 'null'}) — ditarik pemiliknya, ` +
           'sudah keluar, atau hilang. Listing TIDAK diklaim SOLD, pemilik TIDAK dikredit. ' +
+          'Rupiah pembeli aman di-refund seluruhnya.',
+      );
+    }
+
+    // 1b. ═══ SIAPA YANG DIBAYAR — PAGAR TERAKHIR, DAN IA ADA DI JALUR UANG ═══
+    //
+    // Sejak titipan bisa diterima dari orang yang BELUM punya akun Hoshi (kode klaim di tanda
+    // terima serah-terima), `Consignment.consignorId` NULLABLE. Baris tanpa pemilik seharusnya
+    // TIDAK PERNAH bisa sampai ke sini: ia tidak bisa berstatus LISTED (CHECK
+    // `consignments_listed_requires_owner_chk`), predikat `listClaimWhere` menuntut
+    // `consignorId != null`, dan CHECK `listings_consignment_shape_chk` menuntut
+    // `sellerId IS NOT NULL` pada setiap baris listing titipan.
+    //
+    // Pemeriksaan ini tetap ditulis karena ia berada DI JALUR UANG: kalau satu dari ketiga pagar
+    // itu suatu saat dilonggarkan, yang terjadi tanpa blok ini adalah `balance.credit` dipanggil
+    // dengan id yang tidak menunjuk siapa pun SESUDAH pembeli membayar — Hoshi memegang Rupiah
+    // orang tanpa tujuan untuk menyalurkannya. Menolak DI SINI berarti listing tidak pernah
+    // menyentuh SOLD dan tidak ada saldo yang bergerak, jadi Rupiah pembeli utuh dan
+    // refundSafe = true.
+    //
+    // Kesetaraan `consignorId === sellerId` ikut diperiksa karena keduanya MENJAWAB PERTANYAAN
+    // YANG SAMA lewat dua kolom: `sellerId` adalah salinan yang dibekukan saat listing dibuat,
+    // `consignorId` adalah sumbernya. Keduanya tidak bisa menyimpang lewat jalur mana pun yang
+    // ada hari ini (penautan menolak menimpa pemilik yang sudah ada), jadi kalau mereka BERBEDA,
+    // yang benar bukan salah satunya — yang benar adalah berhenti dan me-refund.
+    if (c.consignorId == null || c.consignorId !== sellerId) {
+      return this.failToRefund(
+        order,
+        `Titipan ${consignmentId} tidak punya pemilik yang jelas saat pembayaran mendarat ` +
+          `(consignorId=${c.consignorId ?? 'null'}, listing.sellerId=${sellerId}) — tidak ada ` +
+          'siapa pun yang boleh dikredit. Listing TIDAK diklaim SOLD dan NOL saldo bergerak; ' +
           'Rupiah pembeli aman di-refund seluruhnya.',
       );
     }
@@ -2835,6 +2888,29 @@ export class PaymentsService {
         `Rp ${commission}; pemilik ${sellerId} dikredit Rp ${payout}. NOL USDC, NOL SOL, NOL ` +
         `on-chain (order ${order.merchantOrderId} FULFILLED).`,
     );
+
+    // ── "KAMI AKAN MEMBERITAHUMU" — halaman titipan menjanjikannya; ini yang menepatinya ──
+    //
+    // DI SINI, dan bukan di dalam transaksi, dengan sengaja: baris ini hanya terjangkau setelah
+    // settlement TERBUKTI commit (`settled === true` dan penjaga di atasnya sudah lewat), jadi
+    // tidak mungkin ada email "kartumu terjual" untuk penjualan yang di-rollback. Angkanya
+    // diambil dari variabel yang SAMA yang baru saja ditulis ke ledger, bukan dihitung ulang —
+    // email dan buku besar tidak boleh bisa menyebut angka yang berbeda.
+    this.consignmentNotify.notifySold(
+      ConsignmentNotifyService.target({
+        id: c.id,
+        consignorId: c.consignorId,
+        cardName: c.cardName,
+        consignorNameAtIntake: c.consignorNameAtIntake,
+        consignorPhoneAtIntake: c.consignorPhoneAtIntake,
+      }),
+      {
+        paidBaseIdr: paidBaseIdrx,
+        commissionIdr: commission,
+        payoutIdr: payout,
+        commissionBps: feeBps,
+      },
+    );
     return 'FULFILLED';
   }
 
@@ -2861,7 +2937,11 @@ export class PaymentsService {
     const claimedCount = await this.prisma.$transaction(async (tx) => {
       const claim = await tx.listing.updateMany({
         where: { id: listing.id, status: ListingStatus.ACTIVE },
-        data: { status: ListingStatus.SOLD, buyerId: user.id, soldAt: new Date() },
+        data: {
+          status: ListingStatus.SOLD,
+          buyerId: user.id,
+          soldAt: new Date(),
+        },
       });
       if (claim.count !== 1) return claim.count;
       await tx.paymentOrder.update({
@@ -3037,7 +3117,11 @@ export class PaymentsService {
       await this.prisma.$transaction(async (tx) => {
         const c = await tx.listing.updateMany({
           where: { id: listing.id, status: ListingStatus.ACTIVE },
-          data: { status: ListingStatus.SOLD, buyerId: user.id, soldAt: new Date() },
+          data: {
+            status: ListingStatus.SOLD,
+            buyerId: user.id,
+            soldAt: new Date(),
+          },
         });
         if (c.count !== 1) return; // kalah klaim → claimedMock tetap false → tak kredit/FULFILLED
         if (payout > 0) {
@@ -3053,7 +3137,11 @@ export class PaymentsService {
         }
         await tx.paymentOrder.update({
           where: { merchantOrderId: order.merchantOrderId },
-          data: { status: PaymentStatus.FULFILLED, fulfilledAt: new Date(), error: null },
+          data: {
+            status: PaymentStatus.FULFILLED,
+            fulfilledAt: new Date(),
+            error: null,
+          },
         });
         claimedMock = true;
       });
@@ -3090,7 +3178,11 @@ export class PaymentsService {
     // order satu kartu → satu menang; kalah klaim → refund tanpa transfer.
     const claimed = await this.prisma.listing.updateMany({
       where: { id: listing.id, status: ListingStatus.ACTIVE },
-      data: { status: ListingStatus.SOLD, buyerId: user.id, soldAt: new Date() },
+      data: {
+        status: ListingStatus.SOLD,
+        buyerId: user.id,
+        soldAt: new Date(),
+      },
     });
     if (claimed.count !== 1) {
       return this.failToRefund(
@@ -3841,7 +3933,8 @@ export class PaymentsService {
     // ║ `extra` tidak diisi (semua pemanggil failToRefund) = PASCA-KLAIM, yang hanya tercapai    ║
     // ║ sesudah gerbang `userMintStatus==='MINTED'` di verifyAndFulfil → paruhnya sudah terbukti.║
     // ╚══════════════════════════════════════════════════════════════════════════════════════════╝
-    const mintProven = extra === undefined || extra.idrxUserMintStatus === 'MINTED';
+    const mintProven =
+      extra === undefined || extra.idrxUserMintStatus === 'MINTED';
     if (refundSafe && !mintProven) {
       this.logger.warn(
         `Order ${order.merchantOrderId}: refundSafe DITURUNKAN ke false oleh gerbang mint — ` +
@@ -4043,7 +4136,11 @@ export class PaymentsService {
     // saldo on-chain di bawah tetap berlaku identik untuk kedua jalur.
     const usingDefaultCap = perItemCapUsdc == null;
     const maxItem = usingDefaultCap
-      ? this.intConfig('GACHA_MAX_PACK_PRICE_USDC', TREASURY_MAX_PACK_PRICE_USDC, 1)
+      ? this.intConfig(
+          'GACHA_MAX_PACK_PRICE_USDC',
+          TREASURY_MAX_PACK_PRICE_USDC,
+          1,
+        )
       : perItemCapUsdc;
     if (priceUsdc > maxItem) {
       this.logger.error(

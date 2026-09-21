@@ -66,6 +66,47 @@ export const CONSIGNMENT_ERROR_CODE = {
    * tidak bisa dimenangkan oleh SIAPA PUN — termasuk oleh pemiliknya.
    */
   EVIDENCE_REQUIRED: 'CONSIGNMENT_EVIDENCE_REQUIRED',
+  /**
+   * Catatan titipan ini BELUM TERHUBUNG ke akun Hoshi mana pun (`consignorId` null): kartunya
+   * diterima dari seseorang yang saat itu belum punya akun, dan kode klaimnya belum ditukarkan.
+   *
+   * SENGAJA BUKAN `NOT_IN_CUSTODY`, dan perbedaan ini HARUS dijaga. Keduanya sama-sama berarti
+   * "belum bisa dipajang", tapi sebabnya BERLAWANAN dan pemulihannya berbeda total:
+   *
+   *   NOT_IN_CUSTODY  → kartunya TIDAK ADA di tangan kita. Pemulihan: catat serah-terimanya.
+   *   OWNER_UNLINKED  → kartunya ADA di tangan kita, tapi kita tidak tahu SIAPA YANG HARUS
+   *                     DIBAYAR kalau ia terjual. Pemulihan: pemiliknya menukarkan kode klaim
+   *                     (POST /consignments/claim), atau admin menautkan akunnya
+   *                     (POST /admin/consignments/:id/link-consignor).
+   *
+   * Menyamakan keduanya akan menyuruh operator "menerima custody" untuk kartu yang SUDAH ada di
+   * raknya — nasihat yang tidak bisa berhasil, dan persis kelas kesalahan yang dicegah file ini.
+   */
+  OWNER_UNLINKED: 'CONSIGNMENT_OWNER_UNLINKED',
+  /**
+   * Kode klaim yang ditukarkan tidak berlaku. SATU kode untuk SEMUA sebab — bentuknya salah,
+   * tidak ditemukan, kedaluwarsa, sudah pernah dipakai, atau sudah diterbitkan ulang.
+   *
+   * ITU DISENGAJA DAN TIDAK BOLEH DIPECAH. Membedakan "kode tidak ada" dari "kode ada tapi
+   * kedaluwarsa" mengubah rute penukaran menjadi oracle yang MENGONFIRMASI tebakan — tepat hal
+   * yang membuat menebak jadi ada gunanya.
+   */
+  CLAIM_CODE_INVALID: 'CONSIGNMENT_CLAIM_CODE_INVALID',
+  /**
+   * RENCANA PENGEMBALIAN belum cukup untuk melepas custody: cara pengembaliannya belum
+   * dinyatakan, alamatnya belum lengkap, atau resinya belum ada.
+   *
+   * SENGAJA BUKAN `EVIDENCE_REQUIRED`, walaupun keduanya berarti "ada yang kurang". Yang satu
+   * tentang BUKTI SAAT MENERIMA kartu (foto, catatan kondisi) dan pemulihannya adalah memotret;
+   * yang ini tentang KE MANA KARTUNYA PULANG, dan pemulihannya adalah menanyakan alamat kepada
+   * pemiliknya lalu mencatat resinya. UI yang menyamakan keduanya akan menyuruh operator
+   * memotret kartu yang sedang ia bungkus untuk dikirim.
+   *
+   * BAGI PEMILIK KARTU: tidak ada yang berubah. Kartunya TETAP di rak Hoshi, TETAP tercatat
+   * sebagai miliknya, dan permintaan penarikannya TETAP hidup — yang ditolak hanyalah pernyataan
+   * bahwa kartunya sudah keluar.
+   */
+  RETURN_INCOMPLETE: 'CONSIGNMENT_RETURN_INCOMPLETE',
 } as const;
 
 export type ConsignmentErrorCode =

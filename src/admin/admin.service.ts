@@ -35,6 +35,8 @@ import {
   p2pModeOf,
   unescrowedUserListingWhere,
 } from '../marketplace/p2p.gate';
+// SATU definisi "baris listing ini titipan atau bukan?" — lihat `financeSummary`.
+import { nonConsignedListingWhere } from '../common/listing-kind';
 import { PrismaService } from '../prisma/prisma.service';
 import {
   recordShippingRefundDebts,
@@ -1550,13 +1552,45 @@ export class AdminService {
   }
 
   /**
-   * Ringkasan keuangan untuk admin: pemasukan dipisah reseller vs P2P, TOTAL KEWAJIBAN (saldo
-   * penjual yang belum ditarik = utang Hoshi), + daftar saldo tiap penjual. Treasury on-chain &
-   * "profit yang aman ditarik" (treasury − kewajiban) dihitung di controller (yang punya akses gacha).
+   * Ringkasan keuangan untuk admin: pemasukan dipisah per RAIL, TOTAL KEWAJIBAN (saldo penjual
+   * yang belum ditarik = utang Hoshi), + daftar saldo tiap penjual. Treasury on-chain & "profit
+   * yang aman ditarik" (treasury − kewajiban) dihitung di controller (yang punya akses gacha).
+   *
+   * ╔════════════════════════════════════════════════════════════════════════════════════════════╗
+   * ║ EMPAT EMBER, BUKAN TIGA — dan ember keempat adalah SATU-SATUNYA yang komisinya milik Hoshi.║
+   * ╚════════════════════════════════════════════════════════════════════════════════════════════╝
+   *
+   * Ringkasan ini LEBIH TUA dari `src/common/listing-kind.ts`, dan itu persis yang membuatnya
+   * salah: ember `p2p` dulu berbunyi `sellerId: { not: null }` — BENTUK YANG SAMA PERSIS dengan
+   * baris listing TITIPAN, yang memang wajib punya `sellerId` (kalau tidak, tidak ada siapa pun
+   * yang bisa dikredit). Jadi SETIAP penjualan titipan dilaporkan sebagai P2P, dan komisi 5% —
+   * seluruh model bisnis kustodi ini — tidak punya satu baris pun di layar mana pun. Sekarang
+   * kedua ember memakai `nonConsignedListingWhere()` / kolom yang dicatat settlement, jadi yang
+   * memisahkan keduanya adalah SATU definisi, bukan dua bentuk yang kebetulan mirip.
+   *
+   * ── DARI MANA ANGKA KOMISINYA DATANG, dan kenapa BUKAN dari harga listing ──────────────────
+   *
+   * `Consignment.commissionIdrx` / `payoutIdrx` ditulis oleh `PaymentsService.fulfilConsignment`
+   * di dalam transaksi settlement, dari `commissionBps` yang DI-SNAPSHOT saat perjanjian
+   * ditandatangani dan dari harga yang pembeli BENAR-BENAR bayar. Menghitung ulang 5% dari
+   * `listing.priceIdrx` di sini akan salah pada dua hal sekaligus: harga listing bisa diubah
+   * admin SESUDAH invoice terbit, dan bps-nya bisa berbeda per titipan. Yang dilaporkan adalah
+   * yang TERCATAT, bukan yang diperkirakan ulang.
+   *
+   * PREDIKATNYA `commissionIdrx: { not: null }`, BUKAN `status: SOLD` — dan itu bukan selera:
+   * titipan yang sudah terjual LALU DIKIRIM ke pembelinya berpindah ke RELEASED, dan yang
+   * ditandai hilang sesudah terjual berpindah ke LOST. Memfilter dengan `status: SOLD` akan
+   * MENJATUHKAN penjualan-penjualan itu dari laporan — tepat penjualan yang sudah paling tuntas.
    */
   async financeSummary() {
-    const [resellerAgg, hoshiInvAgg, p2pAgg, sellers, pendingWdAgg] =
-      await Promise.all([
+    const [
+      resellerAgg,
+      hoshiInvAgg,
+      p2pAgg,
+      consignmentAgg,
+      sellers,
+      pendingWdAgg,
+    ] = await Promise.all([
         // Reseller = Hoshi jual kartu KATALOG CC (source COLLECTORCRYPT, tanpa penjual user).
         this.prisma.listing.aggregate({
           where: {
@@ -1578,9 +1612,24 @@ export class AdminService {
           _sum: { priceIdrx: true },
           _count: true,
         }),
+        // P2P = listing milik USER. `nonConsignedListingWhere()` WAJIB ada di sini: tanpa itu,
+        // setiap kartu TITIPAN (yang juga ber-sellerId) ikut terhitung sebagai P2P. Lihat
+        // paragraf "EMPAT EMBER" di atas.
         this.prisma.listing.aggregate({
-          where: { status: ListingStatus.SOLD, sellerId: { not: null } },
+          where: {
+            status: ListingStatus.SOLD,
+            sellerId: { not: null },
+            ...nonConsignedListingWhere(),
+          },
           _sum: { priceIdrx: true },
+          _count: true,
+        }),
+        // TITIPAN = kartu ORANG LAIN yang fisiknya di rak Hoshi. Yang menjadi PENDAPATAN HOSHI
+        // di sini BUKAN omzetnya melainkan KOMISINYA; sisanya utang ke pemilik kartu dan sudah
+        // masuk `liabilitiesIdr` lewat saldo penjual. Dibaca dari kolom yang DITULIS settlement.
+        this.prisma.consignment.aggregate({
+          where: { commissionIdrx: { not: null } },
+          _sum: { commissionIdrx: true, payoutIdrx: true },
           _count: true,
         }),
       this.prisma.user.findMany({
@@ -1623,6 +1672,19 @@ export class AdminService {
         grossIdr: hoshiInvAgg._sum.priceIdrx ?? 0,
       },
       p2p: { count: p2pAgg._count, grossIdr: p2pAgg._sum.priceIdrx ?? 0 },
+      /**
+       * TITIPAN. `commissionIdr` adalah SATU-SATUNYA bagian yang menjadi pendapatan Hoshi;
+       * `payoutIdr` sudah menjadi saldo pemilik kartu, jadi ia ADA DI `liabilitiesIdr` sampai
+       * ditarik. `grossIdr` = keduanya dijumlahkan = yang pembeli bayar di luar fee QRIS.
+       */
+      consignment: {
+        count: consignmentAgg._count,
+        grossIdr:
+          (consignmentAgg._sum.commissionIdrx ?? 0) +
+          (consignmentAgg._sum.payoutIdrx ?? 0),
+        commissionIdr: consignmentAgg._sum.commissionIdrx ?? 0,
+        payoutIdr: consignmentAgg._sum.payoutIdrx ?? 0,
+      },
       liabilitiesIdr,
       pendingWithdrawalsIdr,
       pendingWithdrawalsCount: pendingWdAgg._count,

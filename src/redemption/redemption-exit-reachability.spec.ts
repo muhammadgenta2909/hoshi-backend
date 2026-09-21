@@ -235,6 +235,8 @@ const paymentsService = (
     {} as any,
     {} as any,
     {} as any,
+    // ConsignmentNotifyService: verifikasi ongkir tidak pernah menyentuh titipan.
+    {} as any,
   );
 
 /* ─────────────────────────── driver jalan keluar ─────────────────────────── */

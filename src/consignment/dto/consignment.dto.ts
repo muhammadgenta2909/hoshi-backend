@@ -4,6 +4,7 @@ import {
   ArrayMaxSize,
   IsArray,
   IsEnum,
+  IsIn,
   IsInt,
   IsNumber,
   IsOptional,
@@ -16,6 +17,10 @@ import {
   ValidateNested,
 } from 'class-validator';
 import { Type } from 'class-transformer';
+import {
+  CONSIGNMENT_RETURN_METHOD,
+  CONSIGNMENT_RETURN_PAYER,
+} from '../../common/consignment.gate';
 
 /** Batas atas nominal Rupiah yang masuk akal untuk satu kartu (sejalan dengan IDRX_MAX listing). */
 const IDR_MAX = 2_000_000_000;
@@ -48,14 +53,37 @@ export class ConsignmentPhotoInput {
  * menyatakan "kartu saya ada di kalian" adalah mesin pembuat kebohongan.
  */
 export class CreateConsignmentDto {
-  @ApiProperty({ description: 'User id PEMILIK kartu (consignor).' })
+  @ApiPropertyOptional({
+    description:
+      'User id PEMILIK kartu (consignor). OPSIONAL. Isi HANYA kalau pemiliknya sudah punya akun ' +
+      'Hoshi DAN operator sudah MEMILIHNYA sendiri dari hasil ' +
+      'GET /admin/consignments/consignor-search. Kosongkan kalau ia belum punya akun: ' +
+      'titipannya tetap tercatat, dan responsnya memuat KODE KLAIM sekali pakai untuk dicetak di ' +
+      'tanda terima. Kartu tanpa pemilik tertaut TIDAK BISA dipajang maupun terjual.',
+  })
+  @IsOptional()
   @IsString()
-  consignorId!: string;
+  @MaxLength(64)
+  consignorId?: string;
+
+  /*
+   * TIDAK ADA `consignorEmail` DI SINI, DAN TIDAK BOLEH DITAMBAHKAN.
+   *
+   * `User.email` di schema ini `String?` — TIDAK unik dan TIDAK PERNAH diverifikasi; siapa pun
+   * bisa mengetik alamat orang lain di setelan profilnya sendiri. Hanya `walletAddress` yang
+   * `@unique`. Sebuah field yang menautkan kartu senilai puluhan juta Rupiah ke siapa pun yang
+   * MENGAKU memiliki sebuah alamat email adalah kelas bug terburuk yang bisa dipunyai fitur ini.
+   * Satu-satunya nilai yang tidak ambigu adalah id, dan id datang dari operator yang MEMILIH
+   * orangnya dari daftar.
+   */
 
   @ApiProperty({
     description:
       'SNAPSHOT nama pemilik saat serah-terima. Sengaja disalin, bukan dibaca dari User: ' +
-      'displayName bisa berubah, dan apa yang benar pada HARI itu tidak bisa diturunkan ulang.',
+      'displayName bisa berubah, dan apa yang benar pada HARI itu tidak bisa diturunkan ulang. ' +
+      'WAJIB juga ketika consignorId kosong — di sana justru ia paling penting: tanpa akun untuk ' +
+      'dirujuk, nama dan telepon inilah satu-satunya cara operator dan pemilik kartu bisa saling ' +
+      'mengenali lagi nanti.',
   })
   @IsString()
   @MinLength(2)
@@ -329,6 +357,176 @@ export class UpdateConsignmentPriceDto {
   note!: string;
 }
 
+/* ══════════════════ PENGEMBALIAN KARTU KE PEMILIK: ALAMAT, ONGKIR, RESI ══════════════════ */
+
+/**
+ * ╔══════════════════════════════════════════════════════════════════════════════════════════════╗
+ * ║ ALAMAT PENGEMBALIAN — BENTUKNYA SENGAJA SAMA PERSIS dengan alamat kirim domestik yang SUDAH ║
+ * ║ ADA (`CardRedemption`: recipientName/country/street/apt/city/state/zip/phone*).             ║
+ * ╚══════════════════════════════════════════════════════════════════════════════════════════════╝
+ *
+ * TIDAK ADA bentuk alamat kedua yang diciptakan untuk hal yang sama, dan itu bukan soal rapi:
+ * tarif ongkirnya dihitung fungsi yang SAMA (`resolveDomesticShippingIdr` atas tabel
+ * `domestic_shipping_rates`), yang membaca `city`/`state`/`country`. Bentuk alamat yang berbeda
+ * berarti dua daftar ongkir yang suatu hari akan menjawab berbeda untuk satu provinsi yang sama.
+ *
+ * DISIMPAN SEBAGAI SNAPSHOT di baris titipan, bukan sebagai FK ke `ShippingAddress`:
+ *   • pemilik kartu BISA belum punya akun sama sekali (Path B / kode klaim), jadi ia tidak punya
+ *     buku alamat untuk dirujuk;
+ *   • alamat yang diubah atau dihapus SESUDAH kartunya dikirim tidak boleh mengubah ke mana kartu
+ *     itu TERCATAT dikirim.
+ */
+export class ConsignmentReturnAddressDto {
+  @ApiProperty({
+    example: 'Budi Santoso',
+    description:
+      'Nama PENERIMA di alamat tujuan. Boleh berbeda dari nama pemilik kartu — paket sering ' +
+      'diterima anggota keluarga, dan memaksanya sama hanya akan membuat kurir menolak.',
+  })
+  @IsString()
+  @MinLength(2)
+  @MaxLength(200)
+  recipientName!: string;
+
+  @ApiProperty({ example: '081234567890' })
+  @IsString()
+  @MinLength(5)
+  @MaxLength(40)
+  phoneNumber!: string;
+
+  @ApiPropertyOptional({ example: '+62' })
+  @IsOptional()
+  @IsString()
+  @MaxLength(8)
+  phoneCountryCode?: string;
+
+  @ApiProperty({
+    example: 'Jl. Merdeka No. 10, RT 03 RW 05',
+    description: 'Alamat jalan lengkap.',
+  })
+  @IsString()
+  @MinLength(5)
+  @MaxLength(500)
+  street!: string;
+
+  @ApiPropertyOptional({
+    description:
+      'Unit/blok/patokan. SENGAJA opsional: kebanyakan alamat rumah tidak punya.',
+  })
+  @IsOptional()
+  @IsString()
+  @MaxLength(200)
+  apt?: string;
+
+  @ApiProperty({ example: 'Kota Bandung', description: 'Kota / kabupaten.' })
+  @IsString()
+  @MinLength(2)
+  @MaxLength(200)
+  city!: string;
+
+  @ApiProperty({
+    example: 'Jawa Barat',
+    description:
+      'PROVINSI. WAJIB di sini — beda dengan buku alamat user, yang membiarkannya kosong. ' +
+      'Provinsilah yang menentukan TIER ONGKIR, dan provinsi yang tidak disebut jatuh ke tier ' +
+      'PENAMPUNG yang lebih mahal; alamat ini diketik OPERATOR sambil bicara dengan pemiliknya, ' +
+      'jadi menanyakannya sekali jauh lebih murah daripada menaksir ongkir yang salah.',
+  })
+  @IsString()
+  @MinLength(2)
+  @MaxLength(200)
+  state!: string;
+
+  @ApiProperty({ example: '40115', description: 'Kode pos.' })
+  @IsString()
+  @MinLength(3)
+  @MaxLength(20)
+  zip!: string;
+
+  @ApiPropertyOptional({
+    default: 'Indonesia',
+    description:
+      'Default "Indonesia". Kolom ini ADA (bukan diasumsikan) karena ia GERBANG, bukan hiasan: ' +
+      'taksiran ongkir domestik hanya berlaku untuk Indonesia, dan alamat luar negeri akan ' +
+      'membuat taksirannya dilewati alih-alih menagih angka yang mustahil.',
+  })
+  @IsOptional()
+  @IsString()
+  @MaxLength(100)
+  country?: string;
+}
+
+/**
+ * ╔══════════════════════════════════════════════════════════════════════════════════════════════╗
+ * ║ RENCANA PENGEMBALIAN — SATU BENTUK, dipakai saat PENARIKAN DIMINTA maupun saat kartunya     ║
+ * ║ BENAR-BENAR DISERAHKAN. Sengaja BUKAN dua bentuk yang mirip.                                ║
+ * ╚══════════════════════════════════════════════════════════════════════════════════════════════╝
+ *
+ * Dalam praktik, keduanya terjadi di dua momen yang berbeda dan kadang di momen yang sama:
+ *   • pemilik menelepon minta kartunya kembali → alamatnya dicatat SEKARANG, kartunya dibungkus
+ *     besok;
+ *   • pemilik datang ke kantor tanpa pemberitahuan → semuanya dicatat pada detik yang sama.
+ * Karena itu bentuk ini ikut di DUA rute (`withdraw` dan `release`) dan TIDAK punya rute sendiri:
+ * rute ketiga hanya akan jadi jalur kedua yang menulis kolom yang sama, dan salah satunya akan
+ * melenceng.
+ *
+ * MENGIRIMNYA LAGI berarti MEMPERBARUI rencananya (alamat bisa salah ketik, dan pemilik bisa
+ * berubah pikiran antara "kirim" dan "saya ambil sendiri"). Yang TIDAK bisa diperbarui adalah
+ * baris yang custody-nya sudah dilepas — di sana rencananya sudah jadi RIWAYAT.
+ */
+export class ConsignmentReturnPlanDto {
+  @ApiProperty({
+    enum: Object.values(CONSIGNMENT_RETURN_METHOD),
+    description:
+      'PICKUP = pemilik mengambil sendiri di tempat Hoshi (tidak butuh alamat, tapi butuh ' +
+      'catatan SIAPA yang mengambil saat penyerahannya). COURIER = dikirim kurir (butuh alamat ' +
+      'lengkap di bawah, dan nanti butuh nomor resi sebelum custody boleh dilepas).',
+  })
+  @IsString()
+  @IsIn(Object.values(CONSIGNMENT_RETURN_METHOD))
+  returnMethod!: string;
+
+  @ApiPropertyOptional({
+    type: ConsignmentReturnAddressDto,
+    description:
+      'WAJIB kalau returnMethod = COURIER; diabaikan kalau PICKUP. Ditegakkan di service (bukan ' +
+      'di decorator) supaya penolakannya bisa menjelaskan hubungan antara kedua field ini, ' +
+      'bukan sekadar "validation failed".',
+  })
+  @IsOptional()
+  @ValidateNested()
+  @Type(() => ConsignmentReturnAddressDto)
+  returnAddress?: ConsignmentReturnAddressDto;
+
+  @ApiPropertyOptional({
+    enum: Object.values(CONSIGNMENT_RETURN_PAYER),
+    description:
+      'SIAPA yang menanggung ongkir balik. ⚠️ DICATAT SAJA — tidak ada tagihan yang terbit, ' +
+      'tidak ada saldo yang dipotong, dan menarik kartu TETAP GRATIS bagi pemiliknya. Kolom ini ' +
+      'ada supaya ongkos yang ditanggung Hoshi berhenti jadi kebocoran yang tidak muncul di ' +
+      'laporan mana pun.',
+  })
+  @IsOptional()
+  @IsString()
+  @IsIn(Object.values(CONSIGNMENT_RETURN_PAYER))
+  returnShippingPayer?: string;
+
+  @ApiPropertyOptional({
+    example: 25_000,
+    description:
+      'Ongkir balik (Rupiah utuh). Kalau dikosongkan untuk pengiriman kurir ke alamat ' +
+      'Indonesia, server MENAKSIRNYA dari tarif wilayah yang SUDAH ADA (tabel yang sama dengan ' +
+      'kirim domestik). Taksiran boleh ditimpa — yang benar adalah angka di struk kurir. 0 sah ' +
+      'dan BERBEDA dari kosong: 0 berarti "digratiskan / diambil sendiri", kosong berarti ' +
+      '"belum dicatat".',
+  })
+  @IsOptional()
+  @IsInt()
+  @Min(0)
+  @Max(IDR_MAX)
+  returnShippingFeeIdr?: number;
+}
+
 /** Kartunya FISIK keluar dari Hoshi. Menulis `custodyReleasedAt` — dan itu tidak bisa dibatalkan. */
 export class ReleaseConsignmentDto {
   @ApiProperty({
@@ -354,6 +552,62 @@ export class ReleaseConsignmentDto {
   @MinLength(NOTE_MIN)
   @MaxLength(1000)
   note!: string;
+
+  /* ── PENGEMBALIAN KE PEMILIK (releaseReason = WITHDRAWN) ──────────────────────────────────
+     Field di bawah TIDAK BERLAKU untuk SHIPPED_TO_BUYER: pengiriman ke pembeli punya jalurnya
+     sendiri (`CardRedemption` + tarif domestik + rute kirim), dan menumpangkannya di sini akan
+     melahirkan dua tempat yang menyimpan resi untuk satu kejadian. */
+
+  @ApiPropertyOptional({
+    type: ConsignmentReturnPlanDto,
+    description:
+      'Rencana pengembalian, kalau baru dicatat SEKARANG — mis. pemiliknya datang tanpa ' +
+      'pemberitahuan. Bentuk yang SAMA dengan yang diterima rute penarikan; kalau rencananya ' +
+      'sudah pernah dicatat di sana, kosongkan (atau kirim lagi untuk memperbaruinya). Server ' +
+      'menuliskannya LEBIH DULU di transaksi yang sama, lalu klaim pelepasan custody membacanya ' +
+      'dari BARIS — jadi "alamatnya ada" tidak pernah cuma berarti "alamatnya disebut di body".',
+  })
+  @IsOptional()
+  @ValidateNested()
+  @Type(() => ConsignmentReturnPlanDto)
+  returnPlan?: ConsignmentReturnPlanDto;
+
+  @ApiPropertyOptional({
+    example: 'JNE REG',
+    description:
+      'Nama kurir. WAJIB bersama nomor resi untuk pengembalian ber-metode COURIER: tanpa ' +
+      'keduanya, "sudah dikirim" adalah klaim yang TIDAK BISA DIPERIKSA oleh pemilik kartunya ' +
+      'sendiri — dan dialah satu-satunya orang yang berhak memeriksanya.',
+  })
+  @IsOptional()
+  @IsString()
+  @MinLength(2)
+  @MaxLength(100)
+  returnCourier?: string;
+
+  @ApiPropertyOptional({
+    example: 'JNE0123456789',
+    description: 'Nomor resi. WAJIB bersama nama kurir untuk metode COURIER.',
+  })
+  @IsOptional()
+  @IsString()
+  @MinLength(4)
+  @MaxLength(100)
+  returnTrackingNo?: string;
+
+  @ApiPropertyOptional({
+    example: 'Budi Santoso (pemilik), KTP dicocokkan dengan catatan intake.',
+    description:
+      'SIAPA yang mengambil kartunya di tempat. WAJIB untuk metode PICKUP. Kalimat manusia, ' +
+      'bukan id: yang datang mengambil sering BUKAN pemegang akunnya (istri, kurir pribadi, ' +
+      'rekan yang membawa surat kuasa), dan yang perlu tercatat adalah siapa yang berdiri di ' +
+      'sana. "KAPAN"-nya tidak ditanyakan: itu `custodyReleasedAt`, yang ditulis detik ini juga.',
+  })
+  @IsOptional()
+  @IsString()
+  @MinLength(3)
+  @MaxLength(300)
+  returnPickedUpBy?: string;
 }
 
 /** Kartu HILANG/RUSAK dalam pengawasan Hoshi. Wajib beralasan; listing ikut ditarik. */
@@ -396,6 +650,85 @@ export class CorrectConsignmentDto {
   note!: string;
 }
 
+/**
+ * ╔══════════════════════════════════════════════════════════════════════════════════════════════╗
+ * ║ KOREKSI LABEL — dan GARIS yang memisahkannya dari `CorrectConsignmentDto` di atas.           ║
+ * ╚══════════════════════════════════════════════════════════════════════════════════════════════╝
+ *
+ * `conditionNote` dan foto adalah BUKTI dan TETAP tidak punya rute update. Field di bawah ini
+ * adalah LABEL: klaim tentang kartu MANA ini, yang bisa dicek terhadap kartu fisiknya sendiri dan
+ * terhadap situs grader-nya. Label yang salah ketik bukan bukti tentang apa pun — ia cuma salah,
+ * dan sampai rute ini ada, "Charizad VMAX" yang terketik di ponsel menjadi JUDUL PUBLIK PERMANEN
+ * kartu orang lain (`createListingFor` menyalin `cardName` langsung ke `Listing.name`).
+ *
+ * SEMUA FIELD OPSIONAL, tapi MINIMAL SATU wajib ada — ditegakkan di service supaya pesannya bisa
+ * menyebutkan garis bukti/label di atas, bukan sekadar "validation failed".
+ *
+ * STRING KOSONG BERARTI KOSONGKAN KOLOMNYA (untuk field yang memang nullable): koreksi yang benar
+ * kadang berarti MENGHAPUS — nomor sertifikat yang diketik untuk kartu yang ternyata mentah,
+ * misalnya. `cardName` dikecualikan: ia judul publik dan tidak boleh kosong.
+ */
+export class CorrectConsignmentLabelDto {
+  @ApiPropertyOptional({
+    example: 'Charizard VMAX',
+    description: 'Nama kartu. TIDAK boleh dikosongkan — ini judul publiknya.',
+  })
+  @IsOptional()
+  @IsString()
+  @MaxLength(200)
+  cardName?: string;
+
+  @ApiPropertyOptional({ description: 'String kosong = kosongkan kolomnya.' })
+  @IsOptional()
+  @IsString()
+  @MaxLength(200)
+  cardSet?: string;
+
+  @ApiPropertyOptional({ description: 'String kosong = kosongkan kolomnya.' })
+  @IsOptional()
+  @IsString()
+  @MaxLength(80)
+  cardNumber?: string;
+
+  @ApiPropertyOptional({
+    description:
+      'Nomor sertifikat grader. String kosong = kosongkan. Nomor yang dikoreksi ikut diperiksa ' +
+      'terhadap kunci anti-dobel-titip (satu kartu fisik = satu titipan hidup).',
+  })
+  @IsOptional()
+  @IsString()
+  @MaxLength(60)
+  certNumber?: string;
+
+  @ApiPropertyOptional({
+    example: 'PSA 10',
+    description: 'String kosong = kosongkan kolomnya.',
+  })
+  @IsOptional()
+  @IsString()
+  @MaxLength(40)
+  gradeLabel?: string;
+
+  @ApiPropertyOptional({ example: 10 })
+  @IsOptional()
+  @IsNumber()
+  @Min(0)
+  @Max(10)
+  gradeScore?: number;
+
+  @ApiProperty({
+    description:
+      'APA yang salah dan DARI MANA tahu nilai yang benar. DISIMPAN permanen sebagai baris ' +
+      'ConsignmentEvent ber-kind LABEL_CORRECTION, lengkap dengan nilai SEBELUM dan SESUDAH.',
+    example:
+      'Salah ketik saat intake di lokasi; dicocokkan ulang dengan slab dan cert PSA 12345678.',
+  })
+  @IsString()
+  @MinLength(NOTE_MIN)
+  @MaxLength(1000)
+  note!: string;
+}
+
 /** Tambah foto bukti. APPEND-ONLY: tidak ada rute update/delete untuk foto. */
 export class AddConsignmentPhotosDto {
   @ApiProperty({ type: [ConsignmentPhotoInput] })
@@ -406,11 +739,115 @@ export class AddConsignmentPhotosDto {
   photos!: ConsignmentPhotoInput[];
 }
 
-/** Pemilik minta kartunya kembali. Tidak ada biaya apa pun di jalur ini. */
+/**
+ * Pemilik minta kartunya kembali. TIDAK ADA BIAYA APA PUN DI JALUR INI — nol Rupiah bergerak,
+ * termasuk sesudah `returnPlan` ada di bawah.
+ *
+ * ┌──── KENAPA ALAMATNYA DITANYAKAN DI SINI, BUKAN NANTI ──────────────────────────────────────┐
+ * │ Sebelum `returnPlan` ada, DTO ini hanya menerima `note`. Artinya sistem bisa menyatakan     │
+ * │ sebuah kartu "ditarik" tanpa pernah tahu ke MANA ia dikirim, SIAPA yang menanggung          │
+ * │ ongkirnya, dan apakah ia benar-benar sampai. Momen paling murah untuk menanyakan alamat     │
+ * │ adalah momen orangnya sedang bicara dengan kita — yaitu SEKARANG, saat ia meminta.          │
+ * └────────────────────────────────────────────────────────────────────────────────────────────┘
+ *
+ * TETAP OPSIONAL, dan itu keputusan yang perlu dijelaskan: permintaan "saya mau kartu saya
+ * kembali" TIDAK BOLEH bisa gagal karena sebuah kode pos. Pemilik yang menekan tombolnya dari
+ * ponsel di jalan tetap harus bisa menyampaikan maksudnya; alamatnya menyusul lewat rute yang
+ * sama. Yang TIDAK opsional adalah alamat pada saat kartunya ditandai KELUAR — lihat
+ * `withdrawnReleaseClaimWhere()`, yang menolak melepas custody tanpa itu.
+ */
 export class WithdrawConsignmentDto {
   @ApiPropertyOptional()
   @IsOptional()
   @IsString()
   @MaxLength(1000)
   note?: string;
+
+  @ApiPropertyOptional({
+    type: ConsignmentReturnPlanDto,
+    description:
+      'Ke mana kartunya dikembalikan, dan siapa yang menanggung ongkirnya. OPSIONAL saat ' +
+      'meminta — tapi WAJIB sudah ada sebelum kartunya boleh ditandai keluar. Mengirimnya lagi ' +
+      'berarti MEMPERBARUI rencananya (alamat salah ketik, atau pemilik berubah pikiran antara ' +
+      '"kirim" dan "saya ambil sendiri"). TIDAK BERLAKU untuk titipan berstatus INTAKE: di sana ' +
+      'kartunya belum pernah berpindah tangan, jadi tidak ada yang perlu dikembalikan.',
+  })
+  @IsOptional()
+  @ValidateNested()
+  @Type(() => ConsignmentReturnPlanDto)
+  returnPlan?: ConsignmentReturnPlanDto;
+}
+
+/* ══════════════════════ KODE KLAIM & PENAUTAN PEMILIK ══════════════════════ */
+
+/**
+ * TUKARKAN KODE KLAIM. Rute PEMILIK KARTU (butuh login, cara masuk apa pun).
+ *
+ * `code` sengaja hanya divalidasi PANJANG KASARNYA di sini, dan longgar: normalisasi yang
+ * sesungguhnya (huruf besar, buang tanda hubung/spasi, O→0, I/L→1) ada di `normalizeClaimCode`,
+ * dan penolakan bentuk yang salah dijawab dengan objek error yang SAMA PERSIS dengan penolakan
+ * "kode tidak ditemukan". Kalau DTO ini menolak lebih ketat, pesan 400 dari class-validator akan
+ * membocorkan bentuk kode yang benar — persis hal yang dijaga rutenya untuk tidak dibocorkan.
+ */
+export class ClaimConsignmentDto {
+  @ApiProperty({
+    example: '4T9KM-2X7PQ',
+    description:
+      'Kode pada tanda terima serah-terima Anda. Huruf besar/kecil, spasi, dan tanda hubung ' +
+      'tidak berpengaruh. Berlaku sekali pakai.',
+  })
+  @IsString()
+  @MinLength(1)
+  @MaxLength(64)
+  code!: string;
+}
+
+/**
+ * TERBITKAN / TERBITKAN ULANG kode klaim. ADMIN-ONLY.
+ *
+ * `note` WAJIB dan tersimpan permanen: penerbitan ulang MEMATIKAN kode sebelumnya, jadi "kenapa"
+ * harus selalu punya jawaban tertulis ("kertas tanda terima hilang, dikonfirmasi lewat telepon
+ * ke nomor yang tercatat saat serah-terima").
+ */
+export class IssueClaimCodeDto {
+  @ApiProperty({
+    description:
+      'Alasan penerbitan / penerbitan ulang. DISIMPAN permanen sebagai baris audit.',
+    example:
+      'Tanda terima hilang; dikonfirmasi lewat telepon ke nomor saat serah-terima.',
+  })
+  @IsString()
+  @MinLength(NOTE_MIN)
+  @MaxLength(1000)
+  note!: string;
+}
+
+/**
+ * ADMIN MENAUTKAN akun pemilik ke titipan yang belum bertuan.
+ *
+ * HANYA `consignorId` — alasannya sama dengan `CreateConsignmentDto`: email tidak unik dan tidak
+ * pernah diverifikasi, jadi ia tidak boleh jadi kunci penautan. Id-nya datang dari
+ * GET /admin/consignments/consignor-search, yang mengembalikan DAFTAR dan memaksa memilih.
+ */
+export class LinkConsignorDto {
+  @ApiProperty({
+    description:
+      'User id pemilik kartu, DIPILIH operator dari hasil pencarian — bukan diketik dari ingatan.',
+  })
+  @IsString()
+  @MinLength(1)
+  @MaxLength(64)
+  consignorId!: string;
+
+  @ApiProperty({
+    description:
+      'BAGAIMANA identitasnya diperiksa. DISIMPAN permanen sebagai baris audit — ini yang ' +
+      'menjawab "dari mana kamu tahu ini orangnya" berbulan-bulan kemudian.',
+    example:
+      'Pemilik datang ke kantor membawa tanda terima bertanda tangan; wallet dicocokkan di layarnya.',
+  })
+  @IsString()
+  @MinLength(NOTE_MIN)
+  @MaxLength(1000)
+  note!: string;
 }

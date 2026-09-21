@@ -366,6 +366,8 @@ const payments = (world: World, opts: { ccEnabled?: boolean } = {}) =>
         );
       },
     } as any,
+    // ConsignmentNotifyService: jalur domestik tidak pernah menyentuh titipan.
+    {} as any,
   );
 
 const redemptions = (world: World) =>

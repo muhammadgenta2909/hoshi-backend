@@ -1,6 +1,7 @@
 import { Module } from '@nestjs/common';
 import { CollectorCryptModule } from '../collectorcrypt/collectorcrypt.module';
 import { BalanceModule } from '../balance/balance.module';
+import { ConsignmentModule } from '../consignment/consignment.module';
 import { EscrowModule } from '../escrow/escrow.module';
 import { IdrxClient } from './idrx.client';
 import { IdrxMockController } from './idrx-mock.controller';
@@ -31,8 +32,20 @@ import { PaymentsService } from './payments.service';
  * PaymentsReconcileScheduler WAJIB terdaftar di sini: callback IDRX tidak pernah di-retry, jadi
  * penyapu berkala inilah satu-satunya yang menyelamatkan order berbayar yang callbacknya hilang.
  */
+/*
+ * `ConsignmentModule` HANYA demi `ConsignmentNotifyService`: settlement titipan adalah satu-
+ * satunya tempat yang tahu kartu seseorang BARU SAJA terjual dan berapa persisnya yang masuk ke
+ * saldonya, jadi di sinilah email "kartumu terjual" harus lahir. TIDAK melingkar —
+ * ConsignmentModule hanya mengimpor BalanceModule dan MailModule, dan tidak satu pun dari
+ * keduanya menyentuh PaymentsModule.
+ */
 @Module({
-  imports: [CollectorCryptModule, BalanceModule, EscrowModule],
+  imports: [
+    CollectorCryptModule,
+    BalanceModule,
+    EscrowModule,
+    ConsignmentModule,
+  ],
   controllers: [PaymentsController, IdrxMockController],
   providers: [
     PaymentsService,

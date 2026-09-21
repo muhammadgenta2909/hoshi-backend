@@ -19,6 +19,7 @@ import {
 } from '../escrow/escrow.service';
 import { BalanceService } from '../balance/balance.service';
 import { CcShippingService } from '../collectorcrypt/cc-shipping.service';
+import { ConsignmentNotifyService } from '../consignment/consignment-notify.service';
 import type { CcMachineNormalized } from '../collectorcrypt/cc-gacha.types';
 import { PrismaService } from '../prisma/prisma.service';
 import { IdrxClient } from './idrx.client';
@@ -86,6 +87,16 @@ describe('PaymentsService', () => {
   let ccShipping: {
     assertEnabled: jest.Mock;
     estimateForRedemption: jest.Mock;
+  };
+  /**
+   * Notifikasi pemilik kartu titipan. Di-mock, bukan dimatikan: jalur settlement titipan MEMANG
+   * harus memberi tahu pemiliknya (halaman titipan menjanjikannya), dan test di bawah memeriksa
+   * bahwa pemberitahuan itu hanya lahir dari penjualan yang BENAR-BENAR commit.
+   */
+  let consignmentNotify: {
+    notifyListed: jest.Mock;
+    notifySold: jest.Mock;
+    notifyLost: jest.Mock;
   };
 
   const now = new Date('2026-07-14T00:00:00.000Z');
@@ -352,6 +363,12 @@ describe('PaymentsService', () => {
         .mockResolvedValue({ usd: 25, usdcBaseUnits: 25_000_000 }),
     };
 
+    consignmentNotify = {
+      notifyListed: jest.fn(),
+      notifySold: jest.fn(),
+      notifyLost: jest.fn(),
+    };
+
     const moduleRef = await Test.createTestingModule({
       providers: [
         PaymentsService,
@@ -363,6 +380,7 @@ describe('PaymentsService', () => {
         { provide: EscrowService, useValue: escrow },
         { provide: BalanceService, useValue: balance },
         { provide: CcShippingService, useValue: ccShipping },
+        { provide: ConsignmentNotifyService, useValue: consignmentNotify },
       ],
     }).compile();
 
@@ -1358,6 +1376,12 @@ describe('PaymentsService', () => {
       custodyReleasedAt: null as Date | null,
       commissionBps: 500,
       consignorId: consignedListing.sellerId,
+      // Untuk email "kartumu terjual". Kedua kolom snapshot serah-terima ikut dibaca supaya,
+      // ketika pemiliknya (Path B) belum punya email, yang tertulis di log adalah nama dan
+      // nomor telepon yang bisa dihubungi manusia — bukan sekadar "gagal kirim".
+      cardName: 'Charizard PSA 10',
+      consignorNameAtIntake: 'Budi',
+      consignorPhoneAtIntake: '+62811',
     };
 
     // base = floor(805.600 × 10000 / 10070) = 800.000; komisi 5% = 40.000; payout = 760.000.
@@ -1491,6 +1515,64 @@ describe('PaymentsService', () => {
           data: expect.objectContaining({ payoutIdrx: 0 }) as unknown,
         }),
       );
+    });
+
+    /**
+     * ╔════════════════════════════════════════════════════════════════════════════════════════╗
+     * ║ "hasilnya langsung masuk ke saldomu — kami akan memberitahumu" adalah JANJI TERTULIS.  ║
+     * ╚════════════════════════════════════════════════════════════════════════════════════════╝
+     *
+     * Kalimat itu ada di halaman titipan yang dibaca pemilik kartu sebelum ia menyerahkannya.
+     * Sampai jalur ini memanggil notifier, seseorang menyerahkan kartu senilai puluhan juta dan
+     * yang terjadi di sisinya SENYAP. Angkanya diambil dari variabel yang SAMA yang baru ditulis
+     * ke ledger — email dan buku besar tidak boleh bisa menyebut angka yang berbeda.
+     */
+    it('PEMILIK DIBERI TAHU saat kartunya terjual, dengan angka yang SAMA dengan yang masuk ledger', async () => {
+      prisma.paymentOrder.findUnique.mockResolvedValue(consignedOrder);
+      prisma.listing.findUnique.mockResolvedValue(consignedListing);
+      prisma.consignment.findUnique.mockResolvedValue(liveConsignment);
+
+      await service.handleCallback({ merchantOrderId: MERCHANT_ORDER_ID });
+
+      expect(consignmentNotify.notifySold).toHaveBeenCalledTimes(1);
+      const [target, amounts] = consignmentNotify.notifySold.mock.calls[0] as [
+        Record<string, unknown>,
+        Record<string, unknown>,
+      ];
+      expect(target).toMatchObject({
+        consignmentId: CONSIGNMENT_ID,
+        consignorId: consignedListing.sellerId,
+        cardName: 'Charizard PSA 10',
+        // Jalan keluar ketika pemiliknya belum punya email.
+        consignorNameAtIntake: 'Budi',
+        consignorPhoneAtIntake: '+62811',
+      });
+      expect(amounts).toEqual({
+        paidBaseIdr: PAID_BASE,
+        commissionIdr: COMMISSION,
+        payoutIdr: PAYOUT,
+        commissionBps: 500,
+      });
+    });
+
+    it('penjualan yang TIDAK jadi commit tidak pernah mengirim "kartumu terjual"', async () => {
+      // Email yang mengabarkan penjualan yang di-rollback lebih buruk daripada tidak ada email:
+      // pemiliknya akan mencari saldo yang tidak pernah ada. Panggilannya DI LUAR transaksi dan
+      // hanya terjangkau sesudah settlement terbukti commit — ini yang menjaganya tetap begitu.
+      prisma.paymentOrder.findUnique.mockResolvedValue(consignedOrder);
+      prisma.listing.findUnique.mockResolvedValue(consignedListing);
+      prisma.consignment.findUnique.mockResolvedValue({
+        ...liveConsignment,
+        status: 'RELEASED',
+        custodyReleasedAt: new Date('2026-07-13T00:00:00.000Z'),
+      });
+
+      const outcome = await service.handleCallback({
+        merchantOrderId: MERCHANT_ORDER_ID,
+      });
+
+      expect(outcome).toBe('REFUND_DUE');
+      expect(consignmentNotify.notifySold).not.toHaveBeenCalled();
     });
 
     it('KARTU SUDAH DITARIK PEMILIKNYA sebelum pembayaran mendarat → REFUND_DUE, refundSafe TRUE, NOL kredit', async () => {
@@ -3310,6 +3392,7 @@ describe('PaymentsService', () => {
             { provide: EscrowService, useValue: escrow },
             { provide: BalanceService, useValue: balance },
             { provide: CcShippingService, useValue: ccShipping },
+            { provide: ConsignmentNotifyService, useValue: consignmentNotify },
           ],
         }).compile();
         const revived = fresh.get(PaymentsService);

@@ -714,6 +714,102 @@ describe('AdminService.cancelAwaitingPayment (B1 — last-resort exit)', () => {
   });
 });
 
+/**
+ * ╔══════════════════════════════════════════════════════════════════════════════════════════════╗
+ * ║ B4 — RINGKASAN KEUANGAN: EMBER KEEMPAT, DAN SATU-SATUNYA YANG KOMISINYA MILIK HOSHI.        ║
+ * ╚══════════════════════════════════════════════════════════════════════════════════════════════╝
+ *
+ * Baris listing TITIPAN punya `sellerId != null` — HARUS, kalau tidak tidak ada siapa pun yang
+ * bisa dikredit. Jadi untuk setiap kueri yang bertanya "sellerId ada?", kartu titipan TAMPAK
+ * PERSIS SEPERTI listing P2P. Di jalur settlement, kekeliruan itu ditutup `listing-kind.ts`;
+ * ringkasan ini LEBIH TUA dari file itu dan masih menghitung setiap penjualan titipan sebagai
+ * P2P — sehingga komisi 5%, yaitu SELURUH model bisnis kustodi, tidak punya satu baris pun di
+ * layar mana pun.
+ */
+describe('AdminService.financeSummary — titipan punya embernya sendiri', () => {
+  const make = () => {
+    const prisma = {
+      listing: { aggregate: jest.fn() },
+      consignment: { aggregate: jest.fn() },
+      user: { findMany: jest.fn().mockResolvedValue([]) },
+      withdrawal: {
+        aggregate: jest.fn().mockResolvedValue({
+          _sum: { amountIdr: 0n },
+          _count: 0,
+        }),
+      },
+    };
+    // Tiga agregat listing berurutan: reseller, inventaris Hoshi, P2P.
+    prisma.listing.aggregate
+      .mockResolvedValueOnce({ _sum: { priceIdrx: 5_000_000 }, _count: 1 })
+      .mockResolvedValueOnce({ _sum: { priceIdrx: 3_000_000 }, _count: 1 })
+      .mockResolvedValueOnce({ _sum: { priceIdrx: 7_000_000 }, _count: 2 });
+    prisma.consignment.aggregate.mockResolvedValue({
+      _sum: { commissionIdrx: 1_200_000, payoutIdrx: 22_800_000 },
+      _count: 3,
+    });
+    const service = new AdminService(
+      prisma as unknown as PrismaService,
+      {} as unknown as JwtService,
+      {} as unknown as ConfigService,
+      {} as unknown as MarketplaceService,
+      {} as unknown as EscrowService,
+    );
+    return { service, prisma };
+  };
+
+  it('ember P2P MENGECUALIKAN baris titipan — kalau tidak, komisinya lenyap ke dalam P2P', async () => {
+    const { service, prisma } = make();
+
+    await service.financeSummary();
+
+    const p2pWhere = (
+      prisma.listing.aggregate.mock.calls[2] as [
+        { where: Record<string, unknown> },
+      ]
+    )[0].where;
+    expect(p2pWhere).toMatchObject({
+      sellerId: { not: null },
+      // Satu definisi, dari `nonConsignedListingWhere()`.
+      consignmentId: null,
+    });
+  });
+
+  it('komisi dibaca dari yang DICATAT settlement, bukan dihitung ulang dari harga listing', async () => {
+    // `commissionIdrx`/`payoutIdrx` ditulis di dalam transaksi settlement, dari `commissionBps`
+    // yang di-SNAPSHOT saat perjanjian ditandatangani dan dari harga yang pembeli BENAR-BENAR
+    // bayar. Menghitung ulang 5% dari `listing.priceIdrx` salah pada dua hal sekaligus: harga
+    // listing bisa diubah admin sesudah invoice terbit, dan bps-nya bisa berbeda per titipan.
+    const { service } = make();
+
+    const out = await service.financeSummary();
+
+    expect(out.consignment).toEqual({
+      count: 3,
+      commissionIdr: 1_200_000,
+      payoutIdr: 22_800_000,
+      grossIdr: 24_000_000,
+    });
+  });
+
+  it('predikatnya `commissionIdrx != null`, BUKAN `status: SOLD`', async () => {
+    // Titipan yang sudah terjual LALU DIKIRIM ke pembelinya berpindah ke RELEASED; yang ditandai
+    // hilang sesudah terjual berpindah ke LOST. Memfilter dengan `status: SOLD` akan
+    // MENJATUHKAN justru penjualan yang paling tuntas.
+    const { service, prisma } = make();
+
+    await service.financeSummary();
+
+    const where = (
+      prisma.consignment.aggregate.mock.calls[0] as [
+        { where: Record<string, unknown> },
+      ]
+    )[0].where;
+    expect(where).toEqual({ commissionIdrx: { not: null } });
+    expect(where).not.toHaveProperty('status');
+  });
+});
+
 /** Rute-nya dijaga AdminGuard yang sama dengan mutasi admin lain: non-admin ditolak 403. */
 describe('AdminGuard — the recovery route is admin-only', () => {
   const guard = new AdminGuard();

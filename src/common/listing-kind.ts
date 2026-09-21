@@ -1,3 +1,4 @@
+import type { Prisma } from '@prisma/client';
 import {
   isHoshiSellableStock,
   LISTING_SOURCE_COLLECTORCRYPT,
@@ -88,4 +89,33 @@ export function isConsignedListing(row: {
   consignmentId: string | null;
 }): boolean {
   return row.consignmentId != null;
+}
+
+/* ─────────────────── KEDUA SISI PERTANYAAN YANG SAMA, DALAM BENTUK SQL ─────────────────── */
+
+/**
+ * ╔══════════════════════════════════════════════════════════════════════════════════════════════╗
+ * ║ SETIAP AGREGAT YANG MENGHITUNG "PENJUALAN P2P" WAJIB MEMAKAI `nonConsignedListingWhere()`.  ║
+ * ╚══════════════════════════════════════════════════════════════════════════════════════════════╝
+ *
+ * Jebakan yang sama dengan yang dijelaskan di kepala file ini, tapi kali ini di jalur LAPORAN,
+ * bukan settlement: baris titipan punya `sellerId != null`, jadi `where: { sellerId: { not: null } }`
+ * — bentuk yang paling wajar untuk "listing milik user" — MENELAN SETIAP PENJUALAN TITIPAN dan
+ * melaporkannya sebagai P2P. Akibatnya bukan sekadar angka yang meleset: komisi 5%, yaitu SELURUH
+ * model bisnis titipan, tidak punya satu baris pun di layar mana pun, dan P2P tampak lebih besar
+ * dari yang sebenarnya dengan selisih yang persis sama.
+ *
+ * Kedua fungsi ini ada supaya pertanyaan itu punya SATU jawaban tertulis, sama seperti
+ * `listingKindOf` menjadi satu jawaban untuk jalur settlement. SENGAJA fungsi, bukan konstanta:
+ * objek literal yang di-spread ke beberapa query Prisma akan berbagi sub-objek yang SAMA, dan
+ * satu pemanggil yang memutasinya diam-diam mengubah filter pemanggil lain (alasan yang sama
+ * dengan `unescrowedUserListingWhere` dan `inCustodyWhere`).
+ */
+export function consignedListingWhere(): Prisma.ListingWhereInput {
+  return { consignmentId: { not: null } };
+}
+
+/** Kebalikannya: SEMUA baris listing yang BUKAN titipan. Lihat paragraf di atas. */
+export function nonConsignedListingWhere(): Prisma.ListingWhereInput {
+  return { consignmentId: null };
 }

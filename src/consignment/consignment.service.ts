@@ -7,6 +7,7 @@ import {
   Logger,
   NotFoundException,
 } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import {
   ActivityType,
   ConsignmentPhotoKind,
@@ -23,23 +24,56 @@ import {
 } from '../common/consignment.errors';
 import {
   CONSIGNMENT_COMPENSATION_REASON,
+  CONSIGNMENT_RETURN_METHOD,
+  CONSIGNMENT_RETURN_PAYER,
   CONSIGNMENT_SALE_REASON,
   acceptCustodyClaimWhere,
+  awaitingConsignorWhere,
+  claimCodeRedeemWhere,
+  isAwaitingConsignorClaim,
+  isConsignorLinked,
   isInHoshiCustody,
+  isPhysicallyHeldByHoshi,
+  isReturnAddressComplete,
+  isReturnPlanReady,
+  linkConsignorClaimWhere,
   listClaimWhere,
   liveConsignmentWhere,
+  missingReturnAddressFields,
+  requireLinkedConsignorId,
   takeDownClaimWhere,
+  withdrawnReleaseClaimWhere,
+  type ConsignmentReturnFacts,
 } from '../common/consignment.gate';
+import {
+  isIndonesianDestination,
+  resolveDomesticShippingIdr,
+  type DomesticShippingQuote,
+} from '../payments/domestic-shipping-rate';
+import {
+  CLAIM_CODE_TTL_DAYS,
+  claimCodeExpiryFrom,
+  formatClaimCode,
+  generateClaimCode,
+  hashClaimCode,
+  normalizeClaimCode,
+} from '../common/consignment-claim-code';
 import { shortWallet } from '../marketplace/marketplace.serialize';
 import { PrismaService } from '../prisma/prisma.service';
+import { ConsignmentNotifyService } from './consignment-notify.service';
 import type {
   AcceptCustodyDto,
   AddConsignmentPhotosDto,
+  ClaimConsignmentDto,
   CompensateConsignmentDto,
   ConsignmentPhotoInput,
+  ConsignmentReturnPlanDto,
   CorrectConsignmentDto,
+  CorrectConsignmentLabelDto,
   CreateConsignmentDto,
   CreateConsignmentListingDto,
+  IssueClaimCodeDto,
+  LinkConsignorDto,
   MarkConsignmentLostDto,
   ReleaseConsignmentDto,
   UpdateConsignmentPriceDto,
@@ -53,6 +87,106 @@ export { CONSIGNMENT_SALE_REASON, CONSIGNMENT_COMPENSATION_REASON };
 
 /** Berapa lama sebuah INTAKE boleh menganggur sebelum dashboard menandainya perlu tindakan. */
 const STALE_INTAKE_DAYS = 14;
+
+/** Satu kolom LABEL yang dikoreksi: apa, dari apa, jadi apa. Lihat `correctLabel`. */
+export interface LabelChange {
+  field:
+    | 'cardName'
+    | 'cardSet'
+    | 'cardNumber'
+    | 'certNumber'
+    | 'gradeLabel'
+    | 'gradeScore';
+  before: string | number | null;
+  after: string | number | null;
+}
+
+/**
+ * String kosong berarti KOSONGKAN kolomnya, bukan "simpan string kosong".
+ *
+ * Dibutuhkan karena koreksi yang benar kadang BERARTI menghapus: nomor sertifikat yang diketik
+ * untuk kartu yang ternyata mentah, atau `gradeLabel` yang diisi padahal kartunya belum di-grade.
+ * Tanpa ini, satu-satunya "perbaikan" adalah menuliskan nilai palsu lain.
+ */
+function blankToNull(v: string): string | null {
+  const t = v.trim();
+  return t.length === 0 ? null : t;
+}
+
+/** "cardName: \"Charizad VMAX\" → \"Charizard VMAX\"" — untuk baris audit dan log. */
+function describeChange(ch: LabelChange): string {
+  const fmt = (v: string | number | null) =>
+    v == null ? '(kosong)' : typeof v === 'number' ? String(v) : `"${v}"`;
+  return `${ch.field}: ${fmt(ch.before)} → ${fmt(ch.after)}`;
+}
+
+/**
+ * Berapa lama sebuah titipan boleh ada di rak TANPA pemilik tertaut sebelum dashboard
+ * menandainya. Lebih pendek dari `STALE_INTAKE_DAYS` DENGAN SENGAJA: intake yang menggantung
+ * berarti kartunya masih di tangan pemiliknya, sedangkan ini berarti kartunya ADA DI RAK KITA
+ * dan kita belum tahu siapa yang harus dibayar kalau ia terjual. Yang kedua jauh lebih mendesak.
+ */
+const UNLINKED_CUSTODY_DAYS = 7;
+
+/** Panjang minimal kata kunci pencarian pemilik. Lihat `searchConsignors`. */
+const CONSIGNOR_SEARCH_MIN_QUERY = 3;
+
+/** Jumlah kandidat maksimum yang ditampilkan sekaligus. Lihat `searchConsignors`. */
+const CONSIGNOR_SEARCH_LIMIT = 20;
+
+/* ───────────────────────── LANTAI HARGA YANG DISEPAKATI PEMILIK ───────────────────────── */
+
+/**
+ * ╔══════════════════════════════════════════════════════════════════════════════════════════════╗
+ * ║ `reservePriceIdr` — MEMPERINGATKAN, TIDAK PERNAH MENOLAK. Dan sebabnya penting.             ║
+ * ╚══════════════════════════════════════════════════════════════════════════════════════════════╝
+ *
+ * Kolom ini dicatat saat serah-terima sebagai "harga TERENDAH yang pemilik mau terima" — dan
+ * sampai sekarang TIDAK ADA satu baris kode pun yang membacanya. Angka yang diketik seseorang di
+ * teras rumah orang lain, lalu tidak pernah dipakai, lebih buruk daripada tidak ditanyakan: ia
+ * membuat pemiliknya percaya ada pagar yang sebenarnya tidak ada.
+ *
+ * TAPI IA TIDAK BOLEH JADI PENOLAKAN, dan itu keputusan produk, bukan kemalasan:
+ *   • pasar bergerak, dan menurunkan harga sering justru DIMINTA pemiliknya lewat telepon —
+ *     percakapan yang tidak dilihat sistem;
+ *   • `updatePrice` SUDAH menuntut alasan tertulis yang tersimpan permanen, jadi penurunannya
+ *     tidak pernah bisa terjadi diam-diam;
+ *   • operator yang diblokir sambil berdiri di depan pemiliknya tidak punya jalan keluar selain
+ *     mengubah angka reserve-nya — dan pagar yang bisa dilangkahi dengan mengubah pagarnya
+ *     sendiri bukan pagar, cuma gesekan yang mengajari orang mengabaikannya.
+ *
+ * Jadi: peringatan di respons rute (supaya layar bisa menanyakannya SEBELUM tombol ditekan),
+ * kalimat yang sama DISIMPAN di baris audit (supaya "kami tahu ini di bawah reserve dan tetap
+ * melakukannya" punya bukti tertulis), dan satu baris `actionRequired` selama listing-nya MASIH
+ * tayang di bawah lantai itu.
+ */
+function belowReserveWarning(
+  reservePriceIdr: number | null | undefined,
+  priceIdr: number,
+): string | null {
+  if (reservePriceIdr == null || priceIdr >= reservePriceIdr) return null;
+  return (
+    `DI BAWAH HARGA TERENDAH YANG DISEPAKATI: Rp ${priceIdr} < reserve Rp ${reservePriceIdr}. ` +
+    'Perubahan TETAP dilakukan — ini peringatan, bukan penolakan — tetapi angka reserve adalah ' +
+    'bagian dari perjanjian bertanda tangan, jadi pastikan pemiliknya memang menyetujuinya.'
+  );
+}
+
+/**
+ * LEWAT MANA pemilik tertaut ke catatan titipannya. Disimpan di `consignorLinkMethod`, dan itu
+ * bukan hiasan: kalau suatu hari ada sengketa tentang SIAPA pemilik sebuah kartu, jawabannya
+ * berbeda kekuatannya tergantung jalannya — akun yang dipilih operator dari daftar (`SEARCH`
+ * / `AT_INTAKE` / `ADMIN_LINK`) bersandar pada penilaian manusia saat itu, sedangkan
+ * `CLAIM_CODE` bersandar pada kertas yang berpindah tangan bersama kartunya.
+ */
+const CONSIGNOR_LINK_METHOD = {
+  /** Pemiliknya sudah punya akun dan dipilih operator saat serah-terima (Path A). */
+  AT_INTAKE: 'AT_INTAKE',
+  /** Pemiliknya menukarkan kode klaim di tanda terimanya (Path B). */
+  CLAIM_CODE: 'CLAIM_CODE',
+  /** Admin menautkan belakangan setelah memeriksa identitas secara langsung. */
+  ADMIN_LINK: 'ADMIN_LINK',
+} as const;
 
 /**
  * ╔══════════════════════════════════════════════════════════════════════════════════════════════╗
@@ -81,6 +215,15 @@ export class ConsignmentService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly balance: BalanceService,
+    // Pemberitahuan ke PEMILIK KARTU. Setiap method-nya `void` dan menelan errornya sendiri —
+    // email TIDAK PERNAH boleh menggagalkan jalur custody maupun jalur uang. Lihat
+    // `consignment-notify.service.ts`.
+    private readonly notify: ConsignmentNotifyService,
+    // HANYA untuk membaca `HOSHI_DOMESTIC_SHIPPING_FLAT_IDR` saat MENAKSIR ongkir balik —
+    // lapis 5 dari resolusi tarif yang sudah ada (`resolveDomesticShippingIdr`). Tidak ada
+    // keputusan lain di file ini yang bergantung pada env: gerbang custody membaca FAKTA
+    // TERSIMPAN, tidak pernah flag.
+    private readonly config: ConfigService,
   ) {}
 
   /* ══════════════════════════════════ 1. INTAKE ══════════════════════════════════ */
@@ -95,15 +238,40 @@ export class ConsignmentService {
    * formulir menyatakan dua hal yang berbeda kebenarannya.
    */
   async createIntake(dto: CreateConsignmentDto, admin: AuthUser) {
-    const consignor = await this.prisma.user.findUnique({
-      where: { id: dto.consignorId },
-      select: { id: true, walletAddress: true, displayName: true },
-    });
-    if (!consignor) {
-      throw new NotFoundException(
-        'Pemilik kartu (consignor) tidak ditemukan. Ia harus sudah punya akun Hoshi — ' +
-          'kalau tidak, tidak ada siapa pun yang bisa dikredit saat kartunya terjual.',
-      );
+    // ── SIAPA PEMILIKNYA: DUA JALAN, dan yang pertama sengaja dibuat yang paling mudah ───────
+    //
+    // PATH A — `consignorId` diberikan. Pemiliknya masuk akun SAAT serah-terima (momen terkuat
+    // yang ada untuk mengikat identitas: kedua orangnya berdiri di tempat yang sama). Operator
+    // menemukannya lewat `GET /admin/consignments/consignor-search`, yang MENGEMBALIKAN DAFTAR
+    // dan tidak pernah mencocokkan sendiri; yang menulis tautan tetap satu-satunya nilai yang
+    // tidak ambigu, yaitu id.
+    //
+    // PATH B — `consignorId` TIDAK diberikan. Pemiliknya belum punya akun, atau tidak mau membuat
+    // satu sambil berdiri di teras rumahnya. Baris ini lahir TANPA pemilik, dan tanda terima yang
+    // ia bawa pulang memuat KODE KLAIM sekali pakai. Kartunya tetap tercatat, tetap dipotret,
+    // tetap bisa diminta kembali — hanya saja ia TIDAK BISA DIPAJANG sampai pemiliknya tertaut.
+    //
+    // YANG TIDAK PERNAH DITERIMA RUTE INI: email. `User.email` tidak unik dan tidak pernah
+    // diverifikasi, jadi menautkan kartu senilai puluhan juta ke siapa pun yang MENGAKU memiliki
+    // sebuah alamat adalah kelas bug terburuk yang bisa dipunyai fitur ini. Tidak ada field
+    // "consignorEmail" di DTO, dan tidak boleh ditambahkan.
+    let consignor: {
+      id: string;
+      walletAddress: string;
+      displayName: string | null;
+    } | null = null;
+    if (dto.consignorId) {
+      consignor = await this.prisma.user.findUnique({
+        where: { id: dto.consignorId },
+        select: { id: true, walletAddress: true, displayName: true },
+      });
+      if (!consignor) {
+        throw new NotFoundException(
+          'Akun pemilik kartu (consignorId) tidak ditemukan. Kalau pemiliknya memang belum punya ' +
+            'akun Hoshi, JANGAN mengarang id: catat titipannya TANPA consignorId, dan tanda ' +
+            'terimanya akan memuat kode klaim yang bisa ia tukarkan nanti.',
+        );
+      }
     }
 
     // ANTI-DOBEL-TITIP untuk slab bernomor sertifikat. Dicek di sini supaya pesannya bisa
@@ -134,10 +302,29 @@ export class ConsignmentService {
       }
     }
 
+    // Kode klaim HANYA untuk Path B, dan diterbitkan OTOMATIS — bukan sebagai pilihan operator.
+    // Titipan tanpa pemilik DAN tanpa kode adalah baris yang tidak punya jalan pulang sama sekali:
+    // satu-satunya cara pemiliknya bisa mengambil alih catatannya adalah lewat admin, dan itu
+    // berarti bergantung pada ingatan seseorang. Teks kodenya hidup HANYA di variabel ini dan di
+    // body respons; yang masuk database hanya hash-nya.
+    const now = new Date();
+    const claimCode = consignor ? null : generateClaimCode();
+    const claimCodeHash = claimCode ? hashClaimCode(claimCode) : null;
+
     const row = await this.prisma.$transaction(async (tx) => {
       const created = await tx.consignment.create({
         data: {
-          consignorId: consignor.id,
+          consignorId: consignor?.id ?? null,
+          ...(consignor
+            ? {
+                consignorLinkedAt: now,
+                consignorLinkMethod: CONSIGNOR_LINK_METHOD.AT_INTAKE,
+              }
+            : {
+                claimCodeHash,
+                claimCodeIssuedAt: now,
+                claimCodeExpiresAt: claimCodeExpiryFrom(now),
+              }),
           consignorNameAtIntake: dto.consignorNameAtIntake.trim(),
           consignorPhoneAtIntake: dto.consignorPhoneAtIntake.trim(),
           consignorIdKind: dto.consignorIdKind ?? null,
@@ -172,17 +359,463 @@ export class ConsignmentService {
         kind: 'INTAKE',
         toStatus: ConsignmentStatus.INTAKE,
         actor: admin,
-        note: `Kesepakatan dicatat di ${created.receivedAtPlace}. Kartu BELUM diterima.`,
+        // Baris audit menyebut KEBERADAAN kode, tidak pernah kodenya. Jejak audit adalah tempat
+        // paling sering dibaca ulang di fitur ini; rahasia tidak ditaruh di sana.
+        note:
+          `Kesepakatan dicatat di ${created.receivedAtPlace}. Kartu BELUM diterima. ` +
+          (consignor
+            ? `Pemilik tertaut ke akun ${consignor.id} sejak serah-terima.`
+            : 'Pemilik BELUM punya akun Hoshi; kode klaim diterbitkan di tanda terima (berlaku ' +
+              `${CLAIM_CODE_TTL_DAYS} hari). Kartu ini TIDAK BISA dipajang sampai kodenya ` +
+              'ditukarkan.'),
       });
       return created;
     });
 
     this.logger.log(
       `Titipan ${row.id} dicatat (INTAKE) oleh admin ${admin.id}: "${row.cardName}" milik ` +
-        `${consignor.id}, ask Rp ${row.askPriceIdr}, komisi ${row.commissionBps} bps. ` +
+        `${consignor ? consignor.id : `"${row.consignorNameAtIntake}" (BELUM tertaut akun)`}, ` +
+        `ask Rp ${row.askPriceIdr}, komisi ${row.commissionBps} bps. ` +
         'Belum boleh dipajang — custody belum diterima.',
     );
-    return this.byId(row.id);
+
+    // TEKS KODENYA DIKEMBALIKAN TEPAT SEKALI, DI SINI. Tidak ada rute yang bisa membacanya lagi
+    // dan tidak ada log yang memuatnya. Kalau kertasnya hilang, jalannya adalah PENERBITAN ULANG
+    // (POST /admin/consignments/:id/claim-code) — yang mematikan kode lama.
+    return {
+      ...(await this.byId(row.id)),
+      ...(claimCode
+        ? {
+            claimCode: formatClaimCode(claimCode),
+            claimCodeExpiresInDays: CLAIM_CODE_TTL_DAYS,
+            claimCodeNote:
+              'CETAK KODE INI DI TANDA TERIMA DAN SERAHKAN BERSAMA KARTUNYA. Kode ditampilkan ' +
+              'SEKALI dan tidak bisa dilihat lagi; kalau hilang, terbitkan ulang.',
+          }
+        : {}),
+    };
+  }
+
+  /* ═══════════════════ 1b. MENEMUKAN PEMILIKNYA (PATH A) ═══════════════════ */
+
+  /**
+   * ╔════════════════════════════════════════════════════════════════════════════════════════╗
+   * ║ PENCARIAN PEMILIK — MENGEMBALIKAN DAFTAR, TIDAK PERNAH MENCOCOKKAN.                    ║
+   * ╚════════════════════════════════════════════════════════════════════════════════════════╝
+   *
+   * Operator berdiri di rumah orang, dan yang ia punya hanya apa yang bisa dilihat di layar
+   * ponsel pemilik kartunya: nama tampilan, alamat wallet, kadang email. Ia TIDAK punya id
+   * database, dan tidak ada yang bisa mengetiknya di sana.
+   *
+   * KENAPA RUTE INI TIDAK PERNAH MENJAWAB "ini orangnya". Di schema ini hanya `walletAddress`
+   * yang `@unique`. `displayName` boleh sama persis untuk sepuluh orang, dan `email` BUKAN HANYA
+   * tidak unik — ia TIDAK PERNAH DIVERIFIKASI: siapa pun bisa mengetik alamat orang lain di
+   * setelan profilnya sendiri. Jadi kecocokan atas kedua kolom itu adalah PETUNJUK, bukan
+   * identitas. Rute yang memilihkan satu dari beberapa kandidat akan, cepat atau lambat,
+   * menautkan kartu senilai puluhan juta Rupiah ke orang yang salah — dan akan melakukannya
+   * diam-diam.
+   *
+   * MAKA BENTUK KONTRAKNYA:
+   *   - hasilnya SELALU array, bahkan ketika panjangnya satu;
+   *   - `ambiguous` true jika kandidatnya lebih dari satu, dan frontend WAJIB memaksa memilih;
+   *   - `exactWalletMatch` menandai kandidat yang cocok PERSIS pada satu-satunya kolom unik,
+   *     supaya operator tahu mana yang identitas dan mana yang cuma kemiripan;
+   *   - `matchedOn` menyebut KOLOM MANA yang cocok, supaya "cocok karena emailnya" tidak pernah
+   *     terbaca sebagai "terbukti orangnya";
+   *   - `truncated` true berarti ada kandidat yang TIDAK ditampilkan; operator harus mempersempit
+   *     dan tidak boleh memilih dari daftar yang ia tahu tidak lengkap.
+   *
+   * Rute ini TIDAK MENULIS APA PUN. Penautan terjadi di `createIntake` dan `linkConsignor`, dan
+   * keduanya hanya menerima `consignorId` — satu-satunya nilai yang tidak ambigu.
+   */
+  async searchConsignors(rawQuery: string) {
+    const q = (rawQuery ?? '').trim();
+    // Ambang minimum: di bawah itu setiap kueri mengembalikan separuh tabel user, dan daftar yang
+    // terlalu panjang untuk dibaca adalah daftar yang akan dipilih asal-asalan.
+    if (q.length < CONSIGNOR_SEARCH_MIN_QUERY) {
+      throw new BadRequestException(
+        `Kata kunci pencarian minimal ${CONSIGNOR_SEARCH_MIN_QUERY} karakter. Pakai alamat ` +
+          'wallet (satu-satunya yang unik), nama tampilan, atau email — lalu PILIH orangnya ' +
+          'sendiri dari daftar.',
+      );
+    }
+
+    const where = {
+      OR: [
+        { walletAddress: { contains: q, mode: 'insensitive' as const } },
+        { displayName: { contains: q, mode: 'insensitive' as const } },
+        { email: { contains: q, mode: 'insensitive' as const } },
+      ],
+    };
+    const [rows, total] = await Promise.all([
+      this.prisma.user.findMany({
+        where,
+        take: CONSIGNOR_SEARCH_LIMIT,
+        orderBy: { createdAt: 'asc' },
+        select: {
+          id: true,
+          walletAddress: true,
+          displayName: true,
+          email: true,
+          createdAt: true,
+          _count: { select: { consignmentsConsigned: true } },
+        },
+      }),
+      this.prisma.user.count({ where }),
+    ]);
+
+    const qLower = q.toLowerCase();
+    const matches = rows.map((u) => ({
+      id: u.id,
+      // Alamat wallet UTUH, bukan bentuk pendek: operator sedang MEMBANDINGKAN dengan layar orang
+      // lain, dan `Abc1...Xyz9` membuat dua alamat yang berbeda tampak sama persis.
+      walletAddress: u.walletAddress,
+      displayName: u.displayName,
+      email: u.email,
+      createdAt: u.createdAt,
+      consignmentCount: u._count.consignmentsConsigned,
+      /** Cocok PERSIS pada satu-satunya kolom unik. Ini identitas; sisanya kemiripan. */
+      exactWalletMatch: u.walletAddress.toLowerCase() === qLower,
+      matchedOn: [
+        u.walletAddress.toLowerCase().includes(qLower) ? 'walletAddress' : null,
+        u.displayName?.toLowerCase().includes(qLower) ? 'displayName' : null,
+        u.email?.toLowerCase().includes(qLower) ? 'email' : null,
+      ].filter((v): v is string => v != null),
+    }));
+
+    return {
+      query: q,
+      total,
+      /** true berarti ada kandidat yang tidak ditampilkan — persempit dulu, jangan pilih. */
+      truncated: total > matches.length,
+      /** >1 kandidat berarti operator WAJIB memilih. Tidak ada auto-pilih di sisi mana pun. */
+      ambiguous: total > 1,
+      matches,
+      /**
+       * Dibaca apa adanya oleh UI. Sengaja MENYEBUTKAN bahwa email tidak diverifikasi: operator
+       * yang tidak tahu itu akan memperlakukan kecocokan email sebagai bukti.
+       */
+      advice:
+        'Hanya alamat wallet yang unik di Hoshi. Nama tampilan bisa sama persis untuk beberapa ' +
+        'orang, dan email TIDAK PERNAH diverifikasi — siapa pun bisa mengetik alamat orang lain ' +
+        'di setelan profilnya. Cocokkan alamat wallet di layar pemilik kartunya sebelum memilih. ' +
+        'Kalau ragu, JANGAN menebak: catat titipannya tanpa consignorId dan serahkan kode klaim ' +
+        'bersama kartunya.',
+    };
+  }
+
+  /* ═══════════════ 1c. KODE KLAIM & PENAUTAN PEMILIK (PATH B) ═══════════════ */
+
+  /**
+   * ╔════════════════════════════════════════════════════════════════════════════════════════╗
+   * ║ SATU PENOLAKAN UNTUK SEMUA SEBAB. Rute penukaran TIDAK BOLEH jadi oracle.              ║
+   * ╚════════════════════════════════════════════════════════════════════════════════════════╝
+   *
+   * Bentuk kode salah, kode tidak ada, kode kedaluwarsa, kode sudah dipakai, kode sudah
+   * diterbitkan ulang, titipannya CANCELLED — SEMUANYA menghasilkan objek yang SAMA PERSIS.
+   *
+   * Kalau "tidak ditemukan" dan "kedaluwarsa" dibedakan, penebak mendapat konfirmasi bahwa
+   * tebakannya MENGENAI SESUATU — dan itulah satu-satunya hal yang membuat menebak ada gunanya.
+   * Kalau "sudah dipakai" dibedakan, penebak bisa memetakan kode mana yang pernah hidup.
+   *
+   * 404 (bukan 400/409) supaya jawabannya juga tidak membedakan "bentuknya salah" dari "tidak
+   * ada": dua-duanya berarti tidak ada apa pun untuk dibuka.
+   */
+  private claimCodeInvalid() {
+    return consignmentError({
+      status: HttpStatus.NOT_FOUND,
+      code: CONSIGNMENT_ERROR_CODE.CLAIM_CODE_INVALID,
+      message:
+        'Kode klaim ini tidak berlaku. Periksa lagi kode pada tanda terima Anda (huruf besar/' +
+        'kecil dan tanda hubung tidak berpengaruh). Kode hanya bisa dipakai SEKALI dan berlaku ' +
+        `${CLAIM_CODE_TTL_DAYS} hari sejak diterbitkan — kalau sudah lewat atau kertasnya ` +
+        'hilang, hubungi Hoshi untuk penerbitan ulang.',
+    });
+  }
+
+  /**
+   * ╔════════════════════════════════════════════════════════════════════════════════════════╗
+   * ║ TUKARKAN KODE KLAIM. Rute PEMILIK KARTU — inilah Path B yang menutup lingkarannya.     ║
+   * ╚════════════════════════════════════════════════════════════════════════════════════════╝
+   *
+   * Yang membuat kode ini sah sebagai bukti kepemilikan BUKAN kerahasiaan saluran — tidak ada
+   * saluran, ia dicetak di kertas. Yang membuatnya sah adalah SERAH-TERIMA FISIK yang sudah
+   * terjadi: kode itu berpindah tangan pada detik yang sama dengan kartunya, di tanda terima
+   * bertanda tangan yang sudah difoto. Siapa pun yang memegangnya ADALAH orang yang menyerahkan
+   * kartunya.
+   *
+   * PENAUTANNYA KLAIM ATOMIK, dan bentuk itu melakukan pekerjaan nyata di sini: predikatnya
+   * menyebut `consignorId: null`, jadi dua penukaran serentak tidak mungkin dua-duanya menang,
+   * dan titipan yang SUDAH punya pemilik tidak bisa direbut oleh siapa pun. `count !== 1` bukan
+   * error melainkan JAWABAN — dan jawabannya sama dengan semua penolakan lain (lihat
+   * `claimCodeInvalid`).
+   *
+   * Penukaran yang berhasil MENGOSONGKAN `claimCodeHash` di transaksi yang sama: sesudah itu kode
+   * tersebut tidak cocok dengan apa pun di tabel. "Sekali pakai" jadi bentuk baris, bukan janji.
+   *
+   * REM LEDAKAN ada di controller (`@Throttle` 5/menit/IP). Yang sebenarnya membuat menebak sia-sia
+   * adalah 50 bit entropi kodenya — lihat `consignment-claim-code.ts`.
+   */
+  async claimByCode(dto: ClaimConsignmentDto, user: AuthUser) {
+    const normalized = normalizeClaimCode(dto.code);
+    // Bentuk yang mustahil dijawab PERSIS SAMA dengan kode yang tidak ada. Tidak ada jalan untuk
+    // menyimpulkan "panjangnya benar tapi kodenya salah".
+    if (!normalized) throw this.claimCodeInvalid();
+
+    const hash = hashClaimCode(normalized);
+    const now = new Date();
+
+    const claimedId = await this.prisma.$transaction(async (tx) => {
+      // `claimCodeHash` @unique → satu index lookup, dan satu kode tidak pernah bisa menunjuk dua
+      // titipan. Pembacaan ini HANYA untuk mendapatkan id demi baris audit; gerbangnya ada di
+      // `updateMany` di bawah, yang predikatnya tetap menyebut hash-nya.
+      const found = await tx.consignment.findUnique({
+        where: { claimCodeHash: hash },
+        select: { id: true, cardName: true },
+      });
+      if (!found) return null;
+
+      const claimed = await tx.consignment.updateMany({
+        where: claimCodeRedeemWhere(hash, now),
+        data: {
+          consignorId: user.id,
+          consignorLinkedAt: now,
+          consignorLinkMethod: CONSIGNOR_LINK_METHOD.CLAIM_CODE,
+          // SEKALI PAKAI, sebagai bentuk baris. Kedua kolom dikosongkan bersama-sama supaya tidak
+          // ada baris yang punya tanggal kedaluwarsa untuk kode yang sudah tidak ada.
+          claimCodeHash: null,
+          claimCodeExpiresAt: null,
+        },
+      });
+      // Kalah balapan, kedaluwarsa, sudah bertuan, atau CANCELLED — satu jawaban untuk semuanya.
+      if (claimed.count !== 1) return null;
+
+      await this.writeEvent(tx, {
+        consignmentId: found.id,
+        kind: 'CLAIM_CODE_REDEEMED',
+        actor: user,
+        // TIDAK PERNAH memuat kodenya. Baris audit adalah tempat yang paling sering dibaca ulang.
+        note:
+          `Kode klaim ditukarkan. Titipan ini sekarang tertaut ke akun ${user.id}. Mulai saat ` +
+          'ini pemiliknya bisa melihat bukti serah-terimanya sendiri, meminta kartunya kembali, ' +
+          'dan menerima hasil penjualannya.',
+      });
+      return found.id;
+    });
+
+    if (!claimedId) throw this.claimCodeInvalid();
+
+    this.logger.warn(
+      `Titipan ${claimedId} DITAUTKAN ke akun ${user.id} lewat kode klaim. Sejak sekarang ia ` +
+        'boleh dipajang (kalau custody-nya sudah tercatat) dan hasil penjualannya punya tujuan.',
+    );
+    return this.byId(claimedId);
+  }
+
+  /**
+   * TERBITKAN / TERBITKAN ULANG kode klaim. ADMIN-ONLY.
+   *
+   * JAWABAN UNTUK "KERTASNYA HILANG". Kode klaim tidak bisa dibaca kembali oleh siapa pun —
+   * database hanya menyimpan hash-nya — jadi satu-satunya pemulihan adalah menerbitkan yang BARU.
+   * Penerbitan ulang MENIMPA hash yang lama dalam satu tulisan, jadi kertas lama langsung mati;
+   * tidak pernah ada dua kode hidup untuk satu titipan.
+   *
+   * KENAPA ADMIN, dan kenapa itu BUKAN kelemahan: yang bisa menerbitkan ulang adalah orang yang
+   * memegang kartunya. Ia sudah bisa mengembalikan kartu itu ke siapa pun secara fisik; menerbitkan
+   * secarik kertas baru tidak menambah kuasa apa pun yang belum ia punya. Yang ditambahkan adalah
+   * JEJAKNYA: `note` WAJIB (min 10 karakter) dan tersimpan permanen sebagai baris audit, jadi
+   * "kenapa kode ini diterbitkan ulang" selalu punya jawaban tertulis.
+   *
+   * DITOLAK kalau titipannya SUDAH punya pemilik: tidak ada yang perlu diklaim, dan menerbitkan
+   * kode untuk kartu yang sudah bertuan hanya menciptakan kunci yang tidak membuka apa pun.
+   */
+  async issueClaimCode(id: string, dto: IssueClaimCodeDto, admin: AuthUser) {
+    const c = await this.requireConsignment(id);
+    if (isConsignorLinked(c)) {
+      throw consignmentError({
+        status: HttpStatus.CONFLICT,
+        code: CONSIGNMENT_ERROR_CODE.BAD_TRANSITION,
+        message:
+          `Titipan ini sudah tertaut ke akun ${c.consignorId} — tidak ada yang perlu diklaim, ` +
+          'jadi tidak ada kode yang diterbitkan. Kalau tautannya SALAH ORANG, itu bukan ' +
+          'persoalan kode klaim: hentikan dulu (tarik listing-nya) dan selesaikan sebagai ' +
+          'koreksi yang tercatat.',
+        consignmentId: id,
+      });
+    }
+    if (c.status === ConsignmentStatus.CANCELLED) {
+      throw consignmentError({
+        status: HttpStatus.CONFLICT,
+        code: CONSIGNMENT_ERROR_CODE.BAD_TRANSITION,
+        message:
+          'Kesepakatan ini sudah dibatalkan sebelum serah-terima; tidak ada kartu yang dipegang ' +
+          'Hoshi dan tidak ada yang bisa diklaim.',
+        consignmentId: id,
+      });
+    }
+
+    // Tabrakan hash secara praktis mustahil (2^50 ruang per kode; @unique `claimCodeHash` adalah
+    // penjaganya, dan P2002 terpetakan ke 409 oleh PrismaExceptionFilter). Tidak ada pra-cek di
+    // sini dengan sengaja: pra-cek baca-lalu-tulis tetap bisa kalah balapan, jadi ia hanya akan
+    // menjadi teater di depan index yang memang sudah menjamin.
+    const code = generateClaimCode();
+    const now = new Date();
+    const expiresAt = claimCodeExpiryFrom(now);
+    const reissue = c.claimCodeHash != null;
+
+    await this.prisma.$transaction(async (tx) => {
+      const claimed = await tx.consignment.updateMany({
+        // Predikat yang SAMA dengan penautan: kalau pemiliknya tertaut barusan, klaim ini cocok
+        // 0 baris dan tidak ada kode yang lahir untuk kartu yang sudah bertuan.
+        where: linkConsignorClaimWhere(id),
+        data: {
+          claimCodeHash: hashClaimCode(code),
+          claimCodeIssuedAt: now,
+          claimCodeExpiresAt: expiresAt,
+        },
+      });
+      if (claimed.count !== 1) {
+        // Klaimnya membawa DUA syarat (`linkConsignorClaimWhere`), jadi kekalahannya punya dua
+        // sebab dan operator berhak tahu keduanya: pemiliknya baru saja tertaut, ATAU
+        // kesepakatannya baru saja dibatalkan. Yang kedua justru yang paling penting disebut —
+        // kode untuk kesepakatan yang batal TIDAK AKAN PERNAH bisa ditukarkan, dan tanpa syarat
+        // di dalam klaim, kertas itu sudah terlanjur dicetak dan diserahkan.
+        throw consignmentError({
+          status: HttpStatus.CONFLICT,
+          code: CONSIGNMENT_ERROR_CODE.BAD_TRANSITION,
+          message:
+            'Keadaan titipan ini berubah barusan — pemiliknya baru saja tertaut ke sebuah akun, ' +
+            'atau kesepakatannya baru saja DIBATALKAN. Tidak ada kode yang diterbitkan, dan itu ' +
+            'memang yang benar: kode untuk kesepakatan yang batal tidak akan pernah bisa ' +
+            'ditukarkan. Muat ulang barisnya dan lihat statusnya sekarang.',
+          consignmentId: id,
+        });
+      }
+      await this.writeEvent(tx, {
+        consignmentId: id,
+        kind: 'CLAIM_CODE_ISSUED',
+        actor: admin,
+        note:
+          (reissue
+            ? 'Kode klaim DITERBITKAN ULANG; kode sebelumnya MATI sejak detik ini. '
+            : 'Kode klaim diterbitkan. ') +
+          `Berlaku ${CLAIM_CODE_TTL_DAYS} hari. ${dto.note.trim()}`,
+      });
+    });
+
+    this.logger.warn(
+      `Kode klaim ${reissue ? 'DITERBITKAN ULANG' : 'diterbitkan'} untuk titipan ${id} ` +
+        `("${c.cardName}") oleh admin ${admin.id}. Kode lama (kalau ada) sudah mati.`,
+    );
+
+    // Sekali lagi: teks kodenya ada TEPAT SEKALI, di sini.
+    return {
+      ...(await this.byId(id)),
+      claimCode: formatClaimCode(code),
+      claimCodeExpiresAt: expiresAt,
+      claimCodeExpiresInDays: CLAIM_CODE_TTL_DAYS,
+      reissued: reissue,
+      claimCodeNote:
+        'CETAK ULANG TANDA TERIMANYA DAN SERAHKAN KODE INI KE PEMILIK KARTU. Kode ditampilkan ' +
+        'SEKALI; kode sebelumnya (kalau ada) sudah tidak berlaku.',
+    };
+  }
+
+  /**
+   * ADMIN MENAUTKAN AKUN PEMILIK ke titipan yang belum bertuan — Path A yang datang terlambat:
+   * pemiliknya membuat akun di tempat, atau datang lagi ke kantor dan identitasnya diperiksa
+   * langsung, atau kertasnya hilang dan ia lebih cepat ditolong begini daripada menunggu kode.
+   *
+   * `consignorId` SAJA yang diterima, dan itu disengaja. Tidak ada `consignorEmail`, tidak ada
+   * `consignorName` — `User.email` tidak unik dan TIDAK PERNAH diverifikasi, jadi menerimanya di
+   * sini berarti membiarkan kartu orang ditautkan ke siapa pun yang MENGAKU memiliki sebuah
+   * alamat. Id-nya datang dari `GET /admin/consignments/consignor-search`, yang mengembalikan
+   * DAFTAR dan memaksa operator memilih sendiri.
+   *
+   * `note` WAJIB: ia menjawab "bagaimana kamu tahu ini orangnya" secara tertulis dan permanen.
+   */
+  async linkConsignor(id: string, dto: LinkConsignorDto, admin: AuthUser) {
+    const c = await this.requireConsignment(id);
+    if (isConsignorLinked(c)) {
+      // Admin BOLEH tahu bahwa baris ini sudah bertuan dan siapa — ia sudah memegang kartunya,
+      // dan menyembunyikannya hanya akan membuat ia mencoba lagi. (Bandingkan rute penukaran
+      // kode, yang menghadap publik dan karena itu tidak membedakan sebab apa pun.)
+      throw consignmentError({
+        status: HttpStatus.CONFLICT,
+        code: CONSIGNMENT_ERROR_CODE.BAD_TRANSITION,
+        message:
+          `Titipan ini sudah tertaut ke akun ${c.consignorId}. Penautan TIDAK PERNAH menimpa ` +
+          'pemilik yang sudah ada — kartu orang lain tidak boleh berpindah tangan karena satu ' +
+          'panggilan yang salah ketik. Kalau tautannya memang salah, selesaikan sebagai koreksi ' +
+          'yang tercatat, bukan dengan menimpanya diam-diam.',
+        consignmentId: id,
+      });
+    }
+    if (c.status === ConsignmentStatus.CANCELLED) {
+      throw consignmentError({
+        status: HttpStatus.CONFLICT,
+        code: CONSIGNMENT_ERROR_CODE.BAD_TRANSITION,
+        message:
+          'Kesepakatan ini sudah dibatalkan sebelum serah-terima; tidak ada yang bisa ditautkan.',
+        consignmentId: id,
+      });
+    }
+
+    const target = await this.prisma.user.findUnique({
+      where: { id: dto.consignorId },
+      select: { id: true, walletAddress: true, displayName: true },
+    });
+    if (!target) {
+      throw new NotFoundException(
+        'Akun yang dituju tidak ditemukan. Cari dulu lewat ' +
+          'GET /admin/consignments/consignor-search dan PILIH orangnya dari daftar — jangan ' +
+          'mengetikkan id dari ingatan.',
+      );
+    }
+
+    const now = new Date();
+    await this.prisma.$transaction(async (tx) => {
+      const claimed = await tx.consignment.updateMany({
+        where: linkConsignorClaimWhere(id),
+        data: {
+          consignorId: target.id,
+          consignorLinkedAt: now,
+          consignorLinkMethod: CONSIGNOR_LINK_METHOD.ADMIN_LINK,
+          // Kode klaim yang masih beredar ikut MATI: kartunya sudah bertuan, jadi kertas di saku
+          // siapa pun tidak boleh lagi menunjuk ke baris ini.
+          claimCodeHash: null,
+          claimCodeExpiresAt: null,
+        },
+      });
+      if (claimed.count !== 1) {
+        // Dua sebab, dua-duanya berarti TIDAK ADA yang ditulis: pemiliknya baru saja tertaut
+        // (mungkin ia menukarkan kode klaimnya pada detik yang sama), atau kesepakatannya baru
+        // saja dibatalkan — dan menautkan pemilik ke kesepakatan yang batal tidak berarti apa pun.
+        throw consignmentError({
+          status: HttpStatus.CONFLICT,
+          code: CONSIGNMENT_ERROR_CODE.BAD_TRANSITION,
+          message:
+            'Keadaan titipan ini berubah barusan — pemiliknya baru saja tertaut ke sebuah akun ' +
+            '(mungkin ia menukarkan kode klaimnya pada detik yang sama), atau kesepakatannya ' +
+            'baru saja DIBATALKAN. Tidak ada yang ditimpa dan tidak ada yang ditautkan.',
+          consignmentId: id,
+        });
+      }
+      await this.writeEvent(tx, {
+        consignmentId: id,
+        kind: 'CONSIGNOR_LINKED',
+        actor: admin,
+        note:
+          `Pemilik ditautkan ke akun ${target.id} (${shortWallet(target.walletAddress)}) oleh ` +
+          `admin. Snapshot saat serah-terima: "${c.consignorNameAtIntake}". Kode klaim yang ` +
+          `masih beredar dimatikan. Dasar verifikasi: ${dto.note.trim()}`,
+      });
+    });
+
+    this.logger.warn(
+      `Titipan ${id} ("${c.cardName}") DITAUTKAN ke akun ${target.id} oleh admin ${admin.id}.`,
+    );
+    return this.byId(id);
   }
 
   /* ═══════════════════════════ 2. TERIMA CUSTODY (INVARIAN) ══════════════════════ */
@@ -215,25 +848,61 @@ export class ConsignmentService {
     // tidak bisa dimenangkan oleh SIAPA PUN — termasuk oleh pemiliknya. Foto depan/belakang
     // (plus foto sertifikat kalau slab bernomor) adalah bukti yang HOSHI SENDIRI ciptakan dan
     // tidak bisa diam-diam direvisi: baris foto append-only, tidak ada endpoint update.
+    //
+    // ┌──── KENAPA `HANDOVER` IKUT WAJIB, DAN KENAPA IA BUKAN SEKADAR FOTO KEEMPAT ───────────┐
+    // │ FRONT/BACK/CERT membuktikan KEADAAN BARANGNYA. Tidak satu pun dari ketiganya           │
+    // │ membuktikan ADA KESEPAKATAN — dan justru itu yang dipersoalkan kalau pemiliknya        │
+    // │ ternyata sudah menjual kartu yang sama ke orang lain, atau kalau ia belakangan berkata │
+    // │ tidak pernah menyetujui harga yang tertulis di layar kami. Foto slab yang bagus tidak  │
+    // │ menjawab apa pun tentang itu; yang menjawabnya cuma selembar kertas bertanda tangan    │
+    // │ DUA PIHAK, yang salinannya ADA DI TANGAN PEMILIKNYA (lihat                             │
+    // │ `components/admin/HandoverReceipt.tsx` — struk dua lembar, identik, satu untuk         │
+    // │ masing-masing pihak).                                                                 │
+    // │                                                                                       │
+    // │ `HANDOVER` = foto struk itu SESUDAH ditandatangani. Kalau operator tidak bisa          │
+    // │ memotretnya, artinya strukya memang belum ditandatangani — dan kartu yang belum punya  │
+    // │ perjanjian tertulis tidak boleh masuk rak kami.                                        │
+    // │                                                                                       │
+    // │ BERLAKU UNTUK PENERIMAAN BARU SAJA, dan itu bukan kelonggaran melainkan BENTUK dari    │
+    // │ rute ini: gerbang ini hanya dilewati pada transisi INTAKE → IN_CUSTODY, dan baris yang │
+    // │ custody-nya SUDAH tercatat tidak akan pernah melewatinya lagi (statusnya sudah bukan   │
+    // │ INTAKE, dan `acceptCustodyClaimWhere` menuntut `custodyAcceptedAt: null`). Jadi tidak  │
+    // │ ada satu pun kartu yang sudah di rak yang mendadak terkunci — tidak perlu backfill,    │
+    // │ tidak perlu pengecualian bertanggal, tidak ada kolom baru yang harus diingat.          │
+    // └───────────────────────────────────────────────────────────────────────────────────────┘
     const kinds = new Set<ConsignmentPhotoKind>([
       ...existing.photos.map((p) => p.kind),
       ...(dto.photos ?? []).map((p) => p.kind),
     ]);
+    // Tiap yang kurang DISEBUT NAMANYA dalam bahasa manusia, bukan cuma token enum-nya: yang
+    // membaca pesan ini adalah operator yang sedang berdiri di ruang tamu orang, dan "kurang
+    // HANDOVER" tidak memberitahunya bahwa yang harus ia lakukan adalah memotret struk.
     const missing: string[] = [];
-    if (!kinds.has(ConsignmentPhotoKind.FRONT)) missing.push('FRONT');
-    if (!kinds.has(ConsignmentPhotoKind.BACK)) missing.push('BACK');
+    if (!kinds.has(ConsignmentPhotoKind.FRONT)) {
+      missing.push('FRONT (foto depan kartu)');
+    }
+    if (!kinds.has(ConsignmentPhotoKind.BACK)) {
+      missing.push('BACK (foto belakang kartu)');
+    }
     if (existing.certNumber && !kinds.has(ConsignmentPhotoKind.CERT)) {
-      missing.push('CERT');
+      missing.push('CERT (foto label sertifikat)');
+    }
+    if (!kinds.has(ConsignmentPhotoKind.HANDOVER)) {
+      missing.push(
+        'HANDOVER (foto STRUK SERAH TERIMA yang sudah ditandatangani kedua pihak)',
+      );
     }
     if (missing.length > 0) {
       throw consignmentError({
         status: HttpStatus.BAD_REQUEST,
         code: CONSIGNMENT_ERROR_CODE.EVIDENCE_REQUIRED,
         message:
-          `Foto bukti belum lengkap: kurang ${missing.join(', ')}. Serah-terima tidak dicatat ` +
-          'dan kartu ini tetap tidak bisa dipajang. Foto inilah bukti kondisi kartu SAAT ' +
-          'DITERIMA — tanpa itu, sengketa nanti tidak bisa dimenangkan oleh siapa pun, ' +
-          'termasuk oleh pemiliknya.',
+          `Bukti belum lengkap: kurang ${missing.join(', ')}. Serah-terima tidak dicatat ` +
+          'dan kartu ini tetap tidak bisa dipajang. Foto kartunya adalah bukti KONDISI saat ' +
+          'diterima; foto struk bertanda tangan adalah bukti bahwa ada KESEPAKATAN — tanpa ' +
+          'keduanya, sengketa nanti tidak bisa dimenangkan oleh siapa pun, termasuk oleh ' +
+          'pemiliknya. Cetak struknya dari halaman titipan ini, minta pemiliknya ' +
+          'menandatangani, lalu foto lembar yang sudah ditandatangani.',
         consignmentId: id,
       });
     }
@@ -338,6 +1007,28 @@ export class ConsignmentService {
         `Titipan ini sudah punya listing (${c.listing.id}).`,
       );
     }
+    // ╔════════════════════════════════════════════════════════════════════════════════════════╗
+    // ║ GERBANG KEDUA, DAN SEBABNYA BERBEDA DARI GERBANG DI ATAS. JANGAN DISATUKAN.           ║
+    // ╚════════════════════════════════════════════════════════════════════════════════════════╝
+    //
+    // Gerbang custody di atas menjawab "kartunya ada di tangan kita?". Gerbang ini menjawab
+    // pertanyaan yang LAIN: "kalau kartu ini terjual, siapa yang kita bayar?".
+    //
+    // Sejak titipan bisa diterima dari orang yang belum punya akun Hoshi (kode klaim di tanda
+    // terima), sebuah kartu BISA ada di rak kita DAN tetap tidak boleh dijual. Menjualnya berarti
+    // Hoshi menerima Rupiah pembeli tanpa punya tujuan untuk menyalurkannya — memegang uang orang
+    // tanpa cara menghubunginya, yang justru kebalikan dari seluruh janji fitur ini.
+    //
+    // KODE ERRORNYA SENGAJA BERBEDA (`OWNER_UNLINKED`, bukan `NOT_IN_CUSTODY`) karena
+    // PEMULIHANNYA berbeda: yang ini diselesaikan dengan pemiliknya menukarkan kode klaimnya,
+    // bukan dengan operator "mencatat serah-terima" untuk kartu yang sudah ada di raknya.
+    //
+    // Pemeriksaan di sini ADA UNTUK PESANNYA. Yang MENEGAKKAN aturannya adalah `listClaimWhere`
+    // (predikatnya menyebut `consignorId: { not: null }`, dan `Listing.create` ada di transaksi
+    // yang sama dengan klaim itu) plus dua CHECK constraint di database. Tanpa blok ini aturannya
+    // tetap tidak bisa dilanggar — operator hanya akan menerima "klaim kalah" yang tidak
+    // menjelaskan apa pun.
+    const consignorId = requireLinkedConsignorId(c);
     // ── BATAS SLICE 1 YANG DISENGAJA: kartu MENTAH belum bisa dipajang. ───────────────────
     // `Listing.grader` adalah enum NOT NULL berisi PSA/CGC/BGS saja. Untuk kartu tanpa grading
     // tidak ada nilai yang JUJUR di sana, dan mengarang salah satunya berarti MEMBERI LABEL PALSU
@@ -359,11 +1050,14 @@ export class ConsignmentService {
     }
 
     const consignor = await this.prisma.user.findUniqueOrThrow({
-      where: { id: c.consignorId },
+      where: { id: consignorId },
       select: { id: true, walletAddress: true, displayName: true },
     });
 
     const price = dto.priceIdrx ?? c.askPriceIdr;
+    // MEMPERINGATKAN, BUKAN MENOLAK — lihat `belowReserveWarning`. Kalimatnya ikut masuk baris
+    // audit, jadi "dipajang di bawah lantai yang disepakati" selalu punya jejak tertulis.
+    const reserveWarning = belowReserveWarning(c.reservePriceIdr, price);
     const listingId = await this.prisma.$transaction(async (tx) => {
       // ══ KLAIM ATOMIK DULU. Kalau kalah, TIDAK ADA baris Listing yang pernah dibuat. ══
       const claimed = await tx.consignment.updateMany({
@@ -418,7 +1112,9 @@ export class ConsignmentService {
         fromStatus: ConsignmentStatus.IN_CUSTODY,
         toStatus: ConsignmentStatus.LISTED,
         actor: admin,
-        note: `Listing ${listing.id} dibuat pada harga Rp ${price}.`,
+        note:
+          `Listing ${listing.id} dibuat pada harga Rp ${price}.` +
+          (reserveWarning ? ` ${reserveWarning}` : ''),
       });
       await tx.activity.create({
         data: {
@@ -442,9 +1138,15 @@ export class ConsignmentService {
 
     this.logger.log(
       `Titipan ${id} DIPAJANG sebagai listing ${listingId} (Rp ${price}) oleh admin ${admin.id}. ` +
-        'Kartunya ada di tangan Hoshi SEBELUM baris ini lahir — itu urutannya.',
+        'Kartunya ada di tangan Hoshi SEBELUM baris ini lahir — itu urutannya.' +
+        (reserveWarning ? ` ${reserveWarning}` : ''),
     );
-    return this.byId(id);
+    // SESUDAH transaksi commit, dan `void` — kartunya sudah tayang apa pun yang terjadi pada
+    // email. Kalau harganya salah, SEKARANG waktunya pemiliknya bicara, bukan setelah terjual.
+    this.notify.notifyListed(ConsignmentNotifyService.target(c), {
+      priceIdr: price,
+    });
+    return { belowReserveWarning: reserveWarning, ...(await this.byId(id)) };
   }
 
   /**
@@ -469,6 +1171,13 @@ export class ConsignmentService {
       });
     }
     const before = c.askPriceIdr;
+    // MEMPERINGATKAN, BUKAN MENOLAK — lihat `belowReserveWarning`. Inilah tempat paling mungkin
+    // sebuah kartu turun ke bawah lantai yang disepakati pemiliknya, jadi kalimatnya dikembalikan
+    // ke layar DAN disimpan di baris audit yang sama dengan alasan operatornya.
+    const reserveWarning = belowReserveWarning(
+      c.reservePriceIdr,
+      dto.askPriceIdr,
+    );
     await this.prisma.$transaction(async (tx) => {
       const changed = await tx.consignment.updateMany({
         where: {
@@ -496,13 +1205,179 @@ export class ConsignmentService {
         consignmentId: id,
         kind: 'PRICE',
         actor: admin,
-        note: `Harga Rp ${before} → Rp ${dto.askPriceIdr}. ${dto.note.trim()}`,
+        note:
+          `Harga Rp ${before} → Rp ${dto.askPriceIdr}. ${dto.note.trim()}` +
+          (reserveWarning ? ` ${reserveWarning}` : ''),
       });
     });
-    return this.byId(id);
+    if (reserveWarning) {
+      this.logger.warn(`Titipan ${id}: ${reserveWarning} (admin ${admin.id})`);
+    }
+    return { belowReserveWarning: reserveWarning, ...(await this.byId(id)) };
   }
 
   /* ═══════════════════════════ 4. PENARIKAN KEMBALI ═══════════════════════════ */
+
+  /**
+   * ╔════════════════════════════════════════════════════════════════════════════════════════╗
+   * ║ RENCANA PENGEMBALIAN → KOLOM. Satu penerjemah, dipakai DUA rute (withdraw & release).  ║
+   * ╚════════════════════════════════════════════════════════════════════════════════════════╝
+   *
+   * ADA TEPAT SATU FUNGSI INI dengan sengaja. Alamat pengembalian bisa dicatat di dua momen yang
+   * berbeda — saat pemiliknya meminta lewat telepon, atau pada detik ia berdiri di depan
+   * operator — dan dua penerjemah untuk dua momen berarti dua aturan "alamat lengkap" yang suatu
+   * hari akan berbeda. Yang boleh berbeda antara kedua rute adalah KAPAN ia dipanggil, bukan APA
+   * yang ia anggap sah.
+   *
+   * MENGEMBALIKAN `data` Prisma, bukan menulis sendiri: pemanggilnya yang memutuskan di transaksi
+   * mana tulisan itu duduk, dan di `release` ia WAJIB duduk di transaksi yang sama dengan klaim
+   * pelepasan custody.
+   *
+   * NOL RUPIAH BERGERAK DI SINI. Taksiran ongkirnya adalah ANGKA YANG DICATAT, bukan tagihan:
+   * tidak ada `PaymentOrder` yang terbit, tidak ada saldo yang disentuh. Lihat
+   * `CONSIGNMENT_RETURN_PAYER` di gate untuk alasan panjangnya.
+   */
+  private async buildReturnPlanWrite(
+    id: string,
+    plan: ConsignmentReturnPlanDto,
+  ): Promise<{
+    data: Prisma.ConsignmentUpdateManyMutationInput;
+    quote: DomesticShippingQuote | null;
+    method: string;
+    /**
+     * Kalimat siap-pakai untuk baris audit: cara pengembaliannya, tujuannya, berapa ongkirnya,
+     * siapa yang menanggung, dan bahwa penagihannya BELUM otomatis.
+     *
+     * DIBANGUN DI SINI, dari nilai yang sudah dinormalkan di fungsi ini — bukan dibaca ulang dari
+     * `data` belakangan. `Prisma.ConsignmentUpdateManyMutationInput` membolehkan tiap kolom
+     * berisi objek operator (`{ set: ... }`), jadi apa pun yang membacanya sebagai string sedang
+     * bertaruh pada bentuk yang tidak dijamin tipe.
+     */
+    note: string;
+  }> {
+    const method = plan.returnMethod;
+    const data: Prisma.ConsignmentUpdateManyMutationInput = {
+      returnMethod: method,
+    };
+
+    let quote: DomesticShippingQuote | null = null;
+    /** Salinan datar dari nilai yang ditulis — HANYA untuk menyusun kalimat audit di bawah. */
+    let tujuan: string | null = null;
+
+    if (method === CONSIGNMENT_RETURN_METHOD.COURIER) {
+      const a = plan.returnAddress;
+      // DITEGAKKAN DI SINI, bukan di decorator DTO, supaya penolakannya bisa menjelaskan HUBUNGAN
+      // antara dua field ("kamu memilih kurir, jadi alamatnya wajib") alih-alih "validation
+      // failed" yang tidak memberi tahu apa pun kepada operator yang sedang menelepon pemiliknya.
+      if (!a) {
+        throw consignmentError({
+          status: HttpStatus.BAD_REQUEST,
+          code: CONSIGNMENT_ERROR_CODE.RETURN_INCOMPLETE,
+          message:
+            'Pengembalian lewat kurir butuh alamat tujuan yang lengkap (nama penerima, nomor ' +
+            'telepon, alamat jalan, kota/kabupaten, provinsi, kode pos). Tanyakan sekarang, ' +
+            'selagi pemiliknya masih bicara dengan Anda — kartunya tidak akan bisa ditandai ' +
+            'terkirim tanpa itu. Kalau ia justru mau mengambil sendiri, pilih PICKUP.',
+          consignmentId: id,
+        });
+      }
+      // Negara default INDONESIA: seluruh jalur kurir di Hoshi adalah kurir domestik, dan
+      // memaksa operator mengetik "Indonesia" di setiap pengembalian hanya menambah satu kolom
+      // yang akan diisi asal-asalan. Nilai eksplisit TETAP dihormati — ia gerbang taksiran
+      // ongkir di bawah, bukan hiasan.
+      const country = a.country?.trim() || 'Indonesia';
+      Object.assign(data, {
+        returnRecipientName: a.recipientName.trim(),
+        returnPhoneNumber: a.phoneNumber.trim(),
+        returnPhoneCountryCode: a.phoneCountryCode?.trim() || null,
+        returnStreet: a.street.trim(),
+        returnApt: a.apt?.trim() || null,
+        returnCity: a.city.trim(),
+        returnState: a.state.trim(),
+        returnZip: a.zip.trim(),
+        returnCountry: country,
+      });
+      tujuan =
+        `${a.city.trim()}, ${a.state.trim()} ${a.zip.trim()} ` +
+        `a.n. ${a.recipientName.trim()}`;
+
+      // ── TAKSIRAN ONGKIR: TARIF YANG SUDAH ADA, DAN TIDAK PERNAH MENGHALANGI ──────────────
+      //
+      // Dihitung `resolveDomesticShippingIdr` — fungsi dan TABEL yang SAMA dengan kirim domestik
+      // stok Hoshi (`domestic_shipping_rates`). Satu daftar ongkir untuk seluruh Indonesia; dua
+      // daftar berarti dua jawaban untuk satu provinsi yang sama, dan yang salah tidak akan
+      // ketahuan sampai ada yang membandingkannya.
+      //
+      // DIBUNGKUS try/catch, DAN ITU KEPUTUSAN, BUKAN KEMALASAN: fungsi itu MELEMPAR untuk alamat
+      // di luar Indonesia dan untuk tarif yang tidak masuk akal. Di jalur BAYAR, melempar memang
+      // benar — user tidak boleh ditagih angka yang mustahil. Di sini tidak ada yang ditagih:
+      // yang sedang terjadi adalah seseorang meminta BARANGNYA SENDIRI kembali, dan sebuah
+      // taksiran yang gagal TIDAK BOLEH menghalangi itu. Gagal → `returnShippingFeeIdr` dibiarkan
+      // kosong dan operator mengetiknya dari struk kurir.
+      if (
+        plan.returnShippingFeeIdr == null &&
+        isIndonesianDestination(country)
+      ) {
+        try {
+          quote = await resolveDomesticShippingIdr({
+            prisma: this.prisma,
+            logger: this.logger,
+            dest: { city: a.city.trim(), state: a.state.trim(), country },
+            env: (k) => this.config.get<string>(k),
+          });
+          data.returnShippingFeeIdr = quote.priceIdr;
+        } catch (err) {
+          this.logger.warn(
+            `Taksiran ongkir balik titipan ${id} gagal dihitung ` +
+              `(${err instanceof Error ? err.message : String(err)}). Pengembaliannya TETAP ` +
+              'berjalan; nominal ongkirnya dibiarkan kosong untuk diisi operator dari struk kurir.',
+          );
+        }
+      }
+    }
+
+    // Nominal yang DIKETIK operator selalu menang atas taksiran: yang benar adalah angka di struk
+    // kurir, bukan tabel kita. 0 SENGAJA dibedakan dari kosong — "digratiskan" adalah fakta,
+    // "belum dicatat" adalah ketiadaan fakta.
+    if (plan.returnShippingFeeIdr != null) {
+      data.returnShippingFeeIdr = plan.returnShippingFeeIdr;
+    }
+    if (plan.returnShippingPayer != null) {
+      data.returnShippingPayer = plan.returnShippingPayer;
+    }
+
+    // ── KALIMAT AUDITNYA, disusun dari nilai yang sudah dinormalkan DI ATAS ─────────────────
+    //
+    // "Hoshi yang menanggung Rp 50.000" harus bisa dibaca ulang berbulan-bulan kemudian oleh
+    // orang yang sedang menghitung berapa sebenarnya ongkos fitur ini — dan jejak audit adalah
+    // satu-satunya tempat yang tidak bisa ditimpa.
+    //
+    // Kalimat penutupnya SELALU menyebut bahwa penagihannya belum otomatis. Angka yang tercatat
+    // tanpa keterangan itu akan, cepat atau lambat, dibaca seseorang sebagai "sudah ditagih".
+    const feeIdr = plan.returnShippingFeeIdr ?? (quote ? quote.priceIdr : null);
+    const payer = plan.returnShippingPayer ?? null;
+    const note =
+      method === CONSIGNMENT_RETURN_METHOD.PICKUP
+        ? 'Cara pengembalian: DIAMBIL SENDIRI di tempat Hoshi (tidak perlu alamat kirim).'
+        : `Cara pengembalian: DIKIRIM KURIR ke ${tujuan ?? '—'}. ` +
+          (feeIdr == null
+            ? 'Ongkir balik BELUM dicatat.'
+            : `Ongkir balik Rp ${feeIdr}` +
+              (quote
+                ? ` (taksiran tarif ${quote.scope}${
+                    quote.regionUnresolved
+                      ? ', wilayah tidak dikenali → tier penampung'
+                      : ''
+                  })`
+                : '') +
+              '.') +
+          (payer == null
+            ? ' Penanggung ongkir BELUM ditentukan.'
+            : ` Ditanggung ${payer === CONSIGNMENT_RETURN_PAYER.HOSHI ? 'HOSHI' : 'PEMILIK KARTU'}.`) +
+          ' Penagihannya BELUM otomatis — angka ini DICATAT, bukan ditagihkan.';
+
+    return { data, quote, method, note };
+  }
 
   /**
    * ╔════════════════════════════════════════════════════════════════════════════════════════╗
@@ -534,6 +1409,27 @@ export class ConsignmentService {
     actor: AuthUser,
   ) {
     const c = await this.requireConsignment(id);
+    // ── SIAPA YANG BOLEH MEMINTA KARTU INI KEMBALI ────────────────────────────────────────
+    //
+    // Titipan yang BELUM tertaut akun (`consignorId` null) TIDAK BISA dicocokkan dengan pengguna
+    // mana pun — `actor.id` selalu non-null, jadi perbandingan di bawah otomatis menolak SETIAP
+    // pengguna biasa. ITU BENAR DAN DISENGAJA: kalau titipan tanpa pemilik boleh ditarik oleh
+    // siapa saja yang meminta, maka siapa pun bisa membawa pulang kartu orang lain.
+    //
+    // TAPI JALAN PULANGNYA TIDAK BOLEH HILANG, dan itu bagian terpenting dari paragraf ini.
+    // Orang yang menyerahkan kartunya tanpa punya akun HARUS tetap bisa mengambilnya kembali.
+    // Jalannya: ia datang ke operator, operator mencocokkan `consignorNameAtIntake` /
+    // `consignorPhoneAtIntake` dan tanda terima bertanda tangan yang ia bawa, lalu menarik atas
+    // namanya lewat rute admin (POST /admin/consignments/:id/withdraw). Dua kolom snapshot itulah
+    // yang membuat langkah ini mungkin — alasan keduanya tetap WAJIB meski akunnya belum ada.
+    if (actor.role !== 'ADMIN' && !isConsignorLinked(c)) {
+      throw new ForbiddenException(
+        'Titipan ini belum terhubung ke akun Hoshi mana pun, jadi ia tidak bisa ditarik lewat ' +
+          'rute akun. Kalau ini kartu Anda: tukarkan dulu kode klaim di tanda terima Anda ' +
+          '(POST /consignments/claim), atau hubungi Hoshi dengan membawa tanda terimanya — ' +
+          'kartunya tetap milik Anda dan tetap bisa diminta kembali kapan saja, gratis.',
+      );
+    }
     if (actor.role !== 'ADMIN' && c.consignorId !== actor.id) {
       throw new ForbiddenException(
         'Hanya pemilik kartu (atau admin) yang bisa meminta kartu ini kembali.',
@@ -541,9 +1437,53 @@ export class ConsignmentService {
     }
     const note = dto.note?.trim() ?? '';
 
+    // ── KE MANA KARTUNYA PULANG — DITANYAKAN DI SINI, SELAGI ORANGNYA MASIH BICARA ────────
+    //
+    // Momen paling murah untuk menanyakan alamat adalah momen ini. Sesudahnya, operator harus
+    // MENELEPON KEMBALI seseorang yang sudah menutup telepon — dan itulah bagaimana sebuah kartu
+    // berakhir tercatat "ditarik" selama berminggu-minggu tanpa pernah dikirim ke mana pun.
+    //
+    // TETAP OPSIONAL: permintaan "saya mau kartu saya kembali" TIDAK BOLEH bisa gagal karena
+    // sebuah kode pos. Yang TIDAK opsional adalah alamat pada saat kartunya ditandai KELUAR —
+    // ditegakkan `withdrawnReleaseClaimWhere()`, di lapis yang tidak bisa dilewati kode mana pun.
+    //
+    // DIHITUNG HANYA UNTUK STATUS YANG MEMANG BISA MENYIMPANNYA. Permintaan untuk kartu yang
+    // sudah TERJUAL pasti ditolak beberapa baris di bawah; menaksir ongkirnya lebih dulu berarti
+    // satu pembacaan tabel tarif untuk keputusan yang tidak akan pernah dipakai — dan, lebih
+    // buruk, satu jalur di mana permintaan yang DITOLAK sempat menyentuh sesuatu.
+    const planned =
+      dto.returnPlan &&
+      (c.status === ConsignmentStatus.IN_CUSTODY ||
+        c.status === ConsignmentStatus.LISTED)
+        ? await this.buildReturnPlanWrite(id, dto.returnPlan)
+        : null;
+    const planNote = planned ? ` ${planned.note}` : '';
+
     switch (c.status) {
       // Kartunya belum pernah berpindah tangan → batalkan saja kesepakatannya.
       case ConsignmentStatus.INTAKE: {
+        // ── RENCANA PENGEMBALIAN TIDAK BERLAKU DI SINI, DAN DITOLAK ALIH-ALIH DIABAIKAN ───
+        //
+        // Baris INTAKE berarti kesepakatannya dicatat tapi KARTUNYA TIDAK PERNAH BERPINDAH
+        // TANGAN — ia masih di rumah pemiliknya. Tidak ada apa pun untuk dikirim balik, dan
+        // menyimpan alamat pengembalian untuk kartu yang tidak pernah kami pegang hanya
+        // menciptakan baris yang kelihatan seperti pengiriman yang tertunda.
+        //
+        // DITOLAK, BUKAN DIABAIKAN DIAM-DIAM: operator yang mengetik alamat lengkap lalu tidak
+        // melihatnya tersimpan di mana pun berhak tahu kenapa, dan kalimat di bawah menyebutkan
+        // alasannya. Diam adalah cara paling pasti membuat orang mengetiknya lagi.
+        if (dto.returnPlan) {
+          throw consignmentError({
+            status: HttpStatus.UNPROCESSABLE_ENTITY,
+            code: CONSIGNMENT_ERROR_CODE.RETURN_INCOMPLETE,
+            message:
+              'Titipan ini masih berstatus INTAKE: kesepakatannya dicatat, tapi kartunya BELUM ' +
+              'pernah diserahkan ke Hoshi — ia masih di tangan pemiliknya. Tidak ada yang perlu ' +
+              'dikirim balik, jadi alamat pengembalian tidak disimpan. Kirim ulang permintaan ' +
+              'ini TANPA returnPlan untuk membatalkan kesepakatannya.',
+            consignmentId: id,
+          });
+        }
         await this.prisma.$transaction(async (tx) => {
           const claimed = await tx.consignment.updateMany({
             where: { id, status: ConsignmentStatus.INTAKE },
@@ -580,7 +1520,14 @@ export class ConsignmentService {
               status: ConsignmentStatus.IN_CUSTODY,
               custodyReleasedAt: null,
             },
-            data: { withdrawRequestedAt: new Date() },
+            // ══ `custodyReleasedAt` SENGAJA TIDAK DITULIS DI SINI, DAN ITU INTI FITURNYA. ══
+            //
+            // Yang terjadi barusan adalah sebuah PERMINTAAN, bukan perpindahan fisik. Kartunya
+            // MASIH DI RAK KAMI, jadi ia MASIH TANGGUNG JAWAB HOSHI: masih bisa hilang, masih
+            // harus terhitung di stok opname, masih muncul di `actionRequired`. Melepas custody
+            // di sini akan membuat sebuah kartu yang belum ke mana-mana tercatat "selesai" —
+            // tepat kegagalan yang seluruh bagian ini dibangun untuk menutup.
+            data: { withdrawRequestedAt: new Date(), ...(planned?.data ?? {}) },
           });
           if (claimed.count !== 1) {
             throw new ConflictException(
@@ -593,7 +1540,9 @@ export class ConsignmentService {
             fromStatus: ConsignmentStatus.IN_CUSTODY,
             toStatus: ConsignmentStatus.IN_CUSTODY,
             actor,
-            note: `Pemilik minta kartunya kembali. ${note}`,
+            note:
+              'Pemilik minta kartunya kembali. Kartunya MASIH di rak Hoshi sampai serah-terima ' +
+              `pengembaliannya dicatat. ${note}${planNote}`,
           });
         });
         return this.byId(id);
@@ -633,9 +1582,13 @@ export class ConsignmentService {
           }
           const back = await tx.consignment.updateMany({
             where: takeDownClaimWhere(id),
+            // Sama seperti cabang IN_CUSTODY: custody TIDAK dilepas. Listing-nya turun, kartunya
+            // kembali ke keadaan "di rak Hoshi, tidak dijual" — dan ia tetap tanggung jawab kami
+            // sampai benar-benar berpindah tangan.
             data: {
               status: ConsignmentStatus.IN_CUSTODY,
               withdrawRequestedAt: new Date(),
+              ...(planned?.data ?? {}),
             },
           });
           if (back.count !== 1) {
@@ -673,7 +1626,9 @@ export class ConsignmentService {
             fromStatus: ConsignmentStatus.LISTED,
             toStatus: ConsignmentStatus.IN_CUSTODY,
             actor,
-            note: `Listing ${listingId} ditarik atas permintaan pemilik. ${note}`,
+            note:
+              `Listing ${listingId} ditarik atas permintaan pemilik. Kartunya MASIH di rak ` +
+              `Hoshi sampai serah-terima pengembaliannya dicatat. ${note}${planNote}`,
           });
         });
         return this.byId(id);
@@ -710,6 +1665,28 @@ export class ConsignmentService {
    *
    * Dari SOLD hanya `SHIPPED_TO_BUYER` yang masuk akal; dari IN_CUSTODY hanya `WITHDRAWN`.
    * "Hilang" punya rutenya sendiri supaya ia tidak pernah bisa tercatat sebagai pengembalian biasa.
+   *
+   * ╔════════════════════════════════════════════════════════════════════════════════════════╗
+   * ║ UNTUK `WITHDRAWN`: KARTU TIDAK BISA DINYATAKAN KELUAR TANPA TAHU KE MANA IA PERGI.     ║
+   * ╚════════════════════════════════════════════════════════════════════════════════════════╝
+   *
+   * Tiga lapis, dan ketiganya sengaja TIDAK saling menggantikan:
+   *
+   *   1. PEMERIKSAAN DI SINI       menulis PESANNYA — ia yang memberi tahu operator apa yang
+   *                                kurang (alamat? resi? nama pengambil?) dan bagaimana
+   *                                melengkapinya. Tanpa lapis ini aturannya tetap ditegakkan,
+   *                                operator hanya akan menerima "klaim kalah" yang tidak
+   *                                menjelaskan apa pun.
+   *   2. PREDIKAT KLAIM            `withdrawnReleaseClaimWhere()` menyebut kolom alamatnya, jadi
+   *                                POSTGRES yang menolak — bukan urutan kode. Alamat yang baru
+   *                                dicatat di permintaan yang SAMA tetap terbaca karena rencana
+   *                                pengembaliannya DITULIS LEBIH DULU di transaksi yang sama.
+   *   3. CHECK `consignments_return_shape_chk`  bentuk barisnya tidak bisa jadi tidak konsisten
+   *                                lewat jalur apa pun, termasuk SQL manual.
+   *
+   * `SHIPPED_TO_BUYER` TIDAK tersentuh oleh semua ini: pengiriman ke pembeli punya jalurnya
+   * sendiri (`CardRedemption` + tarif domestik + rute kirim), dan menumpangkan resi pengembalian
+   * di sana akan melahirkan dua tempat yang menyimpan resi untuk satu kejadian.
    */
   async release(id: string, dto: ReleaseConsignmentDto, admin: AuthUser) {
     const c = await this.requireConsignment(id);
@@ -735,20 +1712,179 @@ export class ConsignmentService {
         consignmentId: id,
       });
     }
+    // ── PENGEMBALIAN KE PEMILIK: SIAPKAN RENCANANYA DULU, LALU PERIKSA KELENGKAPANNYA ──────
+    //
+    // `planned` = rencana yang datang BERSAMA permintaan ini (pemiliknya datang tanpa
+    // pemberitahuan, semuanya dicatat pada detik yang sama). Kalau tidak ada, yang berlaku adalah
+    // rencana yang SUDAH tersimpan di baris sejak penarikan diminta.
+    const isReturn = reason === 'WITHDRAWN';
+    const planned =
+      isReturn && dto.returnPlan
+        ? await this.buildReturnPlanWrite(id, dto.returnPlan)
+        : null;
+
+    // Keadaan pengembalian SESUDAH rencana baru (kalau ada) diterapkan. Dihitung di memori supaya
+    // pesan di bawah bisa menyebut apa yang kurang; yang MENEGAKKAN-nya tetap predikat klaim.
+    const effective: ConsignmentReturnFacts = isReturn
+      ? {
+          returnMethod: c.returnMethod,
+          returnRecipientName: c.returnRecipientName,
+          returnPhoneNumber: c.returnPhoneNumber,
+          returnStreet: c.returnStreet,
+          returnCity: c.returnCity,
+          returnState: c.returnState,
+          returnZip: c.returnZip,
+          returnCountry: c.returnCountry,
+          ...((planned?.data ?? {}) as Partial<ConsignmentReturnFacts>),
+        }
+      : {
+          returnMethod: null,
+          returnRecipientName: null,
+          returnPhoneNumber: null,
+          returnStreet: null,
+          returnCity: null,
+          returnState: null,
+          returnZip: null,
+          returnCountry: null,
+        };
+
+    // Bukti serah-terimanya: resi untuk kurir, nama pengambil untuk ambil sendiri.
+    const courier = dto.returnCourier?.trim() || null;
+    const trackingNo = dto.returnTrackingNo?.trim() || null;
+    const pickedUpBy = dto.returnPickedUpBy?.trim() || null;
+
+    if (isReturn) {
+      // (a) CARA PENGEMBALIANNYA belum dinyatakan sama sekali.
+      if (effective.returnMethod == null) {
+        throw consignmentError({
+          status: HttpStatus.BAD_REQUEST,
+          code: CONSIGNMENT_ERROR_CODE.RETURN_INCOMPLETE,
+          message:
+            'Cara pengembalian kartu ini belum dicatat, jadi ia BELUM BISA ditandai keluar dari ' +
+            'Hoshi. Pilih dulu: DIAMBIL SENDIRI (PICKUP) atau DIKIRIM KURIR (COURIER, dengan ' +
+            'alamat lengkap). Kartunya TIDAK berubah keadaannya — ia tetap di rak dan tetap ' +
+            'tanggung jawab Hoshi.',
+          consignmentId: id,
+        });
+      }
+      // (b) KURIR TANPA ALAMAT LENGKAP. Inilah kegagalan yang seluruh bagian ini dibuat untuk
+      //     menutup: sebuah kartu tercatat "dikirim" ke tempat yang tidak pernah ditulis siapa pun.
+      if (
+        effective.returnMethod === CONSIGNMENT_RETURN_METHOD.COURIER &&
+        !isReturnAddressComplete(effective)
+      ) {
+        throw consignmentError({
+          status: HttpStatus.BAD_REQUEST,
+          code: CONSIGNMENT_ERROR_CODE.RETURN_INCOMPLETE,
+          message:
+            'Alamat pengembalian belum lengkap, jadi kartu ini TIDAK BISA ditandai terkirim. ' +
+            `Yang masih kurang: ${missingReturnAddressFields(effective).join(', ')}. ` +
+            'Tanyakan ke pemiliknya dan catat lewat permintaan penarikan (returnPlan), atau ' +
+            'kirim ulang permintaan ini dengan returnPlan yang lengkap. Kartunya tetap di rak ' +
+            'Hoshi sampai itu ada.',
+          consignmentId: id,
+        });
+      }
+      // (c) KURIR TANPA RESI. Tanpa nomor resi, "sudah dikirim" adalah klaim yang TIDAK BISA
+      //     DIPERIKSA oleh pemilik kartunya sendiri — dan dialah satu-satunya orang yang berhak
+      //     memeriksanya. Ditegakkan di sini (bukan di predikat klaim) karena nilainya LAHIR pada
+      //     detik ini: predikat hanya bisa menuntut fakta yang sudah tersimpan.
+      if (
+        effective.returnMethod === CONSIGNMENT_RETURN_METHOD.COURIER &&
+        (courier == null || trackingNo == null)
+      ) {
+        throw consignmentError({
+          status: HttpStatus.BAD_REQUEST,
+          code: CONSIGNMENT_ERROR_CODE.RETURN_INCOMPLETE,
+          message:
+            'Nama kurir dan NOMOR RESI wajib diisi sebelum kartu titipan ditandai terkirim ' +
+            'balik. Tanpa resi, "sudah dikirim" adalah pernyataan yang tidak bisa diperiksa oleh ' +
+            'pemilik kartunya sendiri — padahal dialah satu-satunya orang yang berhak ' +
+            'memeriksanya. Kalau kartunya justru diambil sendiri, ubah cara pengembaliannya ' +
+            'menjadi PICKUP.',
+          consignmentId: id,
+        });
+      }
+      // (d) DIAMBIL SENDIRI TANPA CATATAN SIAPA YANG MENGAMBIL. Menyerahkan kartu senilai puluhan
+      //     juta kepada "seseorang" tanpa nama adalah serah-terima yang tidak bisa dipertanggung-
+      //     jawabkan kepada pemiliknya kalau ternyata bukan dia yang datang.
+      if (
+        effective.returnMethod === CONSIGNMENT_RETURN_METHOD.PICKUP &&
+        pickedUpBy == null
+      ) {
+        throw consignmentError({
+          status: HttpStatus.BAD_REQUEST,
+          code: CONSIGNMENT_ERROR_CODE.RETURN_INCOMPLETE,
+          message:
+            'Catat SIAPA yang mengambil kartunya (returnPickedUpBy) — nama orang yang berdiri di ' +
+            'depan Anda, dan dasar Anda yakin ia berhak menerimanya. Yang datang mengambil sering ' +
+            'bukan pemegang akunnya, dan tanpa catatan ini serah-terimanya tidak bisa ' +
+            'dipertanggungjawabkan kepada pemilik kartu.',
+          consignmentId: id,
+        });
+      }
+    }
+
     await this.prisma.$transaction(async (tx) => {
+      // ══ RENCANA PENGEMBALIAN DITULIS LEBIH DULU, DI TRANSAKSI YANG SAMA. ══
+      //
+      // Urutan ini yang membuat lapis 2 (predikat klaim) tetap bisa membaca alamat yang baru
+      // dicatat detik ini, TANPA melonggarkan prinsipnya: gerbang tetap membaca FAKTA TERSIMPAN
+      // di baris, bukan nilai yang kebetulan lewat di body permintaan. Kalau klaim di bawah kalah,
+      // seluruh transaksi ROLLBACK dan tulisan ini ikut hilang — tidak ada alamat yang tertinggal
+      // untuk pelepasan yang tidak pernah terjadi.
+      if (planned) {
+        const savedPlan = await tx.consignment.updateMany({
+          where: { id, status: from, custodyReleasedAt: null },
+          data: planned.data,
+        });
+        if (savedPlan.count !== 1) {
+          throw new ConflictException(
+            'Status titipan berubah barusan; rencana pengembaliannya tidak ditulis dan kartunya ' +
+              'tidak ditandai keluar.',
+          );
+        }
+      }
+
       const claimed = await tx.consignment.updateMany({
-        where: { id, status: from, custodyReleasedAt: null },
+        // ══ GERBANGNYA ADALAH PREDIKATNYA. ══
+        // Untuk pengembalian ke pemilik, predikatnya ikut menyebut kolom ALAMAT — jadi "tidak
+        // bisa ditandai terkirim tanpa alamat" ditegakkan Postgres, bukan oleh urutan kode.
+        // Untuk SHIPPED_TO_BUYER, gerbangnya tetap seperti semula (jalur pembeli, bukan fitur ini).
+        where: isReturn
+          ? withdrawnReleaseClaimWhere(id)
+          : { id, status: from, custodyReleasedAt: null },
         data: {
           status: ConsignmentStatus.RELEASED,
           custodyReleasedAt: new Date(),
           releaseReason: reason,
           releaseReceiptRef: dto.releaseReceiptRef ?? null,
+          // Bukti serah-terimanya. HANYA untuk pengembalian ke pemilik — jalur pembeli menyimpan
+          // resinya di `CardRedemption`, dan dua tempat untuk satu resi adalah dua jawaban.
+          ...(isReturn
+            ? {
+                ...(courier ? { returnCourier: courier } : {}),
+                ...(trackingNo ? { returnTrackingNo: trackingNo } : {}),
+                ...(pickedUpBy ? { returnPickedUpBy: pickedUpBy } : {}),
+              }
+            : {}),
         },
       });
       if (claimed.count !== 1) {
-        throw new ConflictException(
-          'Status titipan berubah barusan; tidak ada yang ditulis.',
-        );
+        // Klaimnya membawa LEBIH DARI SATU syarat untuk pengembalian, jadi kekalahannya punya
+        // lebih dari satu sebab dan operator berhak tahu keduanya — termasuk sebab yang TIDAK
+        // terlihat di layarnya (alamat yang baru saja dihapus/diubah permintaan lain).
+        throw consignmentError({
+          status: HttpStatus.CONFLICT,
+          code: CONSIGNMENT_ERROR_CODE.BAD_TRANSITION,
+          message: isReturn
+            ? 'Keadaan titipan ini berubah barusan — statusnya bergeser, kartunya sudah tercatat ' +
+              'keluar oleh permintaan lain, atau rencana pengembaliannya tidak lagi lengkap. ' +
+              'TIDAK ADA yang ditulis: kartunya tetap tercatat di rak Hoshi. Muat ulang barisnya ' +
+              'dan lihat keadaannya sekarang.'
+            : 'Status titipan berubah barusan; tidak ada yang ditulis.',
+          consignmentId: id,
+        });
       }
       await this.writeEvent(tx, {
         consignmentId: id,
@@ -756,12 +1892,24 @@ export class ConsignmentService {
         fromStatus: from,
         toStatus: ConsignmentStatus.RELEASED,
         actor: admin,
-        note: `${reason}. ${dto.note.trim()}`,
+        note:
+          `${reason}. ${dto.note.trim()}` +
+          (planned ? ` ${planned.note}` : '') +
+          (isReturn
+            ? effective.returnMethod === CONSIGNMENT_RETURN_METHOD.PICKUP
+              ? ` Diambil sendiri oleh: ${pickedUpBy ?? '—'}.`
+              : ` Dikirim ${courier ?? '—'}, resi ${trackingNo ?? '—'}.`
+            : ''),
       });
     });
     this.logger.warn(
       `CUSTODY SELESAI: titipan ${id} ("${c.cardName}") KELUAR dari Hoshi (${reason}), ` +
-        `dicatat admin ${admin.id}.`,
+        `dicatat admin ${admin.id}.` +
+        (isReturn
+          ? effective.returnMethod === CONSIGNMENT_RETURN_METHOD.PICKUP
+            ? ` Diambil sendiri oleh ${pickedUpBy ?? '—'}.`
+            : ` Dikirim ${courier ?? '—'} resi ${trackingNo ?? '—'}.`
+          : ''),
     );
     return this.byId(id);
   }
@@ -840,6 +1988,9 @@ export class ConsignmentService {
         `oleh admin ${admin.id}. Listing (kalau ada) sudah diturunkan. Ganti rugi = keputusan ` +
         'manusia: POST /admin/consignments/:id/compensate.',
     );
+    // Yang PALING TIDAK BOLEH senyap. Kalau pemiliknya tidak punya email (Path B), notifier
+    // menulis log WARN berisi nama + telepon dari serah-terima — satu-satunya cara meneleponnya.
+    this.notify.notifyLost(ConsignmentNotifyService.target(c));
     return this.byId(id);
   }
 
@@ -855,8 +2006,21 @@ export class ConsignmentService {
         `Ganti rugi hanya untuk titipan berstatus LOST; titipan ini ${c.status}.`,
       );
     }
+    // ── UANG TIDAK PUNYA TUJUAN KALAU PEMILIKNYA BELUM TERTAUT ──────────────────────────────
+    //
+    // Kartu yang HILANG bisa saja kartu yang pemiliknya belum pernah membuat akun: ia menyerahkan
+    // kartunya, membawa pulang tanda terima berkode klaim, lalu kartunya hilang di rak kami
+    // SEBELUM ia sempat menukarkan kodenya. Mengkredit saldo di keadaan itu mustahil — tidak ada
+    // akun untuk dikredit — dan kalau pemeriksaan ini tidak ada, `balance.credit` akan menerima
+    // `null` sebagai userId dan gagal dengan pesan database yang tidak menjelaskan apa pun.
+    //
+    // Yang WAJIB dilakukan manusia lebih dulu: hubungi pemiliknya dengan
+    // `consignorNameAtIntake` / `consignorPhoneAtIntake`, bantu ia masuk akun, tautkan
+    // (POST /admin/consignments/:id/link-consignor atau kode klaimnya), BARU bayar. Ini bukan
+    // hambatan birokrasi; ini satu-satunya cara ganti ruginya benar-benar sampai ke orangnya.
+    const consignorId = requireLinkedConsignorId(c);
     const { credited } = await this.balance.credit({
-      userId: c.consignorId,
+      userId: consignorId,
       amountIdrx: dto.amountIdr,
       reason: CONSIGNMENT_COMPENSATION_REASON,
       refId: id,
@@ -911,16 +2075,315 @@ export class ConsignmentService {
     return this.byId(id);
   }
 
+  /**
+   * ╔════════════════════════════════════════════════════════════════════════════════════════╗
+   * ║ KOREKSI LABEL — dan GARIS yang memisahkannya dari `addCorrection` di atas.             ║
+   * ╚════════════════════════════════════════════════════════════════════════════════════════╝
+   *
+   * ┌────────────────────────────────────────────────────────────────────────────────────────┐
+   * │ `conditionNote` dan foto adalah BUKTI: pernyataan seseorang tentang keadaan kartu pada  │
+   * │ HARI ia diterima. Bukti yang bisa diubah diam-diam sesudah sengketa dimulai TIDAK ADA   │
+   * │ HARGANYA — bagi kedua pihak. Keduanya TETAP tidak punya rute update, dan itu tidak      │
+   * │ dilonggarkan oleh satu baris pun di bawah ini.                                         │
+   * │                                                                                        │
+   * │ `cardName` dan kawan-kawannya adalah LABEL: klaim tentang kartu MANA ini, yang bisa     │
+   * │ dicek terhadap kartu fisiknya sendiri dan terhadap situs grader-nya. Label yang salah   │
+   * │ ketik BUKAN bukti tentang apa pun — ia cuma salah.                                      │
+   * └────────────────────────────────────────────────────────────────────────────────────────┘
+   *
+   * KENAPA RUTE INI HARUS ADA, dengan kalimat yang konkret: `createListingFor` menyalin
+   * `cardName` LANGSUNG ke `Listing.name`. Satu huruf yang terlewat di ponsel, di teras rumah
+   * orang, jam lima sore — "Charizad VMAX" — menjadi JUDUL PUBLIK PERMANEN kartu orang lain
+   * senilai Rp 24 juta. Sebelum rute ini, satu-satunya "perbaikan" yang tersedia adalah
+   * `addCorrection`, yang sengaja TIDAK menimpa apa pun: koreksinya terkubur di jejak audit yang
+   * tidak pernah dibaca satu pun calon pembeli, sementara judul yang salah tetap tayang.
+   *
+   * KONTRAKNYA, dan ketiganya dalam SATU transaksi:
+   *   1. ALASAN WAJIB (`note`, min 10 karakter) — sama seperti perubahan harga.
+   *   2. SEBELUM-DAN-SESUDAH tersimpan sebagai satu baris `ConsignmentEvent` ber-kind
+   *      `LABEL_CORRECTION`. Nilai lamanya tidak hilang; ia pindah ke jejak audit. Itulah yang
+   *      membuat "diperbaiki" tetap bisa dibedakan dari "selalu begitu".
+   *   3. JUDUL LISTING YANG MASIH TAYANG IKUT DIPERBAIKI. Kalau langkah ini terpisah, akan ada
+   *      jendela — sependek apa pun — ketika catatan titipan sudah benar dan yang dilihat publik
+   *      masih salah; dan kalau yang kedua gagal, tidak akan ada yang tahu.
+   *
+   * GERBANG KONKURENSINYA ADALAH KLAIMNYA: `where` menyebut NILAI LAMA setiap kolom yang
+   * disentuh. Dua operator yang memperbaiki field yang sama pada detik yang sama tidak bisa
+   * dua-duanya menang — dan, yang lebih penting, "sebelum" yang tertulis di baris audit TIDAK
+   * PERNAH karangan: kalau nilainya sudah bukan itu lagi, klaimnya cocok 0 baris.
+   *
+   * BOLEH DI STATUS APA PUN, TERMASUK SESUDAH TERJUAL. Catatan yang salah nama tetap salah
+   * setelah kartunya pindah tangan, dan membiarkannya berarti arsip custody Hoshi menyimpan nama
+   * kartu yang tidak pernah ada. Baris `Listing` hanya disentuh selama ia masih ACTIVE: listing
+   * yang sudah SOLD adalah SNAPSHOT APA YANG DIBELI PEMBELI, dan itu bukan milik kita untuk
+   * diubah. `era`/`category`/`rarity` di listing juga TIDAK disentuh — ketiganya pilihan tampilan
+   * yang diketik operator saat memajang, bukan salinan dari kolom titipan.
+   */
+  async correctLabel(
+    id: string,
+    dto: CorrectConsignmentLabelDto,
+    admin: AuthUser,
+  ) {
+    const c = await this.requireConsignment(id);
+
+    const changes: LabelChange[] = [];
+    const data: Prisma.ConsignmentUpdateManyMutationInput = {};
+    // Gerbang optimistic. Mulai dari id, lalu setiap kolom yang disentuh menambahkan NILAI
+    // LAMA-nya sebagai syarat — lihat paragraf "GERBANG KONKURENSINYA ADALAH KLAIMNYA".
+    const guard: Prisma.ConsignmentWhereInput = { id };
+    let provided = 0;
+
+    if (dto.cardName !== undefined) {
+      provided++;
+      const next = dto.cardName.trim();
+      if (next.length === 0) {
+        throw new BadRequestException(
+          'cardName tidak boleh dikosongkan: ia judul publik kartu ini. Kirim nama yang BENAR, ' +
+            'bukan string kosong.',
+        );
+      }
+      if (next !== c.cardName) {
+        changes.push({ field: 'cardName', before: c.cardName, after: next });
+        data.cardName = next;
+        guard.cardName = c.cardName;
+      }
+    }
+    if (dto.cardSet !== undefined) {
+      provided++;
+      const next = blankToNull(dto.cardSet);
+      if (next !== c.cardSet) {
+        changes.push({ field: 'cardSet', before: c.cardSet, after: next });
+        data.cardSet = next;
+        guard.cardSet = c.cardSet;
+      }
+    }
+    if (dto.cardNumber !== undefined) {
+      provided++;
+      const next = blankToNull(dto.cardNumber);
+      if (next !== c.cardNumber) {
+        changes.push({
+          field: 'cardNumber',
+          before: c.cardNumber,
+          after: next,
+        });
+        data.cardNumber = next;
+        guard.cardNumber = c.cardNumber;
+      }
+    }
+    if (dto.certNumber !== undefined) {
+      provided++;
+      const next = blankToNull(dto.certNumber);
+      if (next !== c.certNumber) {
+        changes.push({
+          field: 'certNumber',
+          before: c.certNumber,
+          after: next,
+        });
+        data.certNumber = next;
+        guard.certNumber = c.certNumber;
+      }
+    }
+    if (dto.gradeLabel !== undefined) {
+      provided++;
+      const next = blankToNull(dto.gradeLabel);
+      if (next !== c.gradeLabel) {
+        changes.push({
+          field: 'gradeLabel',
+          before: c.gradeLabel,
+          after: next,
+        });
+        data.gradeLabel = next;
+        guard.gradeLabel = c.gradeLabel;
+      }
+    }
+    if (dto.gradeScore !== undefined) {
+      provided++;
+      if (dto.gradeScore !== c.gradeScore) {
+        changes.push({
+          field: 'gradeScore',
+          before: c.gradeScore,
+          after: dto.gradeScore,
+        });
+        data.gradeScore = dto.gradeScore;
+        guard.gradeScore = c.gradeScore;
+      }
+    }
+
+    if (provided === 0) {
+      throw new BadRequestException(
+        'Sebutkan minimal satu field yang dikoreksi (cardName, cardSet, cardNumber, ' +
+          'certNumber, gradeLabel, gradeScore). Catatan kondisi dan foto SENGAJA tidak bisa ' +
+          'ditimpa — keduanya bukti; koreksi naratif ditulis lewat ' +
+          'POST /admin/consignments/:id/correction.',
+      );
+    }
+    if (changes.length === 0) {
+      throw new BadRequestException(
+        'Tidak ada yang berubah: semua nilai yang dikirim sudah sama persis dengan yang ' +
+          'tersimpan. Tidak ada baris audit yang dibuat untuk perubahan yang tidak terjadi.',
+      );
+    }
+
+    // ANTI-DOBEL-TITIP ikut berlaku untuk nomor sertifikat yang DIKOREKSI, bukan hanya yang
+    // diketik saat intake — kalau tidak, kartu yang sama bisa punya dua titipan hidup lewat
+    // jalan belakang. Pemeriksaan ini ADA UNTUK PESANNYA; yang benar-benar menegakkannya tetap
+    // partial unique index `consignments_active_cert_uniq` (P2002 → 409 lewat filter Prisma).
+    const certChange = changes.find((ch) => ch.field === 'certNumber');
+    if (certChange && typeof certChange.after === 'string' && c.grader) {
+      const clash = await this.prisma.consignment.findFirst({
+        where: {
+          grader: c.grader,
+          certNumber: certChange.after,
+          id: { not: id },
+          ...liveConsignmentWhere(),
+        },
+        select: { id: true, status: true },
+      });
+      if (clash) {
+        throw new ConflictException(
+          `Sertifikat ${c.grader} ${certChange.after} SUDAH dipakai titipan aktif lain ` +
+            `(${clash.id}, status ${clash.status}). Satu kartu fisik tidak bisa punya dua ` +
+            'titipan hidup — periksa lagi nomor yang tertera di slab-nya.',
+        );
+      }
+    }
+
+    const listingId = c.listing?.id ?? null;
+    let listingUpdated = false;
+    // DIBEDAKAN dari `listingUpdated` supaya baris auditnya tidak berbohong: "tidak ada kolom
+    // listing yang perlu disesuaikan" (mis. hanya `cardSet` yang dikosongkan) BUKAN hal yang
+    // sama dengan "listing-nya sudah tidak ACTIVE sehingga tidak boleh disentuh".
+    let listingMirrorAttempted = false;
+    await this.prisma.$transaction(async (tx) => {
+      const claimed = await tx.consignment.updateMany({ where: guard, data });
+      if (claimed.count !== 1) {
+        throw consignmentError({
+          status: HttpStatus.CONFLICT,
+          code: CONSIGNMENT_ERROR_CODE.BAD_TRANSITION,
+          message:
+            'Salah satu nilai yang dikoreksi sudah berubah sejak layar ini dimuat (mungkin ' +
+            'operator lain memperbaikinya lebih dulu). TIDAK ADA yang ditulis — muat ulang ' +
+            'barisnya dan lihat nilainya sekarang sebelum mengoreksi lagi.',
+          consignmentId: id,
+        });
+      }
+
+      // ══ JUDUL PUBLIK IKUT, DI TRANSAKSI YANG SAMA ══
+      if (listingId) {
+        const listingData: Prisma.ListingUpdateManyMutationInput = {};
+        for (const ch of changes) {
+          if (ch.field === 'cardName') listingData.name = String(ch.after);
+          // `Listing.set` NOT NULL: mengosongkan cardSet tidak boleh mengosongkan kolom itu.
+          if (ch.field === 'cardSet' && ch.after != null) {
+            listingData.set = String(ch.after);
+          }
+          if (ch.field === 'cardNumber') {
+            listingData.cardNumber = ch.after == null ? null : String(ch.after);
+          }
+          if (ch.field === 'certNumber') {
+            listingData.certificate =
+              ch.after == null ? null : String(ch.after);
+          }
+        }
+        // `grade`/`gradeScore` dihitung ULANG dari nilai SESUDAH koreksi, dengan rumus yang
+        // SAMA PERSIS dengan `createListingFor` — supaya baris yang dikoreksi tidak berbeda
+        // bentuk dari baris yang dipajang dengan nilai benar sejak awal.
+        const labelChange = changes.find((ch) => ch.field === 'gradeLabel');
+        const scoreChange = changes.find((ch) => ch.field === 'gradeScore');
+        if (labelChange || scoreChange) {
+          // DIBACA DARI `changes`, BUKAN dari `data` dengan `??`: koreksi yang MENGOSONGKAN
+          // `gradeLabel` menulis `null`, dan `null ?? c.gradeLabel` akan diam-diam memulihkan
+          // label LAMA ke baris listing — persis label palsu yang rute ini ada untuk menghapus.
+          // `changes` membedakan "tidak disebut" dari "disebut, dan nilainya null".
+          const nextLabel = (labelChange ? labelChange.after : c.gradeLabel) as
+            | string
+            | null;
+          const nextScore = (scoreChange ? scoreChange.after : c.gradeScore) as
+            | number
+            | null;
+          listingData.grade =
+            nextLabel ?? `${c.grader ?? ''} ${nextScore ?? ''}`.trim();
+          listingData.gradeScore = nextScore ?? 0;
+        }
+        if (Object.keys(listingData).length > 0) {
+          listingMirrorAttempted = true;
+          const upd = await tx.listing.updateMany({
+            // `consignmentId: id` ikut disebut: rute ini tidak boleh bisa menyentuh baris
+            // listing mana pun yang bukan milik titipan ini.
+            where: {
+              id: listingId,
+              consignmentId: id,
+              status: ListingStatus.ACTIVE,
+            },
+            data: listingData,
+          });
+          listingUpdated = upd.count === 1;
+        }
+      }
+
+      await this.writeEvent(tx, {
+        consignmentId: id,
+        kind: 'LABEL_CORRECTION',
+        actor: admin,
+        note:
+          'Koreksi LABEL (menimpa kolom identitas kartu; catatan kondisi & foto TIDAK ' +
+          `disentuh). ${changes.map(describeChange).join('; ')}. ` +
+          (listingId
+            ? listingUpdated
+              ? `Judul publik listing ${listingId} ikut disesuaikan di transaksi yang sama. `
+              : listingMirrorAttempted
+                ? `Listing ${listingId} TIDAK disesuaikan (sudah tidak ACTIVE — baris itu ` +
+                  'snapshot apa yang dibeli pembeli). '
+                : `Listing ${listingId} tidak punya kolom yang perlu ikut berubah. `
+            : '') +
+          `Alasan: ${dto.note.trim()}`,
+      });
+    });
+
+    this.logger.warn(
+      `KOREKSI LABEL titipan ${id} oleh admin ${admin.id}: ` +
+        `${changes.map(describeChange).join('; ')}.` +
+        (listingUpdated ? ` Listing ${listingId} ikut disesuaikan.` : ''),
+    );
+    return {
+      corrected: changes,
+      listingUpdated,
+      ...(await this.byId(id)),
+    };
+  }
+
   /* ══════════════════════════════ 7. PEMBACAAN ══════════════════════════════ */
+
+  /**
+   * ╔════════════════════════════════════════════════════════════════════════════════════════╗
+   * ║ `omit: { claimCodeHash: true }` — DIPASANG DI SETIAP PEMBACAAN DI FILE INI.            ║
+   * ╚════════════════════════════════════════════════════════════════════════════════════════╝
+   *
+   * `include` mengembalikan SELURUH kolom skalar baris itu, jadi tanpa `omit` hash kode klaim
+   * ikut terbang ke browser — di rute admin MAUPUN di rute pemilik. Hash-nya bukan kode dan tidak
+   * bisa dibalik, tapi ia satu-satunya bagian dari sebuah rahasia hidup yang tersimpan, dan tidak
+   * ada satu pun pembaca yang membutuhkannya. `omit` dipilih alih-alih membuang field sesudahnya
+   * karena ia juga MENGHAPUSNYA DARI TIPE: penambah field baru di serializer tidak bisa
+   * mengembalikannya tanpa sadar. (Bandingkan `listUsers` di admin.service.ts, yang mencantumkan
+   * kolomnya satu per satu supaya `nonce`/`passwordHash` tidak pernah ikut.)
+   *
+   * `claimCodeIssuedAt` / `claimCodeExpiresAt` SENGAJA TETAP DIKIRIM: keduanya bukan rahasia, dan
+   * justru merekalah yang memberi tahu operator kapan sebuah kode perlu diterbitkan ulang.
+   */
+  private static readonly OMIT_SECRETS = { claimCodeHash: true } as const;
 
   /** Satu titipan, lengkap dengan bukti dan riwayatnya. */
   async byId(id: string) {
     const row = await this.prisma.consignment.findUnique({
       where: { id },
+      omit: ConsignmentService.OMIT_SECRETS,
       include: {
         photos: { orderBy: { createdAt: 'asc' } },
         events: { orderBy: { createdAt: 'asc' } },
         listing: true,
+        // Relasi OPSIONAL sejak titipan bisa diterima dari orang tanpa akun: `consignor` BISA
+        // null di sini, dan frontend wajib menanganinya lewat `ownerLinked` di bawah, bukan
+        // dengan menebak dari ada-tidaknya objek ini.
         consignor: {
           select: { id: true, displayName: true, walletAddress: true },
         },
@@ -930,13 +2393,18 @@ export class ConsignmentService {
       },
     });
     if (!row) throw new NotFoundException('Titipan tidak ditemukan.');
-    return { ...row, inCustody: isInHoshiCustody(row) };
+    return { ...row, ...this.custodyFlags(row) };
   }
 
   /** Titipan milik user login. Rute PEMILIK — ia berhak melihat buktinya sendiri. */
   async listMine(userId: string) {
     const rows = await this.prisma.consignment.findMany({
+      // `userId` selalu non-null, jadi baris yang BELUM tertaut (consignorId null) tidak pernah
+      // muncul di sini — dan itu benar: sebelum kode klaimnya ditukarkan, tidak ada akun yang
+      // berhak mengatakan baris ini miliknya. Inilah juga yang membuat penukaran kode terasa
+      // sebagai jawaban: sesudahnya, kartunya muncul di sini.
       where: { consignorId: userId },
+      omit: ConsignmentService.OMIT_SECRETS,
       include: {
         photos: { orderBy: { createdAt: 'asc' } },
         events: { orderBy: { createdAt: 'asc' } },
@@ -946,7 +2414,81 @@ export class ConsignmentService {
       },
       orderBy: { createdAt: 'desc' },
     });
-    return rows.map((r) => ({ ...r, inCustody: isInHoshiCustody(r) }));
+    return rows.map((r) => ({ ...r, ...this.custodyFlags(r) }));
+  }
+
+  /**
+   * EMPAT JAWABAN YANG BERBEDA, dan keempatnya dikirim terpisah supaya frontend tidak perlu
+   * menyimpulkan salah satunya dari yang lain:
+   *
+   *   inCustody           kartunya ADA di rak Hoshi dan boleh dijual (gerbang custody).
+   *   ownerLinked         kita TAHU siapa yang dibayar kalau ia terjual.
+   *   awaitingOwnerClaim  pemiliknya belum tertaut DAN penautan itu masih berarti sesuatu yang
+   *                       belum Hoshi tunaikan — definisinya `isAwaitingConsignorClaim` di gate,
+   *                       satu-satunya tempat ia ditulis (SQL-nya `awaitingConsignorWhere`).
+   *   belowReserve        harga yang berlaku SEKARANG ada di bawah lantai yang disepakati pemilik.
+   *
+   * `inCustody && !ownerLinked` adalah kombinasi yang dulu MUSTAHIL dan sekarang normal: kartu
+   * ada di tangan kita, dan ia tetap tidak boleh dipajang. UI yang menampilkan tombol "Pajang"
+   * berdasarkan `inCustody` saja akan menawarkan aksi yang pasti ditolak.
+   *
+   * `belowReserve` MEMBACA HARGA LISTING kalau listing-nya masih ACTIVE, dan baru jatuh kembali
+   * ke `askPriceIdr` kalau tidak ada listing yang tayang — karena yang dilihat pembeli, dan
+   * karena itu yang benar-benar mengikat pemiliknya, adalah angka di baris listing. `reservePriceIdr`
+   * sendiri ikut terkirim apa adanya di setiap baris (semua kolom skalar ikut di `byId`,
+   * `listMine`, dan `adminList`), jadi layar bisa menampilkan ANGKANYA, bukan cuma benderanya.
+   */
+  private custodyFlags(
+    r: {
+      id: string;
+      status: ConsignmentStatus;
+      custodyAcceptedAt: Date | null;
+      custodyReleasedAt: Date | null;
+      consignorId: string | null;
+      askPriceIdr: number;
+      reservePriceIdr: number | null;
+      listing?: { status: ListingStatus; priceIdrx: number } | null;
+      withdrawRequestedAt?: Date | null;
+    } & ConsignmentReturnFacts,
+  ) {
+    const ownerLinked = isConsignorLinked(r);
+    const livePrice =
+      r.listing && r.listing.status === ListingStatus.ACTIVE
+        ? r.listing.priceIdrx
+        : null;
+    return {
+      inCustody: isInHoshiCustody(r),
+      ownerLinked,
+      awaitingOwnerClaim: isAwaitingConsignorClaim(r),
+      /** Boleh dipajang HANYA kalau KEDUA pertanyaan terjawab ya. */
+      listable:
+        isInHoshiCustody(r) &&
+        ownerLinked &&
+        r.status === ConsignmentStatus.IN_CUSTODY,
+      /** Harga yang berlaku (listing tayang kalau ada, kalau tidak harga kesepakatan). */
+      effectivePriceIdr: livePrice ?? r.askPriceIdr,
+      belowReserve:
+        r.reservePriceIdr != null &&
+        (livePrice ?? r.askPriceIdr) < r.reservePriceIdr,
+
+      /* ── PENGEMBALIAN: DUA JAWABAN LAGI, DAN KEDUANYA MEMANG TERPISAH ──────────────────────
+         returnAddressComplete  alamat pengembaliannya lengkap menurut SATU-SATUNYA definisi
+                                yang ada (`isReturnAddressComplete` di gate). Relevan HANYA untuk
+                                metode COURIER.
+         returnPlanReady        kita tahu CUKUP untuk berani melepas custody: PICKUP selalu siap,
+                                COURIER siap kalau alamatnya lengkap.
+
+         KENAPA DIKIRIM SERVER DAN BUKAN DITURUNKAN UI. Layar admin yang menghitung sendiri
+         "alamatnya lengkap?" adalah SALINAN KEDUA dari aturan yang sudah hidup di gate dan di
+         CHECK database — dan salinan kedua berarti salah satunya akan diam-diam salah, lalu
+         menawarkan tombol "Catat kartu keluar" yang pasti ditolak sambil pemilik kartunya
+         menunggu di depan meja. */
+      returnAddressComplete: isReturnAddressComplete(r),
+      returnPlanReady: isReturnPlanReady(r),
+      /** Ditarik tapi kartunya MASIH di rak kami — keadaan yang tidak boleh hilang dari layar. */
+      returnPending:
+        r.withdrawRequestedAt != null && r.custodyReleasedAt == null,
+    };
   }
 
   /**
@@ -954,20 +2496,31 @@ export class ConsignmentService {
    * sama dengan `listUnsellableStock`. Barang orang lain yang tergeletak tanpa ada yang melihat
    * adalah cara paling umum sebuah janji custody diingkari tanpa siapa pun berniat begitu.
    */
-  async adminList(status?: ConsignmentStatus) {
+  async adminList(status?: ConsignmentStatus, filter?: 'AWAITING_OWNER') {
     const rows = await this.prisma.consignment.findMany({
-      where: status ? { status } : {},
+      where: {
+        ...(status ? { status } : {}),
+        // Filter eksplisit "tampilkan yang menunggu pemiliknya". Satu definisi dengan
+        // `awaitingConsignorWhere()` di gate, supaya daftar dan hitungannya tidak bisa melenceng.
+        ...(filter === 'AWAITING_OWNER' ? awaitingConsignorWhere() : {}),
+      },
+      omit: ConsignmentService.OMIT_SECRETS,
       include: {
         photos: { select: { id: true, kind: true, url: true } },
         listing: { select: { id: true, status: true, priceIdrx: true } },
+        // BISA null sejak titipan boleh diterima dari orang tanpa akun. Kolom snapshot
+        // `consignorNameAtIntake`/`consignorPhoneAtIntake` ikut terkirim di baris yang sama dan
+        // SELALU terisi — itulah yang dipakai operator untuk menghubungi orangnya.
         consignor: {
           select: { id: true, displayName: true, walletAddress: true },
         },
       },
       orderBy: { createdAt: 'desc' },
     });
-    const staleBefore = new Date(
-      Date.now() - STALE_INTAKE_DAYS * 24 * 60 * 60 * 1000,
+    const now = Date.now();
+    const staleBefore = new Date(now - STALE_INTAKE_DAYS * 24 * 60 * 60 * 1000);
+    const unlinkedStaleBefore = new Date(
+      now - UNLINKED_CUSTODY_DAYS * 24 * 60 * 60 * 1000,
     );
     const actionRequired = rows
       .map((r) => {
@@ -981,11 +2534,93 @@ export class ConsignmentService {
             `INTAKE sudah lebih dari ${STALE_INTAKE_DAYS} hari tanpa serah-terima.`,
           );
         }
-        // Pemilik sudah minta kartunya kembali, tapi kartunya belum benar-benar diserahkan.
-        if (r.withdrawRequestedAt != null && r.custodyReleasedAt == null) {
+        // ── KARTUNYA DI RAK KITA DAN KITA BELUM TAHU SIAPA PEMILIKNYA ────────────────────
+        //
+        // SENGAJA DIPISAH dari alasan INTAKE di atas dan SENGAJA berambang lebih pendek. Ini
+        // bukan "kesepakatan yang menggantung" melainkan BARANG ORANG LAIN YANG SUDAH ADA DI
+        // TANGAN KITA tanpa siapa pun di sisi sistem yang bisa dihubungi. Kalimatnya menyebut
+        // pemulihannya, dan TIDAK menyebut custody — kartunya sudah ada, yang kurang orangnya.
+        if (
+          isPhysicallyHeldByHoshi(r) &&
+          !isConsignorLinked(r) &&
+          r.createdAt < unlinkedStaleBefore
+        ) {
           reasons.push(
-            'Pemilik minta kartunya kembali; serah-terima pengembaliannya BELUM dicatat.',
+            `Kartunya ADA di rak Hoshi tapi pemiliknya BELUM tertaut akun setelah lebih dari ` +
+              `${UNLINKED_CUSTODY_DAYS} hari — tidak bisa dipajang, dan kalau sampai hilang, ` +
+              `ganti ruginya tidak punya tujuan. Hubungi ${r.consignorNameAtIntake} di ` +
+              `${r.consignorPhoneAtIntake}: minta ia menukarkan kode klaimnya, atau tautkan ` +
+              'akunnya setelah identitasnya diperiksa.',
           );
+        }
+        // ── HARGA TAYANG DI BAWAH LANTAI YANG DISEPAKATI PEMILIK ────────────────────────
+        //
+        // Bukan penolakan (lihat `belowReserveWarning`) — tapi selama kartunya MASIH tayang di
+        // bawah angka itu, keadaannya masih berlangsung, jadi ia harus tetap terlihat. Hanya
+        // untuk listing yang ACTIVE: harga listing yang sudah SOLD/CANCELLED tidak bisa diapa-
+        // apakan lagi, dan menyalakan peringatan untuknya cuma kebisingan.
+        if (
+          r.reservePriceIdr != null &&
+          r.listing != null &&
+          r.listing.status === ListingStatus.ACTIVE &&
+          r.listing.priceIdrx < r.reservePriceIdr
+        ) {
+          reasons.push(
+            `Terpajang Rp ${r.listing.priceIdrx}, DI BAWAH harga terendah yang disepakati ` +
+              `pemilik (reserve Rp ${r.reservePriceIdr}). Pastikan pemiliknya memang setuju — ` +
+              'angka reserve bagian dari perjanjian bertanda tangan. Kalau belum, naikkan lagi ' +
+              'lewat PATCH /admin/consignments/:id/price.',
+          );
+        }
+        // Kode klaimnya kedaluwarsa dan pemiliknya masih belum tertaut → terbitkan ulang.
+        //
+        // Predikatnya `isAwaitingConsignorClaim`, BUKAN "bukan CANCELLED": kartu yang sudah
+        // DIKEMBALIKAN (RELEASED) ke orang yang menyerahkannya tidak menunggu kode apa pun, dan
+        // menerbitkan ulang untuknya hanya menyetel ulang jam 30 hari tanpa menyelesaikan apa pun.
+        if (
+          isAwaitingConsignorClaim(r) &&
+          r.claimCodeExpiresAt != null &&
+          r.claimCodeExpiresAt.getTime() <= now
+        ) {
+          reasons.push(
+            'Kode klaimnya sudah KEDALUWARSA dan pemiliknya belum tertaut. Terbitkan ulang ' +
+              '(POST /admin/consignments/:id/claim-code) lalu serahkan kodenya ke pemiliknya.',
+          );
+        }
+        // ── PEMILIK SUDAH MINTA KARTUNYA KEMBALI, TAPI KARTUNYA MASIH DI RAK KITA ───────────
+        //
+        // Kalimatnya SENGAJA menyebut APA YANG KURANG, bukan sekadar "belum dicatat". Sebelum
+        // rencana pengembalian punya kolom, baris ini hanya bisa berkata "atur serah-terimanya" —
+        // dan operator yang membacanya tidak punya cara tahu apakah yang hilang adalah alamat,
+        // nomor resi, atau tidak ada apa-apa dan tinggal menekan tombol. Peringatan yang tidak
+        // menyebut langkah berikutnya adalah peringatan yang diajarkan untuk diabaikan.
+        if (r.withdrawRequestedAt != null && r.custodyReleasedAt == null) {
+          const base =
+            'Pemilik minta kartunya kembali; kartunya MASIH di rak Hoshi dan serah-terima ' +
+            'pengembaliannya BELUM dicatat.';
+          if (r.returnMethod == null) {
+            reasons.push(
+              `${base} Cara pengembaliannya juga belum ditentukan — tanyakan ke pemiliknya: ` +
+                'diambil sendiri, atau dikirim kurir (butuh alamat lengkap + ongkir)?',
+            );
+          } else if (!isReturnPlanReady(r)) {
+            reasons.push(
+              `${base} Alamat pengembaliannya BELUM LENGKAP (kurang: ` +
+                `${missingReturnAddressFields(r).join(', ')}), jadi kartu ini tidak akan bisa ` +
+                'ditandai terkirim sampai dilengkapi.',
+            );
+          } else if (r.returnShippingPayer == null) {
+            reasons.push(
+              `${base} Tujuannya sudah jelas; yang belum adalah SIAPA yang menanggung ongkir ` +
+                'baliknya — catat sekarang, supaya ongkos yang ditanggung Hoshi tidak jadi ' +
+                'kebocoran yang tidak terlihat di laporan mana pun.',
+            );
+          } else {
+            reasons.push(
+              `${base} Tujuan dan ongkirnya sudah lengkap — tinggal kirim/serahkan, lalu catat ` +
+                'resi (atau siapa yang mengambil) di rute pelepasan custody.',
+            );
+          }
         }
         // Sudah terjual, tapi pembeli belum meminta pengiriman — kartunya masih di rak kita.
         if (
@@ -1005,15 +2640,65 @@ export class ConsignmentService {
           v != null,
       );
 
+    /**
+     * ╔══════════════════════════════════════════════════════════════════════════════════════╗
+     * ║ SEKILAS: KARTU DI TANGAN KITA YANG MASIH MENUNGGU PEMILIKNYA.                        ║
+     * ╚══════════════════════════════════════════════════════════════════════════════════════╝
+     *
+     * TERPISAH dari `actionRequired` DENGAN SENGAJA. `actionRequired` hanya menyala setelah
+     * ambang waktu terlewat — sedangkan daftar ini menampilkan SEMUANYA, sejak hari pertama,
+     * karena pertanyaan "kartu siapa saja yang saya pegang tanpa tahu pemiliknya" harus bisa
+     * dijawab SEKARANG, bukan seminggu lagi.
+     *
+     * Tiap baris memuat nama & telepon dari snapshot serah-terima (satu-satunya cara menghubungi
+     * orangnya saat belum ada akun) dan keadaan kode klaimnya, supaya operator tahu apakah yang
+     * dibutuhkan adalah menelepon atau menerbitkan ulang.
+     */
+    const awaitingOwner = rows
+      // SATU definisi dengan `awaitingConsignorWhere()` yang dipakai filter SQL di atas, dan
+      // dengan flag `awaitingOwnerClaim` per baris. Ketiganya memanggil fungsi yang SAMA, jadi
+      // hitungan badge, isi daftar, dan bendera di barisnya tidak bisa saling bertentangan.
+      .filter((r) => isAwaitingConsignorClaim(r))
+      .map((r) => ({
+        id: r.id,
+        cardName: r.cardName,
+        status: r.status,
+        /** Kartunya benar-benar di rak kita (bukan sekadar kesepakatan yang dicatat). */
+        heldByHoshi: isPhysicallyHeldByHoshi(r),
+        storageLocation: r.storageLocation,
+        receivedAtPlace: r.receivedAtPlace,
+        consignorNameAtIntake: r.consignorNameAtIntake,
+        consignorPhoneAtIntake: r.consignorPhoneAtIntake,
+        claimCodeIssuedAt: r.claimCodeIssuedAt,
+        claimCodeExpiresAt: r.claimCodeExpiresAt,
+        claimCodeExpired:
+          r.claimCodeExpiresAt != null && r.claimCodeExpiresAt.getTime() <= now,
+        /** Tidak ada kode hidup sama sekali → satu-satunya jalan adalah menerbitkan ulang. */
+        needsClaimCode: r.claimCodeExpiresAt == null,
+        createdAt: r.createdAt,
+      }));
+
     return {
       total: rows.length,
-      rows: rows.map((r) => ({ ...r, inCustody: isInHoshiCustody(r) })),
+      rows: rows.map((r) => ({ ...r, ...this.custodyFlags(r) })),
       actionRequired,
+      awaitingOwner,
+      /** Angka untuk badge: berapa kartu yang dipegang Hoshi tanpa pemilik tertaut. */
+      awaitingOwnerCount: awaitingOwner.length,
     };
   }
 
   /* ══════════════════════════════ internal ══════════════════════════════ */
 
+  /**
+   * Baris titipan untuk dipakai DI DALAM service ini.
+   *
+   * SENGAJA TIDAK memakai `OMIT_SECRETS`, tidak seperti `byId`/`listMine`/`adminList`: hasilnya
+   * TIDAK PERNAH dikembalikan ke client (setiap rute menutup dengan `this.byId(...)`, yang
+   * mengomit), dan `issueClaimCode` MEMBUTUHKAN `claimCodeHash` untuk tahu apakah ia sedang
+   * menerbitkan atau MENERBITKAN ULANG. Kalau suatu saat ada rute yang mengembalikan baris ini apa
+   * adanya, ia WAJIB mengomit dulu.
+   */
   private async requireConsignment(id: string) {
     const row = await this.prisma.consignment.findUnique({
       where: { id },

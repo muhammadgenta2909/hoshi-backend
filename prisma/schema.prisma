@@ -1414,7 +1414,21 @@ enum ConsignmentStatus {
   CANCELLED
 }
 
-/// Jenis foto bukti saat serah-terima. FRONT/BACK wajib; CERT wajib bila ada nomor sertifikat.
+/// Jenis foto bukti saat serah-terima.
+///
+/// WAJIB sebelum custody boleh diterima: FRONT, BACK, HANDOVER — plus CERT bila ada nomor
+/// sertifikat. Ditegakkan di `ConsignmentService.acceptCustody`, yaitu satu-satunya jalan masuk
+/// ke IN_CUSTODY; karena rute itu hanya bisa dilewati SEKALI per titipan (INTAKE → IN_CUSTODY,
+/// berpredikat `custodyAcceptedAt: null`), syaratnya berlaku untuk PENERIMAAN BARU saja dan tidak
+/// bisa mengunci baris yang sudah lebih dulu ada di rak.
+///
+/// DUA JENIS BUKTI YANG BERBEDA, dan bedanya bukan gaya penamaan:
+///   FRONT/BACK/CERT  bukti KEADAAN BARANGNYA — menjawab "sudah begitu sejak awal?"
+///   HANDOVER         bukti ADANYA KESEPAKATAN — foto STRUK SERAH TERIMA sesudah ditandatangani
+///                    kedua pihak. Inilah satu-satunya bukti yang menjawab "dia memang setuju
+///                    menitipkannya, dengan harga dan komisi ini, pada hari itu" — pertanyaan
+///                    yang tidak bisa dijawab oleh foto slab sebagus apa pun.
+///   DAMAGE/OTHER     tambahan, bebas.
 enum ConsignmentPhotoKind {
   FRONT
   BACK
@@ -1429,18 +1443,60 @@ model Consignment {
   id String @id @default(cuid())
 
   // ── SIAPA PEMILIKNYA ─────────────────────────────────────────────────────────────────────
-  consignorId String
+  /// NULLABLE DENGAN SENGAJA, dan ini keputusan produk, bukan kelonggaran teknis.
+  ///
+  /// PM mendatangi kolektor lokal di rumahnya. Kebanyakan dari mereka BELUM punya akun Hoshi, dan
+  /// tidak ada seorang pun yang bisa mengetikkan id database di ponsel sambil pemilik kartunya
+  /// berdiri di depannya. Kartunya tetap harus bisa diterima HARI ITU. Jadi ada dua jalan masuk:
+  ///
+  ///   PATH A  pemiliknya masuk akun saat serah-terima → operator mencarinya (rute pencarian
+  ///           admin, yang TIDAK PERNAH mencocokkan sendiri) dan `consignorId` terisi sejak awal.
+  ///   PATH B  pemiliknya belum/tidak mau masuk akun → baris ini lahir dengan `consignorId` NULL,
+  ///           dan tanda terima yang ia pegang memuat KODE KLAIM sekali pakai. Belakangan ia
+  ///           masuk akun dengan cara apa pun, menukarkan kodenya, dan barulah kolom ini terisi.
+  ///
+  /// YANG TIDAK BERUBAH: baris tanpa pemilik TIDAK BISA DIPAJANG dan TIDAK BISA TERJUAL. Ditegakkan
+  /// di tiga lapis — predikat klaim `listClaimWhere`, CHECK `consignments_listed_requires_owner_chk`
+  /// di tabel ini, dan CHECK `listings_consignment_shape_chk` yang menuntut `sellerId IS NOT NULL`.
+  /// Menjual kartu yang pemiliknya tidak diketahui berarti memegang uang orang tanpa cara
+  /// menghubunginya.
+  consignorId String?
   /// Restrict, seperti BalanceEntry.userId: catatan tentang BARANG ORANG LAIN harus hidup lebih
   /// lama dari fitur hapus-akun apa pun yang mungkin ditambahkan nanti.
-  consignor   User   @relation("ConsignmentConsignor", fields: [consignorId], references: [id], onDelete: Restrict)
+  consignor   User?   @relation("ConsignmentConsignor", fields: [consignorId], references: [id], onDelete: Restrict)
 
   /// SNAPSHOT saat serah-terima. `User.displayName`/telepon bisa berubah kemudian; apa yang benar
   /// pada HARI penyerahan tidak bisa diturunkan ulang dari baris yang bisa berubah.
+  ///
+  /// TETAP WAJIB (NOT NULL) MESKI `consignorId` NULL — justru DI SANA ia paling penting: saat tidak
+  /// ada akun untuk dirujuk, dua kolom inilah SATU-SATUNYA cara operator dan pemilik kartu bisa
+  /// saling mengenali lagi nanti.
   consignorNameAtIntake  String
   consignorPhoneAtIntake String
   consignorIdKind        String? // "KTP" | "SIM" | "PASPOR"
   /// EMPAT DIGIT TERAKHIR SAJA. Nomor identitas lengkap TIDAK PERNAH disimpan.
   consignorIdLast4       String?
+
+  /// KAPAN dan LEWAT MANA pemiliknya tertaut. Fakta append-only, seperti stempel custody:
+  /// "AT_INTAKE" (sudah punya akun saat serah-terima) | "CLAIM_CODE" (menukarkan kode di tanda
+  /// terimanya) | "ADMIN_LINK" (admin menautkan setelah memeriksa identitas langsung).
+  consignorLinkedAt     DateTime?
+  consignorLinkMethod   String?
+
+  /// ── KODE KLAIM (Path B) ───────────────────────────────────────────────────────────────────
+  /// SHA-256 hex dari kode yang dicetak di tanda terima. TEKS KODENYA TIDAK PERNAH DISIMPAN dan
+  /// tidak pernah di-log: ia ada tepat sekali, di body respons rute penerbitan. Lihat
+  /// `src/common/consignment-claim-code.ts` untuk entropi, normalisasi, dan alasannya.
+  ///
+  /// @unique: satu kode tidak pernah bisa cocok dengan dua titipan — jadi tebakan yang kebetulan
+  /// berhasil pun hanya bisa mengenai satu baris, dan penukaran bisa dicari lewat satu index.
+  /// DIKOSONGKAN saat penukaran berhasil, di transaksi yang sama: "sekali pakai" jadi BENTUK
+  /// BARIS, bukan janji kode.
+  claimCodeHash      String?   @unique
+  claimCodeIssuedAt  DateTime?
+  /// Kertas yang tertinggal setahun di laci bukan kunci yang masih hidup. Kedaluwarsa BUKAN jalan
+  /// buntu: admin bisa menerbitkan ulang, dan penerbitan ulang MENIMPA hash lama (kertas lama mati).
+  claimCodeExpiresAt DateTime?
 
   // ── SIAPA YANG MENERIMA ──────────────────────────────────────────────────────────────────
   receivedById    String
@@ -1501,6 +1557,87 @@ model Consignment {
   /// Pemilik meminta kartunya kembali. Bukan gerbang — gerbangnya `custodyReleasedAt`.
   withdrawRequestedAt DateTime?
 
+  // ── PENGEMBALIAN KARTU KE PEMILIKNYA: ONGKIR BALIK + RESI ────────────────────────────────
+  //
+  // ╔══════════════════════════════════════════════════════════════════════════════════════════╗
+  // ║ KENAPA KOLOM-KOLOM INI ADA. Sebelum mereka, "ditarik" adalah satu-satunya hal yang       ║
+  // ║ diketahui sistem tentang kartu senilai puluhan juta yang pulang ke pemiliknya: ke MANA   ║
+  // ║ ia dikirim, SIAPA yang membayar ongkirnya, dan apakah ia BENAR-BENAR SAMPAI tidak        ║
+  // ║ tercatat di mana pun. Satu baris bisa berbunyi RELEASED sementara kartunya masih di rak  ║
+  // ║ — atau sudah dikirim ke alamat yang tidak pernah ditulis siapa pun.                      ║
+  // ╚══════════════════════════════════════════════════════════════════════════════════════════╝
+  //
+  // SEMUANYA NULLABLE DENGAN SENGAJA: tabel ini sudah berisi data di produksi, dan migrasi yang
+  // gagal di droplet berarti server tidak pernah menyala. Yang MENEGAKKAN kelengkapannya bukan
+  // NOT NULL melainkan (a) predikat klaim `withdrawnReleaseClaimWhere()` di
+  // `src/common/consignment.gate.ts` — kartu tidak bisa ditandai keluar kalau alamatnya belum
+  // ada — dan (b) CHECK `consignments_return_shape_chk` (migration 20260924000000), yang
+  // menuntut: begitu sebuah CARA PENGEMBALIAN dinyatakan, bentuk barisnya harus konsisten.
+
+  /// CARA kartunya pulang. "PICKUP" (diambil sendiri di tempat Hoshi) | "COURIER" (dikirim kurir).
+  ///
+  /// DUA CARA, dan keduanya WAJIB ada. Memaksa semua pengembalian lewat kurir berarti menagih
+  /// ongkir kepada orang yang rumahnya lima menit dari kantor; memaksa semuanya diambil sendiri
+  /// berarti kolektor di Medan tidak pernah bisa mendapatkan kartunya kembali. Kolom ini yang
+  /// memutuskan BUKTI MANA yang diminta sebelum custody boleh dilepas:
+  ///   PICKUP  → `returnPickedUpBy` (siapa yang mengambil). "Kapan"-nya adalah
+  ///             `custodyReleasedAt` — SENGAJA tidak ada stempel kedua, karena dua tanggal untuk
+  ///             satu kejadian adalah dua tanggal yang suatu hari akan berbeda.
+  ///   COURIER → alamat lengkap di bawah + `returnCourier` & `returnTrackingNo`.
+  returnMethod String?
+
+  /// ── ALAMAT PENGEMBALIAN — SNAPSHOT, dan BENTUKNYA SENGAJA SAMA PERSIS dengan
+  /// `CardRedemption` (jalur kirim domestik yang sudah ada). Nama kolomnya cuma berawalan
+  /// `return` supaya tidak bertabrakan di dalam model ini.
+  ///
+  /// SNAPSHOT, bukan FK ke `ShippingAddress`, karena dua alasan yang dua-duanya mengikat:
+  ///   • pemilik kartu BISA saja belum punya akun sama sekali (Path B / kode klaim), jadi ia
+  ///     tidak punya buku alamat untuk dirujuk;
+  ///   • alamat yang diubah atau dihapus SESUDAH kartunya dikirim tidak boleh mengubah ke mana
+  ///     kartu itu tercatat dikirim. Itu alasan yang sama dengan snapshot di `CardRedemption`.
+  returnRecipientName    String?
+  returnPhoneCountryCode String?
+  returnPhoneNumber      String?
+  returnStreet           String?
+  returnApt              String?
+  returnCity             String?
+  /// PROVINSI. Ikut menentukan TIER ONGKIR (lihat `src/payments/domestic-shipping-rate.ts`):
+  /// provinsi yang tidak dikenali jatuh ke tier PENAMPUNG yang lebih mahal, tidak pernah gratis.
+  returnState            String?
+  returnZip              String?
+  returnCountry          String?
+
+  /// ── RESI ──────────────────────────────────────────────────────────────────────────────────
+  /// Nama kurir ("JNE REG", "SiCepat BEST") dan nomor resinya. KEDUANYA wajib sebelum custody
+  /// boleh dilepas untuk pengembalian ber-metode COURIER: tanpa resi, "sudah dikirim" adalah
+  /// klaim yang tidak bisa diperiksa oleh pemilik kartunya sendiri — dan dialah satu-satunya
+  /// orang yang berhak memeriksanya.
+  returnCourier    String?
+  returnTrackingNo String?
+
+  /// SIAPA yang mengambil kartunya di tempat, untuk metode PICKUP ("Budi Santoso (pemilik), KTP
+  /// dicocokkan" / "Ani, istri pemilik, membawa surat kuasa"). Kalimat manusia, bukan id: yang
+  /// datang mengambil sering BUKAN pemegang akunnya.
+  returnPickedUpBy String?
+
+  /// ── SIAPA YANG MENANGGUNG ONGKIR BALIK ────────────────────────────────────────────────────
+  /// "OWNER" (pemilik kartu) | "HOSHI".
+  ///
+  /// ⚠️ DICATAT SAJA — PENAGIHANNYA BELUM OTOMATIS. Tidak ada invoice yang terbit dari kolom ini,
+  /// tidak ada saldo yang dipotong, tidak ada Rupiah yang bergerak di seluruh jalur penarikan
+  /// (itu janji produknya: menarik kartu GRATIS). Kolom ini ada supaya ongkos yang ditanggung
+  /// Hoshi BERHENTI menjadi kebocoran diam-diam: kalau tidak dicatat, ia tidak pernah muncul di
+  /// laporan mana pun dan tidak ada seorang pun yang bisa memutuskan apakah angkanya wajar.
+  /// Penagihannya, kalau nanti diputuskan, adalah pekerjaan terpisah yang harus memakai jalur
+  /// pembayaran yang SUDAH ADA — jangan membangun rail uang baru untuk ini.
+  returnShippingPayer String?
+
+  /// Nominal ongkir balik (Rupiah utuh). Diisi operator, atau ditaksir dari TARIF WILAYAH yang
+  /// SUDAH ADA (`resolveDomesticShippingIdr`) — tarif yang sama yang dipakai kirim domestik,
+  /// supaya tidak ada dua daftar ongkir yang bisa melenceng. Taksiran boleh ditimpa: yang benar
+  /// adalah angka di struk kurir, bukan tabel kita.
+  returnShippingFeeIdr Int?
+
   // ── HASIL ────────────────────────────────────────────────────────────────────────────────
   /// Back-relation dari `Listing.consignmentId` (1-1). Baris Listing ber-consignmentId TIDAK BISA
   /// lahir sebelum custody tercatat — lihat ConsignmentService.createListingFor.
@@ -1521,6 +1658,22 @@ model Consignment {
   @@index([custodyReleasedAt])
   /// PARTIAL UNIQUE INDEX (grader, certNumber) HANYA atas custody yang MASIH HIDUP — SQL mentah di
   /// migration 20260922000000; Prisma tidak bisa menyatakan index parsial. Lihat file itu.
+  ///
+  /// CHECK `consignments_listed_requires_owner_chk` (SQL mentah di migration 20260923000000;
+  /// Prisma tidak bisa menyatakan CHECK): baris tanpa `consignorId` TIDAK BISA berstatus LISTED
+  /// maupun SOLD. Itu lapis DATABASE dari aturan "kartu yang pemiliknya belum tertaut tidak boleh
+  /// dijual" — lapis kodenya ada di `listClaimWhere()`.
+  ///
+  /// CHECK `consignments_return_shape_chk` (SQL mentah di migration 20260925000000): begitu
+  /// `returnMethod` dinyatakan, bentuk barisnya WAJIB konsisten — 'PICKUP' berdiri sendiri,
+  /// 'COURIER' menuntut alamat pengembalian yang lengkap, dan nilai lain DITOLAK. Ia sengaja
+  /// TIDAK menuntut apa pun dari baris yang `returnMethod`-nya NULL: SELURUH baris yang sudah
+  /// ada di produksi berbentuk begitu, dan constraint yang menolak data lama berarti migrasi
+  /// gagal dan server tidak pernah menyala. Aturan "tidak boleh ditandai keluar tanpa alamat"
+  /// hidup di predikat klaim `withdrawnReleaseClaimWhere()`, bukan di sini.
+  ///
+  /// CHECK `consignments_return_payer_chk` dan `consignments_return_fee_chk` (migration yang
+  /// sama): penanggung ongkir hanya 'OWNER'/'HOSHI', dan nominalnya tidak pernah negatif.
   @@map("consignments")
 }
 
@@ -1554,7 +1707,14 @@ model ConsignmentEvent {
   consignment   Consignment @relation(fields: [consignmentId], references: [id], onDelete: Cascade)
 
   /// "INTAKE" | "ACCEPT_CUSTODY" | "LIST" | "PRICE" | "WITHDRAW_REQUEST" | "TAKE_DOWN" |
-  /// "SOLD" | "RELEASE" | "LOST" | "CANCEL" | "PHOTO" | "CORRECTION"
+  /// "SOLD" | "RELEASE" | "LOST" | "CANCEL" | "PHOTO" | "CORRECTION" | "LABEL_CORRECTION" |
+  /// "CLAIM_CODE_ISSUED" | "CLAIM_CODE_REDEEMED" | "CONSIGNOR_LINKED"
+  ///
+  /// "CORRECTION" vs "LABEL_CORRECTION" — garisnya BUKAN gaya penamaan:
+  ///   CORRECTION        catatan naratif yang TIDAK menimpa kolom apa pun (rute :id/correction).
+  ///   LABEL_CORRECTION  kolom identitas kartu BENAR-BENAR ditimpa (rute PATCH :id/label), dan
+  ///                     baris ini memuat nilai SEBELUM dan SESUDAH-nya. Catatan kondisi dan foto
+  ///                     tidak pernah termasuk: keduanya bukti, dan tidak punya rute update.
   kind String
 
   /// Status sebelum/sesudah. Null pada baris yang tidak memindahkan status (foto, koreksi).
