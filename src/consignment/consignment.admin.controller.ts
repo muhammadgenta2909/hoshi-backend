@@ -286,7 +286,9 @@ export class ConsignmentAdminController {
   @ApiOperation({
     summary:
       'Kartu hilang/rusak dalam pengawasan Hoshi. Listing yang masih hidup ikut diturunkan di ' +
-      'transaksi yang sama.',
+      'transaksi yang sama. Kalau kartunya SUDAH TERJUAL, utang ke PEMBELI langsung dicatat di ' +
+      'baris pembayarannya (REFUND_DUE, refundSafe=false) dan dilaporkan di `buyerRefundDebt` — ' +
+      'pemiliknya TETAP memegang payout-nya.',
   })
   markLost(
     @Param('id') id: string,
@@ -299,8 +301,12 @@ export class ConsignmentAdminController {
   @Post(':id/compensate')
   @ApiOperation({
     summary:
-      'Ganti rugi ke pemilik lewat ledger saldo yang sudah ada. IDEMPOTEN per titipan — klik ' +
-      'dua kali tidak bisa membayar dua kali.',
+      'Ganti rugi ke PEMILIK lewat ledger saldo yang sudah ada, SEBESAR `askPriceIdr` (harga ' +
+      'jual yang disepakati di struk serah terima) — nominalnya tidak diketik operator; ' +
+      '`amountIdr` hanya KONFIRMASI dan ditolak kalau berbeda. DITOLAK 409 kalau titipannya ' +
+      'sudah punya pembeli (yang wajib dipulihkan pembelinya, lewat REFUND_DUE pada order ' +
+      'pembayarannya) DAN kalau ganti ruginya SUDAH pernah tercatat — penolakan itu menyebut ' +
+      'nominal yang sudah masuk. Sukses SELALU berarti rupiah benar-benar bergerak.',
   })
   compensate(
     @Param('id') id: string,
@@ -336,10 +342,14 @@ export class ConsignmentAdminController {
   @Patch(':id/label')
   @ApiOperation({
     summary:
-      'Koreksi label kartu (cardName, cardSet, cardNumber, certNumber, gradeLabel, gradeScore). ' +
-      'Wajib beralasan; menyimpan nilai SEBELUM & SESUDAH sebagai baris audit LABEL_CORRECTION; ' +
-      'judul listing yang MASIH ACTIVE ikut diperbaiki di transaksi yang sama. Catatan kondisi ' +
-      'dan foto TIDAK bisa ditimpa lewat rute mana pun — keduanya bukti.',
+      'Koreksi label kartu (cardName, cardSet, cardNumber, certNumber, grader, gradeLabel, ' +
+      'gradeScore). Wajib beralasan; menyimpan nilai SEBELUM & SESUDAH sebagai baris audit ' +
+      'LABEL_CORRECTION; judul listing yang MASIH ACTIVE ikut diperbaiki di transaksi yang ' +
+      'sama. `grader` punya tiga syarat tambahan: ikut memicu pra-cek bentrok nomor sertifikat, ' +
+      'ikut memperbarui Listing.grader/grade, dan DITOLAK kalau titipannya sudah punya pembeli. ' +
+      'certNumber terisi dengan grader kosong juga DITOLAK (kunci anti-dobel-titip adalah ' +
+      'pasangan keduanya). Catatan kondisi dan foto TIDAK bisa ditimpa lewat rute mana pun — ' +
+      'keduanya bukti.',
   })
   correctLabel(
     @Param('id') id: string,

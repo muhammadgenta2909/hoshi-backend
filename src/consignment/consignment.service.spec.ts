@@ -5,7 +5,11 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import type { ConfigService } from '@nestjs/config';
-import { ConsignmentPhotoKind, ConsignmentStatus } from '@prisma/client';
+import {
+  ConsignmentPhotoKind,
+  ConsignmentStatus,
+  Prisma,
+} from '@prisma/client';
 import type { AuthUser } from '../auth/jwt.strategy';
 import type { BalanceService } from '../balance/balance.service';
 import {
@@ -63,6 +67,19 @@ describe('ConsignmentService', () => {
      * tarif yang SAMA dengan kirim domestik, bukan daftar keduanya sendiri.
      */
     domesticShippingRate: { findMany: Mock };
+    /**
+     * Ledger saldo. Dibaca DUA tempat sejak ganti rugi berhenti bisa gagal diam-diam:
+     * `compensate` (pra-cek "sudah pernah tercatat?") dan `adminList` (titipan LOST yang ganti
+     * ruginya belum ada sama sekali harus TETAP muncul di "Perlu tindakan").
+     */
+    balanceEntry: { findFirst: Mock; findMany: Mock };
+    /**
+     * Baris pembayaran PEMBELI. Rail utang yang SUDAH ADA (PaymentStatus.REFUND_DUE) — dipakai
+     * saat kartu yang SUDAH TERJUAL hilang di rak: yang tidak menerima apa pun adalah pembelinya.
+     */
+    paymentOrder: { findUnique: Mock; updateMany: Mock };
+    /** Jalur kirim: dibaca untuk menemukan paket yang sudah berangkat tapi custody-nya menggantung. */
+    cardRedemption: { findMany: Mock };
     listing: { create: Mock; updateMany: Mock };
     offer: { updateMany: Mock };
     activity: { create: Mock };
@@ -195,6 +212,15 @@ describe('ConsignmentService', () => {
       consignmentPhoto: { createMany: jest.fn().mockResolvedValue({}) },
       consignmentEvent: { create: jest.fn().mockResolvedValue({}) },
       domesticShippingRate: { findMany: jest.fn().mockResolvedValue([]) },
+      balanceEntry: {
+        findFirst: jest.fn().mockResolvedValue(null),
+        findMany: jest.fn().mockResolvedValue([]),
+      },
+      paymentOrder: {
+        findUnique: jest.fn().mockResolvedValue(null),
+        updateMany: jest.fn().mockResolvedValue({ count: 1 }),
+      },
+      cardRedemption: { findMany: jest.fn().mockResolvedValue([]) },
       listing: {
         create: jest.fn().mockResolvedValue({
           id: 'listing-1',
@@ -1120,16 +1146,296 @@ describe('ConsignmentService', () => {
 
       await service.compensate(
         ID,
-        { amountIdr: 900_000, note: 'kesepakatan ganti rugi dengan pemilik' },
+        { note: 'kesepakatan ganti rugi dengan pemilik' },
         admin,
       );
 
-      expect(balance.credit).toHaveBeenCalledWith({
-        userId: consignor.id,
-        amountIdrx: 900_000,
-        reason: 'CONSIGNMENT_COMPENSATION',
-        refId: ID,
+      expect(balance.credit).toHaveBeenCalledWith(
+        {
+          userId: consignor.id,
+          // Dasarnya `askPriceIdr` (fixture: Rp 1.000.000) — harga jual yang disepakati dan
+          // TERCETAK di struk serah terima. Bukan angka yang diketik ulang operator.
+          amountIdrx: 1_000_000,
+          reason: 'CONSIGNMENT_COMPENSATION',
+          refId: ID,
+        },
+        // Argumen KEDUA: transaksinya. Lihat blok "kredit dan baris auditnya satu transaksi".
+        expect.anything(),
+      );
+    });
+  });
+
+  /* ═══════════════════════ GANTI RUGI: SIAPA, BERAPA, DAN SEKALI ═══════════════════════ */
+
+  /**
+   * ╔══════════════════════════════════════════════════════════════════════════════════════════╗
+   * ║ Satu kartu hilang punya DUA korban yang mungkin, dan hanya SATU yang benar.              ║
+   * ╚══════════════════════════════════════════════════════════════════════════════════════════╝
+   *
+   * `fulfilConsignment` mengkredit pemilik 95% DI DALAM transaksi settlement — jadi begitu kartu
+   * terjual, pemiliknya SUDAH dibayar sementara kartunya masih di rak menunggu dikirim. Kartu
+   * yang hilang di jendela itu meninggalkan PEMBELI dengan nol kartu dan nol Rupiah.
+   */
+  describe('compensate — yang dipulihkan adalah orang yang benar-benar kehilangan', () => {
+    const SOLD_ORDER = 'HOSHI-ORDER-9';
+
+    /** LOST, tapi sebelum hilang kartunya SUDAH terjual dan pemiliknya SUDAH dibayar. */
+    const lostAfterSold = (over: Record<string, unknown> = {}) =>
+      rowWith({
+        status: ConsignmentStatus.LOST,
+        custodyReleasedAt: new Date(),
+        soldOrderId: SOLD_ORDER,
+        payoutIdrx: 950_000,
+        commissionIdrx: 50_000,
+        listing: { id: 'listing-1', status: 'SOLD', buyerId: 'buyer-3' },
+        ...over,
       });
+
+    it('BELUM terjual → pemilik dikredit sebesar askPriceIdr (angka di struk), bukan angka yang diketik', async () => {
+      prisma.consignment.findUnique.mockResolvedValue(
+        rowWith({
+          status: ConsignmentStatus.LOST,
+          custodyReleasedAt: new Date(),
+          askPriceIdr: 24_000_000,
+        }),
+      );
+
+      const out = await service.compensate(
+        ID,
+        { note: 'kartu hilang saat pemindahan rak; ganti rugi sesuai struk' },
+        admin,
+      );
+
+      expect(balance.credit).toHaveBeenCalledWith(
+        expect.objectContaining({
+          userId: consignor.id,
+          amountIdrx: 24_000_000,
+          refId: ID,
+        }),
+        expect.anything(),
+      );
+      expect(out.credited).toBe(true);
+      expect(out.compensationIdr).toBe(24_000_000);
+      // Pembeli tidak ada → NOL baris pembayaran disentuh.
+      expect(prisma.paymentOrder.updateMany).not.toHaveBeenCalled();
+    });
+
+    it('nominal konfirmasi yang BERBEDA dari struk DITOLAK — "kurang satu nol" tidak pernah masuk ledger', async () => {
+      prisma.consignment.findUnique.mockResolvedValue(
+        rowWith({
+          status: ConsignmentStatus.LOST,
+          custodyReleasedAt: new Date(),
+          askPriceIdr: 24_000_000,
+        }),
+      );
+
+      await expect(
+        service.compensate(
+          ID,
+          { amountIdr: 2_400_000, note: 'salah ketik kurang satu nol' },
+          admin,
+        ),
+      ).rejects.toBeInstanceOf(BadRequestException);
+      expect(balance.credit).not.toHaveBeenCalled();
+    });
+
+    it('SUDAH TERJUAL → kredit ke PEMILIK DITOLAK, dan utangnya dicatat di baris pembayaran PEMBELI', async () => {
+      prisma.consignment.findUnique.mockResolvedValue(lostAfterSold());
+      prisma.paymentOrder.findUnique.mockResolvedValue({
+        merchantOrderId: SOLD_ORDER,
+        userId: 'buyer-3',
+        priceIdr: 1_007_000,
+        status: 'FULFILLED',
+      });
+
+      await expect(
+        service.compensate(
+          ID,
+          { note: 'kartu hilang padahal sudah dibayar pembeli' },
+          admin,
+        ),
+      ).rejects.toBeInstanceOf(ConflictException);
+
+      // NOL saldo pemilik bergerak — ia sudah menerima payout-nya di detik settlement.
+      expect(balance.credit).not.toHaveBeenCalled();
+      // Utangnya dicatat lewat rail yang SUDAH ADA, berpagar status yang dibaca, refundSafe=false.
+      expect(prisma.paymentOrder.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { merchantOrderId: SOLD_ORDER, status: 'FULFILLED' },
+          data: expect.objectContaining({
+            status: 'REFUND_DUE',
+            refundSafe: false,
+          }) as unknown,
+        }),
+      );
+    });
+
+    it('"sudah terjual" dibaca dari FAKTA TERSIMPAN, bukan dari status yang sudah ditimpa LOST', async () => {
+      // `status` sudah LOST dan `soldOrderId` kosong — yang tersisa cuma jejak pembeli di listing.
+      prisma.consignment.findUnique.mockResolvedValue(
+        lostAfterSold({ soldOrderId: null }),
+      );
+
+      await expect(
+        service.compensate(ID, { note: 'periksa jejak pembeli' }, admin),
+      ).rejects.toBeInstanceOf(ConflictException);
+      expect(balance.credit).not.toHaveBeenCalled();
+    });
+
+    it('markLost pada kartu yang SUDAH TERJUAL mencatat utang pembeli SAAT ITU JUGA', async () => {
+      prisma.consignment.findUnique.mockResolvedValue(
+        rowWith({
+          status: ConsignmentStatus.SOLD,
+          soldOrderId: SOLD_ORDER,
+          payoutIdrx: 950_000,
+          commissionIdrx: 50_000,
+          listing: { id: 'listing-1', status: 'SOLD', buyerId: 'buyer-3' },
+        }),
+      );
+      prisma.paymentOrder.findUnique.mockResolvedValue({
+        merchantOrderId: SOLD_ORDER,
+        userId: 'buyer-3',
+        priceIdr: 1_007_000,
+        status: 'FULFILLED',
+      });
+
+      const out = await service.markLost(
+        ID,
+        { note: 'hilang saat menunggu permintaan kirim dari pembeli' },
+        admin,
+      );
+
+      expect(prisma.paymentOrder.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { merchantOrderId: SOLD_ORDER, status: 'FULFILLED' },
+        }),
+      );
+      expect(out.buyerRefundDebt?.recordedNow).toBe(true);
+      expect(out.buyerRefundDebt?.statusAfter).toBe('REFUND_DUE');
+    });
+
+    it('pembukuan utang pembeli TIDAK PERNAH menggagalkan markLost — LOST-nya sudah commit', async () => {
+      prisma.consignment.findUnique.mockResolvedValue(
+        rowWith({
+          status: ConsignmentStatus.SOLD,
+          soldOrderId: SOLD_ORDER,
+          listing: { id: 'listing-1', status: 'SOLD', buyerId: 'buyer-3' },
+        }),
+      );
+      prisma.paymentOrder.findUnique.mockRejectedValue(
+        new Error('koneksi putus'),
+      );
+
+      const out = await service.markLost(ID, { note: 'hilang di rak' }, admin);
+
+      expect(out.buyerRefundDebt?.recordedNow).toBe(false);
+      expect(out.buyerRefundDebt?.operatorAction).toContain('manual');
+    });
+  });
+
+  /**
+   * ╔══════════════════════════════════════════════════════════════════════════════════════════╗
+   * ║ GANTI RUGI KEDUA TIDAK BOLEH TERLIHAT HIJAU. Nol rupiah bergerak = bukan keberhasilan.  ║
+   * ╚══════════════════════════════════════════════════════════════════════════════════════════╝
+   */
+  describe('compensate — "sudah pernah tercatat" adalah PENOLAKAN, bukan 200', () => {
+    beforeEach(() => {
+      prisma.consignment.findUnique.mockResolvedValue(
+        rowWith({
+          status: ConsignmentStatus.LOST,
+          custodyReleasedAt: new Date(),
+          askPriceIdr: 24_000_000,
+        }),
+      );
+    });
+
+    it('baris ledger sudah ada → 409 yang MENYEBUT nominal yang sudah tercatat; NOL kredit kedua', async () => {
+      prisma.balanceEntry.findFirst.mockResolvedValue({
+        id: 'entry-1',
+        userId: consignor.id,
+        deltaIdrx: BigInt(2_400_000),
+        createdAt: new Date('2026-09-20T03:00:00.000Z'),
+      });
+
+      const err: unknown = await service
+        .compensate(ID, { note: 'coba bayar ulang dengan angka benar' }, admin)
+        .catch((e: unknown) => e);
+
+      expect(err).toBeInstanceOf(ConflictException);
+      // Nominal yang SUDAH tercatat harus ada di kalimatnya: tanpa itu operator tidak punya apa
+      // pun untuk memutuskan langkah berikutnya.
+      expect(String((err as Error).message)).toContain('2.400.000');
+      expect(balance.credit).not.toHaveBeenCalled();
+      expect(prisma.consignmentEvent.create).not.toHaveBeenCalled();
+    });
+
+    it('kalah BALAPAN (P2002 dari unique (reason, refId)) → penolakan yang SAMA, bukan sukses palsu', async () => {
+      // Pra-cek lolos (belum ada baris), lalu permintaan lain menang di dalam transaksi.
+      prisma.balanceEntry.findFirst
+        .mockResolvedValueOnce(null)
+        .mockResolvedValue({
+          id: 'entry-1',
+          userId: consignor.id,
+          deltaIdrx: BigInt(24_000_000),
+          createdAt: new Date('2026-09-20T03:00:00.000Z'),
+        });
+      balance.credit.mockRejectedValue(
+        new Prisma.PrismaClientKnownRequestError('dobel', {
+          code: 'P2002',
+          clientVersion: 'test',
+        }),
+      );
+
+      await expect(
+        service.compensate(ID, { note: 'klik kedua yang beradu' }, admin),
+      ).rejects.toBeInstanceOf(ConflictException);
+    });
+  });
+
+  /**
+   * ╔══════════════════════════════════════════════════════════════════════════════════════════╗
+   * ║ SALDO BERTAMBAH TANPA BARIS AUDIT = OPERATOR BERIKUTNYA MEMBAYAR LAGI.                  ║
+   * ╚══════════════════════════════════════════════════════════════════════════════════════════╝
+   */
+  describe('compensate — kredit dan baris auditnya SATU transaksi', () => {
+    it('balance.credit menerima transaksi yang SAMA dengan writeEvent', async () => {
+      prisma.consignment.findUnique.mockResolvedValue(
+        rowWith({
+          status: ConsignmentStatus.LOST,
+          custodyReleasedAt: new Date(),
+        }),
+      );
+
+      await service.compensate(ID, { note: 'ganti rugi sesuai struk' }, admin);
+
+      expect(prisma.$transaction).toHaveBeenCalledTimes(1);
+      const txPassedToCredit = (balance.credit.mock.calls as unknown[][])[0][1];
+      // Mock `$transaction` memanggil callback-nya dengan objek prisma yang sama, jadi
+      // "transaksi yang sama" di sini berarti: credit TIDAK dipanggil tanpa tx.
+      expect(txPassedToCredit).toBeDefined();
+      expect(prisma.consignmentEvent.create).toHaveBeenCalledTimes(1);
+    });
+
+    it('baris audit GAGAL → kreditnya ikut batal (satu transaksi, bukan dua)', async () => {
+      prisma.consignment.findUnique.mockResolvedValue(
+        rowWith({
+          status: ConsignmentStatus.LOST,
+          custodyReleasedAt: new Date(),
+        }),
+      );
+      prisma.consignmentEvent.create.mockRejectedValue(
+        new Error('koneksi putus sesudah kredit'),
+      );
+
+      await expect(
+        service.compensate(ID, { note: 'ganti rugi sesuai struk' }, admin),
+      ).rejects.toThrow('koneksi putus sesudah kredit');
+      // Kalau keduanya dipisah, error ini terbit SESUDAH saldo bertambah dan tidak pernah
+      // membatalkannya. Yang membuat test ini bermakna adalah `credit` dipanggil DENGAN tx.
+      expect(balance.credit).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.anything(),
+      );
     });
   });
 
@@ -1750,6 +2056,106 @@ describe('ConsignmentService', () => {
       ]);
       expect(out.rows.find((r) => r.id === 'd')?.inCustody).toBe(true);
       expect(out.rows.find((r) => r.id === 'b')?.inCustody).toBe(false);
+    });
+  });
+
+  /**
+   * ╔══════════════════════════════════════════════════════════════════════════════════════════╗
+   * ║ TAB BERLABEL "SELESAI" TIDAK BOLEH MEMUAT UTANG YANG BELUM DIBAYAR.                      ║
+   * ╚══════════════════════════════════════════════════════════════════════════════════════════╝
+   *
+   * Begitu admin mencatat LOST, barisnya hilang dari "Perlu tindakan" dan masuk "Selesai /
+   * hilang" — padahal LOST justru titik ketika Hoshi MULAI BERUTANG kepada pemilik kartunya.
+   */
+  describe('adminList — LOST yang ganti ruginya belum dibayar tetap "perlu tindakan"', () => {
+    it('LOST tanpa baris ledger ganti rugi → muncul, dan kalimatnya MENYEBUT nominal struk', async () => {
+      prisma.consignment.findMany.mockResolvedValue([
+        rowWith({
+          id: 'hilang',
+          status: ConsignmentStatus.LOST,
+          custodyReleasedAt: new Date(),
+          askPriceIdr: 24_000_000,
+          createdAt: new Date(),
+        }),
+      ]);
+
+      const out = await service.adminList();
+
+      const row = out.actionRequired.find((r) => r.id === 'hilang');
+      expect(row).toBeDefined();
+      expect(row?.reasons.join(' ')).toContain('24.000.000');
+      expect(prisma.balanceEntry.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({
+            reason: 'CONSIGNMENT_COMPENSATION',
+            refId: { in: ['hilang'] },
+          }) as unknown,
+        }),
+      );
+    });
+
+    it('LOST yang ganti ruginya SUDAH tercatat → berhenti menuntut tindakan', async () => {
+      prisma.consignment.findMany.mockResolvedValue([
+        rowWith({
+          id: 'hilang',
+          status: ConsignmentStatus.LOST,
+          custodyReleasedAt: new Date(),
+          createdAt: new Date(),
+        }),
+      ]);
+      prisma.balanceEntry.findMany.mockResolvedValue([{ refId: 'hilang' }]);
+
+      const out = await service.adminList();
+
+      expect(out.actionRequired.find((r) => r.id === 'hilang')).toBeUndefined();
+    });
+
+    it('LOST SESUDAH TERJUAL → kalimatnya menunjuk PEMBELI, bukan menyuruh mengkredit pemilik', async () => {
+      prisma.consignment.findMany.mockResolvedValue([
+        rowWith({
+          id: 'hilang',
+          status: ConsignmentStatus.LOST,
+          custodyReleasedAt: new Date(),
+          soldOrderId: 'HOSHI-ORDER-9',
+          payoutIdrx: 950_000,
+          listing: { id: 'listing-1', status: 'SOLD', buyerId: 'buyer-3' },
+          createdAt: new Date(),
+        }),
+      ]);
+
+      const out = await service.adminList();
+
+      const reasons =
+        out.actionRequired.find((r) => r.id === 'hilang')?.reasons.join(' ') ??
+        '';
+      expect(reasons).toContain('PEMBELI');
+      expect(reasons).toContain('JANGAN mengkredit pemilik');
+    });
+
+    it('SOLD yang paketnya SUDAH berangkat tapi custody-nya tak pernah ditutup ikut disorot', async () => {
+      prisma.consignment.findMany.mockResolvedValue([
+        rowWith({
+          id: 'terkirim',
+          status: ConsignmentStatus.SOLD,
+          custodyReleasedAt: null,
+          listing: { id: 'listing-1', status: 'SOLD', buyerId: 'buyer-3' },
+          createdAt: new Date(),
+        }),
+      ]);
+      prisma.cardRedemption.findMany.mockResolvedValue([
+        { id: 'red-1', listingId: 'listing-1', status: 'SHIPPED' },
+      ]);
+
+      const out = await service.adminList();
+
+      const reasons =
+        out.actionRequired
+          .find((r) => r.id === 'terkirim')
+          ?.reasons.join(' ') ?? '';
+      expect(reasons).toContain('red-1');
+      expect(reasons).toContain('custodyReleasedAt');
+      // Kalimat lama ("pembeli belum minta kirim") justru SALAH untuk baris ini.
+      expect(reasons).not.toContain('pembeli belum minta kirim');
     });
   });
 
@@ -2742,6 +3148,230 @@ describe('ConsignmentService', () => {
     });
   });
 
+  /**
+   * ╔══════════════════════════════════════════════════════════════════════════════════════════╗
+   * ║ GRADER YANG TERTINGGAL KOSONG SAAT INTAKE PERNAH BERARTI KARTU TERKUNCI SELAMANYA.       ║
+   * ╚══════════════════════════════════════════════════════════════════════════════════════════╝
+   *
+   * `createListingFor` menolak SELAMANYA kartu tanpa grader, dan sebelum blok ini tidak ada SATU
+   * rute pun yang bisa mengisi kolom itu sesudah serah-terima: kartu fisik milik orang lain duduk
+   * di rak tanpa bisa dijual, dan satu-satunya jalan keluar dari IN_CUSTODY adalah RELEASE atau
+   * LOST — dua-duanya fakta PALSU di buku besar yang sengaja append-only.
+   */
+  describe('correctLabel — grader bisa dikoreksi sesudah intake', () => {
+    const NOTE =
+      'Dropdown grader tertinggal kosong saat intake; dicocokkan ulang dengan slab.';
+
+    it('mengisi grader yang tertinggal kosong: kolomnya ditulis, berpagar nilai LAMA', async () => {
+      prisma.consignment.findUnique.mockResolvedValue(
+        rowWith({ grader: null, certNumber: '12345678', listing: null }),
+      );
+
+      const out = await service.correctLabel(
+        ID,
+        { grader: 'PSA', note: NOTE },
+        admin,
+      );
+
+      const [call] = prisma.consignment.updateMany.mock.calls as [
+        { where: Record<string, unknown>; data: Record<string, unknown> },
+      ][];
+      expect(call[0].data).toEqual({ grader: 'PSA' });
+      expect(call[0].where).toEqual({ id: ID, grader: null });
+      expect(out.corrected).toEqual([
+        { field: 'grader', before: null, after: 'PSA' },
+      ]);
+    });
+
+    it('grader yang dikoreksi IKUT memicu pra-cek bentrok nomor sertifikat', async () => {
+      // Nomor sertifikatnya TIDAK berubah; yang berubah grader-nya. Kuncinya pasangan
+      // (grader, certNumber), jadi mengubah separuhnya sama dengan memindahkan barisnya ke kunci
+      // lain — yang bisa saja sudah dipakai titipan hidup lain.
+      prisma.consignment.findUnique.mockResolvedValue(
+        rowWith({ grader: null, certNumber: '12345678' }),
+      );
+      prisma.consignment.findFirst.mockResolvedValue({
+        id: 'other',
+        status: ConsignmentStatus.IN_CUSTODY,
+      });
+
+      await expect(
+        service.correctLabel(ID, { grader: 'PSA', note: NOTE }, admin),
+      ).rejects.toThrow(ConflictException);
+      expect(prisma.consignment.findFirst).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({
+            grader: 'PSA',
+            certNumber: '12345678',
+          }) as unknown,
+        }),
+      );
+      expect(prisma.consignment.updateMany).not.toHaveBeenCalled();
+    });
+
+    it('listing yang masih ACTIVE ikut diperbarui DI TRANSAKSI YANG SAMA (grader + grade)', async () => {
+      prisma.consignment.findUnique.mockResolvedValue(
+        rowWith({
+          grader: 'CGC',
+          gradeLabel: null,
+          gradeScore: 10,
+          certNumber: null,
+          listing: { id: 'listing-1', status: 'ACTIVE', priceIdrx: 1 },
+        }),
+      );
+
+      const out = await service.correctLabel(
+        ID,
+        { grader: 'PSA', note: NOTE },
+        admin,
+      );
+
+      expect(prisma.listing.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: 'listing-1', consignmentId: ID, status: 'ACTIVE' },
+          data: expect.objectContaining({
+            grader: 'PSA',
+            // Rumus cadangannya memakai grader BARU, bukan yang lama.
+            grade: 'PSA 10',
+          }) as unknown,
+        }),
+      );
+      expect(out.listingUpdated).toBe(true);
+      expect(prisma.$transaction).toHaveBeenCalledTimes(1);
+    });
+
+    it('DITOLAK kalau titipannya sudah punya pembeli — grading yang dibaca pembeli tidak boleh berubah', async () => {
+      prisma.consignment.findUnique.mockResolvedValue(
+        rowWith({
+          status: ConsignmentStatus.SOLD,
+          soldOrderId: 'HOSHI-ORDER-9',
+          grader: 'PSA',
+          listing: { id: 'listing-1', status: 'SOLD', buyerId: 'buyer-3' },
+        }),
+      );
+
+      await expect(
+        service.correctLabel(ID, { grader: 'CGC', note: NOTE }, admin),
+      ).rejects.toThrow(ConflictException);
+      expect(prisma.consignment.updateMany).not.toHaveBeenCalled();
+    });
+
+    it('field label LAIN tetap boleh dikoreksi sesudah terjual — hanya grader yang dikunci', async () => {
+      prisma.consignment.findUnique.mockResolvedValue(
+        rowWith({
+          status: ConsignmentStatus.SOLD,
+          soldOrderId: 'HOSHI-ORDER-9',
+          cardName: 'Charizad VMAX',
+          listing: { id: 'listing-1', status: 'SOLD', buyerId: 'buyer-3' },
+        }),
+      );
+      prisma.listing.updateMany.mockResolvedValue({ count: 0 });
+
+      await expect(
+        service.correctLabel(
+          ID,
+          { cardName: 'Charizard VMAX', note: NOTE },
+          admin,
+        ),
+      ).resolves.toBeDefined();
+    });
+
+    it('MENGOSONGKAN grader ditolak selagi listing-nya masih tayang (Listing.grader NOT NULL)', async () => {
+      prisma.consignment.findUnique.mockResolvedValue(
+        rowWith({
+          grader: 'PSA',
+          certNumber: null,
+          listing: { id: 'listing-1', status: 'ACTIVE', priceIdrx: 1 },
+        }),
+      );
+
+      await expect(
+        service.correctLabel(ID, { grader: '', note: NOTE }, admin),
+      ).rejects.toThrow(ConflictException);
+      expect(prisma.consignment.updateMany).not.toHaveBeenCalled();
+    });
+  });
+
+  /**
+   * ╔══════════════════════════════════════════════════════════════════════════════════════════╗
+   * ║ certNumber TANPA grader MEMATIKAN PENJAGA DOBEL-TITIP — di Postgres, NULL ≠ NULL.       ║
+   * ╚══════════════════════════════════════════════════════════════════════════════════════════╝
+   */
+  describe('certNumber tanpa grader ditolak di KEDUA pintu', () => {
+    it('createIntake: nomor sertifikat terisi + grader kosong → 400 yang menyebut KEDUANYA', async () => {
+      const err: unknown = await service
+        .createIntake(intakeDto({ certNumber: '12345678' }), admin)
+        .catch((e: unknown) => e);
+
+      expect(err).toBeInstanceOf(BadRequestException);
+      const msg = String((err as Error).message);
+      expect(msg).toContain('sertifikat');
+      expect(msg).toContain('GRADER');
+      expect(prisma.consignment.create).not.toHaveBeenCalled();
+    });
+
+    it('createIntake: nomor sertifikat + grader lengkap tetap jalan', async () => {
+      await expect(
+        service.createIntake(
+          intakeDto({ certNumber: '12345678', grader: 'PSA' }),
+          admin,
+        ),
+      ).resolves.toBeDefined();
+      expect(prisma.consignment.create).toHaveBeenCalled();
+    });
+
+    it('correctLabel: mengisi nomor sertifikat pada kartu tanpa grader DITOLAK', async () => {
+      prisma.consignment.findUnique.mockResolvedValue(
+        rowWith({ grader: null, certNumber: null }),
+      );
+
+      await expect(
+        service.correctLabel(
+          ID,
+          { certNumber: '12345678', note: 'dibaca ulang dari slab-nya' },
+          admin,
+        ),
+      ).rejects.toBeInstanceOf(BadRequestException);
+      expect(prisma.consignment.updateMany).not.toHaveBeenCalled();
+    });
+
+    it('correctLabel: MENGOSONGKAN grader pada kartu bernomor sertifikat juga DITOLAK', async () => {
+      prisma.consignment.findUnique.mockResolvedValue(
+        rowWith({ grader: 'PSA', certNumber: '12345678', listing: null }),
+      );
+
+      await expect(
+        service.correctLabel(
+          ID,
+          { grader: '', note: 'katanya kartunya mentah' },
+          admin,
+        ),
+      ).rejects.toBeInstanceOf(BadRequestException);
+      expect(prisma.consignment.updateMany).not.toHaveBeenCalled();
+    });
+
+    it('correctLabel: baris WARISAN yang sudah berbentuk begitu tetap boleh dikoreksi namanya', async () => {
+      // Koreksi yang TIDAK menyentuh pasangan (grader, certNumber) tidak ikut diblokir —
+      // memblokirnya hanya membuat rute perbaikan ikut buntu untuk data lama.
+      prisma.consignment.findUnique.mockResolvedValue(
+        rowWith({
+          grader: null,
+          certNumber: '12345678',
+          cardName: 'Charizad VMAX',
+          listing: null,
+        }),
+      );
+
+      await expect(
+        service.correctLabel(
+          ID,
+          { cardName: 'Charizard VMAX', note: 'salah ketik saat intake' },
+          admin,
+        ),
+      ).resolves.toBeDefined();
+    });
+  });
+
   /* ═════════ B5 — PEMILIKNYA DIBERI TAHU (PRODUKNYA MENJANJIKANNYA DUA KALI) ═════════ */
 
   describe('pemberitahuan ke pemilik kartu', () => {
@@ -2826,7 +3456,10 @@ describe('ConsignmentService', () => {
       );
       const out = await service.updatePrice(
         ID,
-        { askPriceIdr: 21_000_000, note: 'Harga pasar naik; disepakati pemilik.' },
+        {
+          askPriceIdr: 21_000_000,
+          note: 'Harga pasar naik; disepakati pemilik.',
+        },
         admin,
       );
       expect(out.belowReserveWarning).toBeNull();

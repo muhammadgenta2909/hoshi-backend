@@ -178,6 +178,56 @@ export function consignmentSellableNowWhere(): Prisma.ConsignmentWhereInput {
   };
 }
 
+/* ══════════ PERTANYAAN KEEMPAT: "KARTU INI SUDAH PUNYA PEMBELI YANG MEMBAYAR?" ══════════ */
+
+/**
+ * ╔══════════════════════════════════════════════════════════════════════════════════════════════╗
+ * ║ SIAPA YANG HARUS DIPULIHKAN KALAU KARTU INI HILANG — dan kenapa jawabannya BERUBAH di       ║
+ * ║ detik kartunya terjual.                                                                      ║
+ * ╚══════════════════════════════════════════════════════════════════════════════════════════════╝
+ *
+ * `fulfilConsignment` MENGKREDIT PEMILIK (95%) DI DALAM transaksi settlement. Jadi begitu kartunya
+ * terjual, pemiliknya SUDAH DIBAYAR — sementara kartunya masih di rak Hoshi menunggu pembelinya
+ * meminta kirim. Jendela itu bukan kasus tepi: dashboard admin sendiri menyorotnya
+ * ("Sudah TERJUAL tapi kartunya masih di rak Hoshi").
+ *
+ * Kalau kartunya hilang DI JENDELA ITU, yang TIDAK menerima apa pun bukan pemiliknya melainkan
+ * PEMBELI yang sudah membayar penuh. Membayar ganti rugi ke pemilik di situ berarti membayar orang
+ * yang SUDAH dibayar — dua kali untuk satu kartu — sambil membiarkan pembelinya memegang nol
+ * kartu dan nol Rupiah.
+ *
+ * DUA FAKTA TERSIMPAN, BUKAN SATU, dan itu disengaja:
+ *   • `status === SOLD`    benar SELAMA barisnya belum berpindah lagi. Ia TIDAK cukup, karena
+ *                          `markLost` menimpanya menjadi LOST — sesudah itu status tidak lagi
+ *                          bisa menjawab "dulu pernah terjual atau tidak".
+ *   • `soldOrderId`        ditulis SEKALI oleh settlement dan tidak pernah dihapus. Inilah fakta
+ *                          yang bertahan melewati LOST, dan sekaligus KUNCI ke order pembelinya.
+ *   • `listing.buyerId`    fakta ketiga dari sisi listing; ikut dibaca supaya baris lama yang
+ *                          `soldOrderId`-nya kosong (mis. settlement lewat jalur lain di kemudian
+ *                          hari) tidak diam-diam jatuh ke cabang "belum terjual".
+ *
+ * FAIL-CLOSED: cukup SATU dari ketiganya benar untuk memperlakukan barisnya sebagai "sudah punya
+ * pembeli". Arah salahnya disengaja — menolak membayar pemilik untuk kartu yang ternyata belum
+ * terjual bisa dibereskan manusia dengan satu percakapan; membayar pemilik untuk kartu yang sudah
+ * dibayar pembeli adalah uang yang hilang tanpa ada yang tahu.
+ */
+export interface ConsignmentSaleOutcomeFacts {
+  status: ConsignmentStatus;
+  /** `merchantOrderId` yang menyelesaikannya. Ditulis sekali oleh settlement, tidak pernah dihapus. */
+  soldOrderId: string | null;
+  listing?: { buyerId: string | null } | null;
+}
+
+export function isConsignmentSoldToBuyer(
+  c: ConsignmentSaleOutcomeFacts,
+): boolean {
+  return (
+    c.status === ConsignmentStatus.SOLD ||
+    c.soldOrderId != null ||
+    c.listing?.buyerId != null
+  );
+}
+
 /* ───────────────── PEMILIKNYA: PERTANYAAN KEDUA, DAN SENGAJA TERPISAH ───────────────── */
 
 /**

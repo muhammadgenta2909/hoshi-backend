@@ -12,9 +12,12 @@ import {
   ActivityType,
   ConsignmentPhotoKind,
   ConsignmentStatus,
+  type Grader,
   ListingStatus,
   OfferStatus,
+  PaymentStatus,
   Prisma,
+  RedemptionStatus,
 } from '@prisma/client';
 import type { AuthUser } from '../auth/jwt.strategy';
 import { BalanceService } from '../balance/balance.service';
@@ -31,6 +34,7 @@ import {
   awaitingConsignorWhere,
   claimCodeRedeemWhere,
   isAwaitingConsignorClaim,
+  isConsignmentSoldToBuyer,
   isConsignorLinked,
   isInHoshiCustody,
   isPhysicallyHeldByHoshi,
@@ -99,6 +103,7 @@ export interface LabelChange {
     | 'cardSet'
     | 'cardNumber'
     | 'certNumber'
+    | 'grader'
     | 'gradeLabel'
     | 'gradeScore';
   before: string | number | null;
@@ -117,6 +122,33 @@ function blankToNull(v: string): string | null {
   return t.length === 0 ? null : t;
 }
 
+/**
+ * ╔══════════════════════════════════════════════════════════════════════════════════════════════╗
+ * ║ NOMOR SERTIFIKAT TANPA GRADER MEMATIKAN PENJAGA DOBEL-TITIP — DIAM-DIAM.                    ║
+ * ╚══════════════════════════════════════════════════════════════════════════════════════════════╝
+ *
+ * Kunci anti-dobel-titip adalah PASANGAN: partial unique index `consignments_active_cert_uniq`
+ * berbunyi `UNIQUE(grader, certNumber)` atas custody yang masih hidup. Postgres memperlakukan NULL
+ * sebagai TIDAK SAMA DENGAN APA PUN — termasuk dengan NULL lain — jadi dua baris
+ * `(NULL, '12345678')` TIDAK bentrok di index itu. Pra-ceknya pun dulu disyaratkan
+ * `certNumber && dto.grader`, sehingga ia melewatkan keadaan yang sama tanpa sepatah kata.
+ *
+ * Akibatnya: SATU slab fisik bisa punya DUA titipan hidup sekaligus — persis yang index itu
+ * dibangun untuk mencegah — dan tidak ada satu pun lapis yang berbunyi. Bentuk barisnya sendiri
+ * juga tidak masuk akal: sebuah nomor sertifikat ADALAH nomor yang diterbitkan SEORANG grader, dan
+ * "nomor sertifikat dari grader yang tidak diketahui" bukan identitas, cuma angka.
+ *
+ * Maka kombinasinya DITOLAK di kedua pintu yang bisa melahirkannya (`createIntake` dan
+ * `correctLabel`), dengan SATU kalimat yang menyebut KEDUA field — supaya operator yang membacanya
+ * tahu bahwa yang kurang bisa jadi dropdown Grader-nya, bukan nomornya.
+ */
+const CERT_WITHOUT_GRADER_MESSAGE =
+  'Nomor sertifikat terisi tapi GRADER kosong. Keduanya satu paket: kunci anti-dobel-titip ' +
+  'adalah pasangan (grader, certNumber), dan di Postgres grader NULL membuat kunci itu TIDAK ' +
+  'PERNAH bentrok — satu slab fisik bisa punya dua titipan hidup sekaligus tanpa ada yang ' +
+  'berbunyi. Pilih grader-nya (PSA/CGC/BGS) sesuai yang tertera di slab, ATAU kosongkan nomor ' +
+  'sertifikatnya kalau kartunya memang MENTAH.';
+
 /** "cardName: \"Charizad VMAX\" → \"Charizard VMAX\"" — untuk baris audit dan log. */
 function describeChange(ch: LabelChange): string {
   const fmt = (v: string | number | null) =>
@@ -131,6 +163,31 @@ function describeChange(ch: LabelChange): string {
  * dan kita belum tahu siapa yang harus dibayar kalau ia terjual. Yang kedua jauh lebih mendesak.
  */
 const UNLINKED_CUSTODY_DAYS = 7;
+
+/**
+ * Batas panjang kolom `PaymentOrder.error`, SAMA PERSIS dengan `ERROR_MAX` di payments dan
+ * `DEBT_ERROR_MAX` di shipping-refund-debt.ts. Utang yang kalimatnya terpotong di tengah tetap
+ * utang; yang tidak boleh adalah tulisannya GAGAL karena kepanjangan.
+ */
+const BUYER_DEBT_ERROR_MAX = 500;
+
+/**
+ * Laporan pembukuan utang ke PEMBELI kartu titipan yang hilang sesudah terjual. Bentuknya
+ * mengikuti `ShippingRefundDebt` (src/payments/shipping-refund-debt.ts): setiap baris menyebut
+ * apa yang DILIHAT, apa yang DIUBAH, dan KALIMAT AKSI untuk operator — termasuk ketika tidak ada
+ * apa pun yang bisa diubah, karena uang yang lolos dari mata adalah seluruh masalahnya.
+ */
+export interface ConsignmentBuyerRefundDebt {
+  merchantOrderId: string | null;
+  priceIdr: number | null;
+  /** Status order pembeli sebelum pembukuan ini jalan. null = ordernya tidak bisa dibaca. */
+  statusBefore: PaymentStatus | null;
+  statusAfter: PaymentStatus | null;
+  /** true = panggilan INI yang menjadikannya REFUND_DUE. */
+  recordedNow: boolean;
+  /** Kalimat yang dilihat operator. SELALU terisi, juga saat tidak ada yang bisa ditulis. */
+  operatorAction: string;
+}
 
 /** Panjang minimal kata kunci pencarian pemilik. Lihat `searchConsignors`. */
 const CONSIGNOR_SEARCH_MIN_QUERY = 3;
@@ -308,6 +365,13 @@ export class ConsignmentService {
     }
 
     const certNumber = dto.certNumber?.trim() || null;
+    // ── PENJAGA DOBEL-TITIP TIDAK BOLEH MATI DIAM-DIAM ──────────────────────────────────────
+    // Lihat `CERT_WITHOUT_GRADER_MESSAGE`. Ditolak DI SINI, saat operator masih berdiri di depan
+    // pemilik kartunya dan slab-nya masih ada di tangan: satu-satunya momen ketika "grader mana
+    // yang tertera di label ini?" adalah pertanyaan yang bisa dijawab dalam dua detik.
+    if (certNumber && !dto.grader) {
+      throw new BadRequestException(CERT_WITHOUT_GRADER_MESSAGE);
+    }
     if (certNumber && dto.grader) {
       const clash = await this.prisma.consignment.findFirst({
         where: {
@@ -2185,13 +2249,58 @@ export class ConsignmentService {
     // Yang PALING TIDAK BOLEH senyap. Kalau pemiliknya tidak punya email (Path B), notifier
     // menulis log WARN berisi nama + telepon dari serah-terima — satu-satunya cara meneleponnya.
     this.notify.notifyLost(ConsignmentNotifyService.target(c));
-    return this.byId(id);
+
+    // ══ KARTU YANG SUDAH TERJUAL: YANG KEHILANGAN SEGALANYA ADALAH PEMBELI, BUKAN PEMILIK ══
+    //
+    // Kewajibannya LAHIR DI SINI, bukan saat seseorang membuka layar ganti rugi. Kalau menunggu
+    // `compensate` dipanggil, utang ke pembeli hanya akan tercatat pada baris yang kebetulan
+    // diklik operator — dan yang tidak diklik tidak akan muncul di daftar kerja mana pun.
+    //
+    // BEST-EFFORT dan TIDAK PERNAH MELEMPAR, persis seperti `recordShippingRefundDebts`: tulisan
+    // LOST-nya sudah commit di atas, dan kegagalan pembukuan tidak boleh membuat operator melihat
+    // 500 atas aksi yang sudah berhasil. Setiap kegagalan tetap terbit sebagai log ERROR.
+    const buyerRefundDebt = isConsignmentSoldToBuyer(c)
+      ? await this.recordBuyerRefundDebt(
+          c,
+          `titipan ditandai HILANG/RUSAK oleh admin ${admin.id}`,
+          dto.note.trim(),
+        )
+      : null;
+
+    return { ...(await this.byId(id)), buyerRefundDebt };
   }
 
   /**
-   * Ganti rugi ke pemilik kartu, lewat ledger saldo yang SUDAH ADA — bukan buku besar kedua.
-   * IDEMPOTEN lewat unique `(reason, refId)` pada `BalanceEntry`, dengan `refId = consignment.id`:
-   * klik dua kali tidak bisa membayar dua kali.
+   * ╔════════════════════════════════════════════════════════════════════════════════════════╗
+   * ║ GANTI RUGI — SIAPA YANG DIPULIHKAN, BERAPA, DAN KENAPA "SUDAH PERNAH" BUKAN "SUKSES". ║
+   * ╚════════════════════════════════════════════════════════════════════════════════════════╝
+   *
+   * TIGA KEPUTUSAN YANG DITEGAKKAN RUTE INI, dan ketiganya pernah salah di sini:
+   *
+   * 1. NOMINALNYA DIBACA DARI STRUK, TIDAK DIKETIK. Dasarnya `askPriceIdr` — "Harga jual yang
+   *    disepakati" yang tercetak di struk serah terima dua lembar yang ditandatangani kedua
+   *    pihak. BUKAN `reservePriceIdr`, BUKAN taksiran pasar hari ini. `dto.amountIdr` turun
+   *    pangkat jadi KONFIRMASI: kalau dikirim dan berbeda, permintaannya ditolak dengan KEDUA
+   *    angka disebutkan. Itulah yang membunuh "kurang satu nol" sebelum ia menyentuh ledger.
+   *
+   * 2. KALAU KARTUNYA SUDAH TERJUAL, YANG DIPULIHKAN ADALAH PEMBELI — DAN RUTE INI MENOLAK.
+   *    `fulfilConsignment` mengkredit pemilik 95% DI DALAM transaksi settlement, jadi begitu
+   *    kartunya terjual pemiliknya SUDAH DIBAYAR, sementara kartunya masih di rak menunggu
+   *    pembelinya meminta kirim. Kartu yang hilang di jendela itu meninggalkan PEMBELI dengan nol
+   *    kartu dan nol Rupiah. Mengkredit pemilik di situ = membayar dua kali untuk satu kartu
+   *    sambil membiarkan orang yang benar-benar dirugikan tidak menerima apa pun. Utang ke
+   *    pembelinya dicatat lewat rail yang SUDAH ADA (`PaymentOrder` → REFUND_DUE), bukan rail
+   *    baru — lihat `recordBuyerRefundDebt`.
+   *
+   * 3. "SUDAH PERNAH TERCATAT" ADALAH PENOLAKAN, BUKAN KEBERHASILAN. Dulu baris kedua
+   *    mengembalikan `{ credited: false }` dengan HTTP 200, dan layar menampilkan toast hijau
+   *    "Ganti rugi tercatat di saldo pemilik" sambil NOL rupiah bergerak. Sekarang keadaan itu
+   *    melempar 409 yang MENYEBUT NOMINAL YANG SUDAH TERCATAT — jawaban yang tidak punya cara
+   *    dibaca sebagai sukses, bahkan oleh layar yang tidak membaca satu pun field respons.
+   *    `credited` karena itu kini HANYA pernah bernilai `true`.
+   *
+   * IDEMPOTENSINYA TETAP DI DATABASE: unique `(reason, refId)` pada `BalanceEntry` dengan
+   * `refId = consignment.id`. Pra-cek di bawah ada UNTUK PESANNYA; yang menegakkan tetap index.
    */
   async compensate(id: string, dto: CompensateConsignmentDto, admin: AuthUser) {
     const c = await this.requireConsignment(id);
@@ -2200,6 +2309,31 @@ export class ConsignmentService {
         `Ganti rugi hanya untuk titipan berstatus LOST; titipan ini ${c.status}.`,
       );
     }
+
+    // ── (2) SUDAH PUNYA PEMBELI YANG MEMBAYAR → RUTE INI BUKAN JAWABANNYA ───────────────────
+    if (isConsignmentSoldToBuyer(c)) {
+      // Pembukuannya DIPASTIKAN ADA sebelum menolak, dan itu bukan kemewahan: baris LOST yang
+      // ditandai SEBELUM `markLost` mulai mencatat utang pembeli — atau yang pencatatannya
+      // kebetulan gagal waktu itu — tidak punya jalan lain untuk masuk ke daftar kerja refund.
+      // Menolak tanpa mencatat berarti memberi tahu operator bahwa ada korban, lalu tidak
+      // memberinya apa pun untuk ditindaklanjuti. Idempoten (predikat FULFILLED), tidak melempar.
+      const debt = await this.recordBuyerRefundDebt(
+        c,
+        `percobaan ganti rugi ke PEMILIK ditolak (admin ${admin.id})`,
+        dto.note.trim(),
+      );
+      throw new ConflictException(
+        `Titipan ${id} SUDAH TERJUAL sebelum hilang (order ${c.soldOrderId ?? '(tidak tercatat)'}` +
+          `, pembeli ${c.listing?.buyerId ?? '(tidak tercatat)'}). Ganti rugi ke PEMILIK ` +
+          'DITOLAK: pemiliknya sudah menyerahkan kartunya DAN sudah menerima payout-nya ' +
+          `(Rp ${c.payoutIdrx ?? 0}) di detik settlement — ia tetap memegangnya. Yang tidak ` +
+          'menerima apa pun adalah PEMBELI yang sudah membayar penuh, dan dialah yang wajib ' +
+          `dipulihkan. ${debt.operatorAction} JANGAN membuat kredit saldo untuk pemilik di baris ` +
+          'ini; kalau memang ada kesepakatan terpisah dengan pemiliknya, catat lewat ' +
+          'POST /admin/consignments/:id/correction dan selesaikan di luar sistem.',
+      );
+    }
+
     // ── UANG TIDAK PUNYA TUJUAN KALAU PEMILIKNYA BELUM TERTAUT ──────────────────────────────
     //
     // Kartu yang HILANG bisa saja kartu yang pemiliknya belum pernah membuat akun: ia menyerahkan
@@ -2213,21 +2347,324 @@ export class ConsignmentService {
     // (POST /admin/consignments/:id/link-consignor atau kode klaimnya), BARU bayar. Ini bukan
     // hambatan birokrasi; ini satu-satunya cara ganti ruginya benar-benar sampai ke orangnya.
     const consignorId = requireLinkedConsignorId(c);
-    const { credited } = await this.balance.credit({
-      userId: consignorId,
-      amountIdrx: dto.amountIdr,
-      reason: CONSIGNMENT_COMPENSATION_REASON,
-      refId: id,
+
+    // ── (1) NOMINALNYA DARI STRUK ───────────────────────────────────────────────────────────
+    const amountIdr = c.askPriceIdr;
+    if (!Number.isInteger(amountIdr) || amountIdr <= 0) {
+      throw new BadRequestException(
+        `Titipan ${id} tidak punya harga kesepakatan yang bisa dipakai sebagai dasar ganti rugi ` +
+          `(askPriceIdr = ${String(amountIdr)}). Struk serah terima adalah sumber angkanya, dan ` +
+          'baris ini tidak memuatnya — selesaikan dengan pemiliknya di luar sistem lalu catat ' +
+          'kesepakatannya lewat POST /admin/consignments/:id/correction.',
+      );
+    }
+    if (dto.amountIdr !== undefined && dto.amountIdr !== amountIdr) {
+      throw new BadRequestException(
+        `Nominal yang dikirim (Rp ${dto.amountIdr.toLocaleString('id-ID')}) BERBEDA dari harga ` +
+          `jual yang disepakati di struk (Rp ${amountIdr.toLocaleString('id-ID')}). Dasar ganti ` +
+          'rugi adalah angka yang tercetak di struk serah terima yang ditandatangani kedua ' +
+          'pihak — bukan angka yang diketik ulang, bukan harga dasar (reserve), bukan taksiran ' +
+          'pasar hari ini. Periksa lagi struknya; kalau struknya memang berbunyi lain, yang ' +
+          'harus diperbaiki adalah catatan titipannya, bukan pembayarannya.',
+      );
+    }
+
+    // ── (3) PRA-CEK "SUDAH PERNAH" — DEMI PESANNYA, BUKAN DEMI PENEGAKANNYA ────────────────
+    const already = await this.findCompensationEntry(id);
+    if (already) throw this.alreadyCompensated(id, already);
+
+    // ── SATU TRANSAKSI: KREDIT + BARIS AUDIT ────────────────────────────────────────────────
+    //
+    // Dulu `balance.credit` berjalan dengan transaksinya SENDIRI dan `writeEvent` dipanggil
+    // sesudahnya dengan `this.prisma`. Koneksi yang putus di antara keduanya meninggalkan saldo
+    // pemilik yang sudah bertambah TANPA satu baris `ConsignmentEvent` pun — dan halaman titipan
+    // membaca jejak audit, bukan ledger saldo. Operator berikutnya membuka barisnya, tidak
+    // menemukan penyebutan ganti rugi, lalu membayar LAGI. Sekarang keduanya satu transaksi:
+    // audit yang bisa gagal terpisah dari perubahan yang diauditnya bukan audit.
+    //
+    // `balance.credit(..., tx)` SENGAJA tidak menelan P2002 (lihat BalanceService): di dalam
+    // transaksi pemanggil, baris ledger kembar MEMBATALKAN seluruh transaksi — jadi balapan
+    // dengan permintaan kedua tidak bisa menghasilkan baris audit yatim, dan kami menerjemahkan
+    // P2002-nya menjadi penolakan yang sama dengan pra-cek di atas.
+    try {
+      await this.prisma.$transaction(async (tx) => {
+        await this.balance.credit(
+          {
+            userId: consignorId,
+            amountIdrx: amountIdr,
+            reason: CONSIGNMENT_COMPENSATION_REASON,
+            refId: id,
+          },
+          tx,
+        );
+        await this.writeEvent(tx, {
+          consignmentId: id,
+          kind: 'CORRECTION',
+          actor: admin,
+          note:
+            `GANTI RUGI Rp ${amountIdr} dikreditkan ke saldo pemilik ${consignorId} — sebesar ` +
+            'HARGA JUAL YANG DISEPAKATI di struk serah terima (askPriceIdr). ' +
+            dto.note.trim(),
+        });
+      });
+    } catch (err) {
+      if (
+        err instanceof Prisma.PrismaClientKnownRequestError &&
+        err.code === 'P2002'
+      ) {
+        const raced = await this.findCompensationEntry(id);
+        throw this.alreadyCompensated(id, raced);
+      }
+      throw err;
+    }
+
+    this.logger.warn(
+      `GANTI RUGI titipan ${id} ("${c.cardName}"): Rp ${amountIdr} dikreditkan ke saldo pemilik ` +
+        `${consignorId} oleh admin ${admin.id}. Dasar: askPriceIdr dari struk serah terima.`,
+    );
+    return {
+      /** HANYA pernah `true`. "Sudah pernah" sekarang terbit sebagai 409, bukan 200. */
+      credited: true as const,
+      /** Nominal yang BENAR-BENAR dikreditkan — dibaca dari struk, bukan dari body permintaan. */
+      compensationIdr: amountIdr,
+      ...(await this.byId(id)),
+    };
+  }
+
+  /** Baris ledger ganti rugi untuk satu titipan, kalau sudah pernah ada. */
+  private async findCompensationEntry(consignmentId: string) {
+    return this.prisma.balanceEntry.findFirst({
+      where: {
+        reason: CONSIGNMENT_COMPENSATION_REASON,
+        refId: consignmentId,
+      },
+      select: {
+        id: true,
+        userId: true,
+        deltaIdrx: true,
+        createdAt: true,
+      },
     });
-    await this.writeEvent(this.prisma, {
-      consignmentId: id,
-      kind: 'CORRECTION',
-      actor: admin,
-      note:
-        `Ganti rugi Rp ${dto.amountIdr} ${credited ? 'dikreditkan' : '(SUDAH pernah dikreditkan — tidak dobel)'}. ` +
-        dto.note.trim(),
-    });
-    return { credited, ...(await this.byId(id)) };
+  }
+
+  /**
+   * Penolakan untuk ganti rugi KEDUA. Menyebut nominal yang SUDAH tercatat, karena itulah satu-
+   * satunya informasi yang membuat operator bisa memutuskan langkah berikutnya: kalau angkanya
+   * ternyata salah, yang dibutuhkan bukan "bayar lagi" (ledger append-only, dan kunci idempotensi
+   * (reason, refId) akan menolaknya selamanya) melainkan KOREKSI yang terlihat sebagai koreksi.
+   */
+  private alreadyCompensated(
+    consignmentId: string,
+    entry: {
+      deltaIdrx: bigint;
+      userId: string;
+      createdAt: Date;
+    } | null,
+  ): ConflictException {
+    const nominal =
+      entry != null
+        ? `Rp ${Number(entry.deltaIdrx).toLocaleString('id-ID')}`
+        : '(nominalnya gagal dibaca — periksa ledger saldo)';
+    const kapan =
+      entry != null ? entry.createdAt.toISOString() : '(waktu tidak terbaca)';
+    return new ConflictException(
+      `Ganti rugi untuk titipan ${consignmentId} SUDAH pernah tercatat: ${nominal} ke saldo ` +
+        `${entry?.userId ?? '(pemilik)'} pada ${kapan}. NOL rupiah bergerak dari permintaan ini ` +
+        '— dan itu SENGAJA: ledger saldo append-only dengan kunci idempotensi (reason, refId), ' +
+        'jadi pembayaran kedua untuk titipan yang sama tidak mungkin terjadi lewat rute ini. ' +
+        'KALAU NOMINAL YANG TERCATAT SALAH, jangan mencoba membayar ulang: catat selisihnya ' +
+        'sebagai kesepakatan tertulis lewat POST /admin/consignments/:id/correction, lalu ' +
+        'selesaikan pembayarannya di luar sistem. Koreksi harus TERLIHAT sebagai koreksi.',
+    );
+  }
+
+  /**
+   * ╔════════════════════════════════════════════════════════════════════════════════════════╗
+   * ║ UTANG KE PEMBELI — LEWAT RAIL YANG SUDAH ADA, BUKAN RAIL BARU.                         ║
+   * ╚════════════════════════════════════════════════════════════════════════════════════════╝
+   *
+   * Kartu titipan yang hilang SESUDAH terjual meninggalkan satu orang dengan nol kartu dan nol
+   * Rupiah: PEMBELINYA. Rupiah-nya tidak lagi duduk di treasury — 95%-nya sudah dikreditkan ke
+   * saldo pemilik di detik settlement, dan 5%-nya jadi komisi. Jadi memulihkan pembeli BUKAN
+   * "mengembalikan uang yang kami pegang" melainkan MEMBAYAR KERUGIAN dari kantong Hoshi.
+   *
+   * KENAPA `PaymentOrder` → REFUND_DUE, dan bukan tabel utang baru: itulah SATU-SATUNYA bentuk
+   * "user sudah bayar dan tidak menerima apa pun" yang sudah dikenal seluruh sistem ini —
+   * reconciler mengalarmkannya, /admin/transactions menampilkannya, dan operator sudah terlatih
+   * membacanya. Utang yang lahir dalam bentuk yang tidak dikenali daftar kerja mana pun sama saja
+   * dengan utang yang tidak dicatat. Polanya DISALIN dari `recordShippingRefundDebts`
+   * (src/payments/shipping-refund-debt.ts), penulis PaymentStatus.REFUND_DUE kedua di repo ini:
+   * log DULU, tulisan BERPAGAR pada status yang kami baca, tidak pernah melempar.
+   *
+   * ══ `refundSafe = false`, DAN ITU BUKAN KELALAIAN ══
+   * `refundSafe = true` adalah KLAIM dengan dua paruh: uang user TERBUKTI kami pegang DAN
+   * TERBUKTI belum diserahkan. Di sini paruh PERTAMA salah — uangnya sudah keluar ke saldo
+   * pemilik. Operator yang menuruti aturan rumah ("baca refundSafe, bukan teksnya") karena itu
+   * harus melihat "berhenti dan verifikasi", bukan "transfer sekarang": jumlah yang harus
+   * dikembalikan, dari kantong siapa, dan apa yang terjadi pada payout pemilik adalah keputusan
+   * manusia. Utangnya tetap TERCATAT — yang ditahan hanya izin transfernya, sama persis dengan
+   * kebijakan `markProvenDeviationRefundDue` di payments.
+   *
+   * TIDAK PERNAH MELEMPAR. Pemanggilnya (`markLost`, `compensate`) sudah menulis/menolak; sebuah
+   * kegagalan pembukuan tidak boleh membalikkan itu. Setiap kegagalan terbit sebagai log ERROR
+   * yang menyebut PERSIS query pemulihannya.
+   */
+  private async recordBuyerRefundDebt(
+    c: {
+      id: string;
+      cardName: string;
+      status: ConsignmentStatus;
+      soldOrderId: string | null;
+      payoutIdrx: number | null;
+      commissionIdrx: number | null;
+      listing?: { id: string; buyerId: string | null } | null;
+    },
+    trigger: string,
+    reason: string,
+  ): Promise<ConsignmentBuyerRefundDebt> {
+    const base = {
+      merchantOrderId: c.soldOrderId,
+      priceIdr: null as number | null,
+      statusBefore: null as PaymentStatus | null,
+      statusAfter: null as PaymentStatus | null,
+      recordedNow: false,
+    };
+
+    if (!c.soldOrderId) {
+      const action =
+        `Titipan ${c.id} tercatat punya pembeli (listing.buyerId ` +
+        `${c.listing?.buyerId ?? 'null'}) tapi TIDAK menyimpan merchantOrderId penjualannya, ` +
+        'jadi utangnya tidak bisa ditempelkan ke baris pembayaran mana pun secara otomatis. ' +
+        'CARI MANUAL: SELECT * FROM payment_orders WHERE "listingId" = ' +
+        `'${c.listing?.id ?? '?'}' ORDER BY "createdAt" DESC — lalu tandai REFUND_DUE sendiri.`;
+      this.logger.error(
+        `UTANG PEMBELI TIDAK TERTEMPEL: ${action} Pemicu: ${trigger}.`,
+      );
+      return { ...base, operatorAction: action };
+    }
+
+    let order: {
+      merchantOrderId: string;
+      userId: string;
+      priceIdr: number;
+      status: PaymentStatus;
+    } | null = null;
+    try {
+      order = await this.prisma.paymentOrder.findUnique({
+        where: { merchantOrderId: c.soldOrderId },
+        select: {
+          merchantOrderId: true,
+          userId: true,
+          priceIdr: true,
+          status: true,
+        },
+      });
+    } catch (err) {
+      const action =
+        `Gagal membaca order pembeli ${c.soldOrderId} untuk titipan ${c.id}: ` +
+        `${err instanceof Error ? err.message : String(err)}. Utangnya NYATA — periksa manual: ` +
+        `SELECT * FROM payment_orders WHERE "merchantOrderId" = '${c.soldOrderId}'.`;
+      this.logger.error(action);
+      return { ...base, operatorAction: action };
+    }
+
+    if (!order) {
+      const action =
+        `Order pembeli ${c.soldOrderId} (titipan ${c.id}) TIDAK DITEMUKAN — utangnya tidak bisa ` +
+        'dicatat otomatis. Ini seharusnya mustahil: kolom itu ditulis settlement sendiri. ' +
+        'Periksa manual sebelum menutup kasusnya.';
+      this.logger.error(action);
+      return { ...base, operatorAction: action };
+    }
+
+    const message =
+      `UTANG KE PEMBELI — KARTU TITIPAN HILANG SESUDAH TERJUAL. Titipan ${c.id} ` +
+      `("${c.cardName}") ${trigger}, padahal kartunya SUDAH dibayar penuh lewat order ini dan ` +
+      'masih menunggu dikirim. Pembeli memegang NOL kartu dan NOL Rupiah. Rupiah-nya TIDAK lagi ' +
+      `di treasury: payout Rp ${c.payoutIdrx ?? 0} sudah masuk ke saldo pemilik kartu dan komisi ` +
+      `Rp ${c.commissionIdrx ?? 0} sudah diambil di detik settlement — jadi memulihkan pembeli ` +
+      'adalah KERUGIAN HOSHI, bukan pengembalian uang yang kami pegang. refundSafe=false: ' +
+      'utangnya TERCATAT tapi transfernya keputusan manusia. Alasan: ' +
+      reason;
+
+    // Log DULU: utangnya harus terbit walaupun tulisan DB di bawah gagal. Format prefiksnya
+    // SENGAJA sama dengan payments (`REFUND_DUE[JANGAN-REFUND][...]`) supaya pencarian log
+    // operator yang sudah ada ikut menemukannya.
+    this.logger.error(
+      `REFUND_DUE[JANGAN-REFUND][KARTU TITIPAN HILANG] ${order.merchantOrderId} ` +
+        `(user ${order.userId}, Rp ${order.priceIdr}): ${message}`,
+    );
+
+    const seen = {
+      merchantOrderId: order.merchantOrderId,
+      priceIdr: order.priceIdr,
+      statusBefore: order.status,
+    };
+
+    if (order.status !== PaymentStatus.FULFILLED) {
+      // TIDAK DISENTUH. Baris yang sudah REFUND_DUE berarti utangnya memang sudah tercatat
+      // (mungkin oleh panggilan sebelumnya — rute ini idempoten karena predikat FULFILLED-nya);
+      // status lain berarti settlement-nya tidak pernah selesai, dan menimpanya dari sini akan
+      // menghapus keadaan yang justru harus diperiksa manusia.
+      const action =
+        order.status === PaymentStatus.REFUND_DUE
+          ? `Utang ke pembeli SUDAH tercatat sebelumnya pada order ${order.merchantOrderId} ` +
+            `(Rp ${order.priceIdr}). Baca kolom \`error\`-nya, verifikasi, lalu kembalikan ` +
+            'Rupiah-nya ke pembeli di luar sistem — tidak ada kode yang mengirimkannya otomatis.'
+          : `Order pembeli ${order.merchantOrderId} berstatus ` +
+            `${order.status}, bukan FULFILLED — TIDAK disentuh. Periksa manual: kalau Rupiah ` +
+            'pembeli memang mendarat, tandai REFUND_DUE sendiri; kalau tidak, tidak ada utang.';
+      this.logger.error(
+        `UTANG PEMBELI TIDAK DITULIS (status ${order.status}) untuk titipan ${c.id}: ${action}`,
+      );
+      return {
+        ...seen,
+        statusAfter: order.status,
+        recordedNow: false,
+        operatorAction: action,
+      };
+    }
+
+    try {
+      // BERPAGAR pada status yang KITA BACA. Panggilan kedua (mis. `compensate` sesudah
+      // `markLost`) cocok 0 baris — SATU utang, bukan dua. `fulfilledAt` SENGAJA tidak dihapus:
+      // order itu MEMANG pernah dilayani, dan menghapus stempelnya menghilangkan satu-satunya
+      // bukti kapan Rupiah pembelinya diterima.
+      const moved = await this.prisma.paymentOrder.updateMany({
+        where: {
+          merchantOrderId: order.merchantOrderId,
+          status: PaymentStatus.FULFILLED,
+        },
+        data: {
+          status: PaymentStatus.REFUND_DUE,
+          error: message.slice(0, BUYER_DEBT_ERROR_MAX),
+          refundSafe: false,
+        },
+      });
+      const recordedNow = moved.count === 1;
+      return {
+        ...seen,
+        statusAfter: recordedNow ? PaymentStatus.REFUND_DUE : order.status,
+        recordedNow,
+        operatorAction:
+          `Utang ke PEMBELI tercatat di order ${order.merchantOrderId} (Rp ${order.priceIdr}) ` +
+          'sebagai REFUND_DUE dengan refundSafe=FALSE. JANGAN transfer sebelum diverifikasi: ' +
+          'Rupiah-nya sudah keluar ke saldo pemilik kartu, jadi mengembalikannya adalah ' +
+          'kerugian Hoshi dan butuh keputusan manusia.',
+      };
+    } catch (err) {
+      const action =
+        `Gagal menandai REFUND_DUE pada order pembeli ${order.merchantOrderId} sesudah titipan ` +
+        `${c.id} hilang: ${err instanceof Error ? err.message : String(err)}. Utangnya NYATA — ` +
+        'tandai manual.';
+      this.logger.error(action);
+      return {
+        ...seen,
+        statusAfter: order.status,
+        recordedNow: false,
+        operatorAction: action,
+      };
+    }
   }
 
   /* ══════════════════════════════ 6. BUKTI & KOREKSI ══════════════════════════════ */
@@ -2402,12 +2839,32 @@ export class ConsignmentService {
         guard.gradeScore = c.gradeScore;
       }
     }
+    /* ── GRADER: satu-satunya jalan keluar dari kartu yang terkunci di rak ──────────────────
+       Sebelum cabang ini ada, dropdown Grader yang tertinggal kosong saat intake adalah
+       kesalahan PERMANEN: `createListingFor` menolak selamanya kartu tanpa grader, dan tidak ada
+       satu rute pun yang bisa mengisinya sesudah serah-terima. Kartu fisik milik orang lain
+       duduk di rak tanpa bisa dijual, dan satu-satunya jalan keluar dari IN_CUSTODY adalah
+       RELEASE atau LOST — dua-duanya FAKTA PALSU di buku besar yang sengaja append-only.
+
+       String kosong = kartunya ternyata MENTAH (kolomnya dikosongkan). Nilai lain sudah disaring
+       `@IsIn` di DTO, jadi di sini ia pasti salah satu dari PSA/CGC/BGS. */
+    let graderChange: LabelChange | null = null;
+    if (dto.grader !== undefined) {
+      provided++;
+      const next = dto.grader === '' ? null : dto.grader;
+      if (next !== c.grader) {
+        graderChange = { field: 'grader', before: c.grader, after: next };
+        changes.push(graderChange);
+        data.grader = next;
+        guard.grader = c.grader;
+      }
+    }
 
     if (provided === 0) {
       throw new BadRequestException(
         'Sebutkan minimal satu field yang dikoreksi (cardName, cardSet, cardNumber, ' +
-          'certNumber, gradeLabel, gradeScore). Catatan kondisi dan foto SENGAJA tidak bisa ' +
-          'ditimpa — keduanya bukti; koreksi naratif ditulis lewat ' +
+          'certNumber, grader, gradeLabel, gradeScore). Catatan kondisi dan foto SENGAJA tidak ' +
+          'bisa ditimpa — keduanya bukti; koreksi naratif ditulis lewat ' +
           'POST /admin/consignments/:id/correction.',
       );
     }
@@ -2418,27 +2875,90 @@ export class ConsignmentService {
       );
     }
 
-    // ANTI-DOBEL-TITIP ikut berlaku untuk nomor sertifikat yang DIKOREKSI, bukan hanya yang
-    // diketik saat intake — kalau tidak, kartu yang sama bisa punya dua titipan hidup lewat
-    // jalan belakang. Pemeriksaan ini ADA UNTUK PESANNYA; yang benar-benar menegakkannya tetap
-    // partial unique index `consignments_active_cert_uniq` (P2002 → 409 lewat filter Prisma).
+    /* ══ GRADING YANG DIBACA PEMBELI SAAT IA MEMBAYAR TIDAK BOLEH BERUBAH SESUDAHNYA ══
+       Nama kartu yang salah ketik tetap layak diperbaiki setelah terjual (arsip custody Hoshi
+       tidak boleh menyimpan nama kartu yang tidak pernah ada) — itulah kenapa rute ini sengaja
+       boleh dipakai di status apa pun. `grader` BERBEDA KELAS: ia bagian dari APA YANG DIBELI.
+       Mengubahnya sesudah ada yang membayar berarti mengubah barangnya secara retroaktif, dan
+       baris `Listing` yang SOLD memang sudah dijaga sebagai snapshot yang tidak disentuh. Kalau
+       grading yang benar ternyata lain, itu sengketa antara Hoshi dan pembelinya — bukan sesuatu
+       yang diselesaikan dengan menimpa satu kolom. */
+    if (graderChange && isConsignmentSoldToBuyer(c)) {
+      throw new ConflictException(
+        `Titipan ${id} sudah punya pembeli yang membayar (order ` +
+          `${c.soldOrderId ?? '(tidak tercatat)'}), jadi GRADER-nya tidak bisa dikoreksi lagi: ` +
+          `pembeli membayar untuk kartu ber-grading "${c.grader ?? 'mentah'}" dan itulah yang ` +
+          'dibacanya saat menekan Beli. Field label lain masih boleh dikoreksi. Kalau grading ' +
+          'yang benar memang berbeda, itu urusan yang harus diselesaikan DENGAN pembelinya — ' +
+          'catat duduk perkaranya lewat POST /admin/consignments/:id/correction.',
+      );
+    }
+
+    /* ══ MENGOSONGKAN GRADER SELAGI KARTUNYA TAYANG: DITOLAK, DAN BUKAN KARENA TIPE DATA ══
+       `Listing.grader` adalah enum NOT NULL berisi PSA/CGC/BGS saja — tidak ada nilai yang JUJUR
+       di sana untuk kartu mentah (alasan yang sama yang membuat `createListingFor` menolak kartu
+       tanpa grading). Jadi "kartunya ternyata mentah" TIDAK BISA dicerminkan ke baris listing
+       yang sedang tayang, dan membiarkan koreksinya lewat akan meninggalkan pajangan publik yang
+       menyebut grader yang catatan titipannya sendiri sudah bantah. Urutannya: turunkan dulu
+       pajangannya (rute penarikan), baru koreksi — kartunya tetap di rak, tidak ada yang hilang. */
+    if (
+      graderChange &&
+      graderChange.after == null &&
+      c.listing?.status === ListingStatus.ACTIVE
+    ) {
+      throw new ConflictException(
+        `Titipan ${id} SEDANG TAYANG (listing ${c.listing.id}), jadi grader-nya tidak bisa ` +
+          'dikosongkan sekarang: kolom grader pada listing hanya mengenal PSA/CGC/BGS dan tidak ' +
+          'punya nilai yang jujur untuk kartu MENTAH. Turunkan dulu pajangannya, baru koreksi ' +
+          'labelnya — kartunya tetap di rak Hoshi selama itu.',
+      );
+    }
+
+    /* ══ ANTI-DOBEL-TITIP: KUNCINYA PASANGAN (grader, certNumber), JADI DUA-DUANYA DIPERIKSA ══
+       Dulu blok ini hanya melihat `certChange` dan hanya memakai `c.grader` yang LAMA. Sesudah
+       `grader` bisa dikoreksi, keduanya salah: mengubah grader SAJA sudah memindahkan baris ini
+       ke kunci unik yang LAIN — bisa tepat ke kunci yang sudah dipakai titipan hidup lain —
+       tanpa satu pun pemeriksaan berbunyi. Maka yang dipakai di bawah adalah nilai SESUDAH
+       koreksi untuk KEDUA kolom, dan pemicunya perubahan pada salah satu dari keduanya.
+
+       Pemeriksaan ini ADA UNTUK PESANNYA; yang benar-benar menegakkannya tetap partial unique
+       index `consignments_active_cert_uniq` (P2002 → 409 lewat filter Prisma). */
     const certChange = changes.find((ch) => ch.field === 'certNumber');
-    if (certChange && typeof certChange.after === 'string' && c.grader) {
-      const clash = await this.prisma.consignment.findFirst({
-        where: {
-          grader: c.grader,
-          certNumber: certChange.after,
-          id: { not: id },
-          ...liveConsignmentWhere(),
-        },
-        select: { id: true, status: true },
-      });
-      if (clash) {
-        throw new ConflictException(
-          `Sertifikat ${c.grader} ${certChange.after} SUDAH dipakai titipan aktif lain ` +
-            `(${clash.id}, status ${clash.status}). Satu kartu fisik tidak bisa punya dua ` +
-            'titipan hidup — periksa lagi nomor yang tertera di slab-nya.',
+    const nextGrader = (
+      graderChange ? graderChange.after : c.grader
+    ) as Grader | null;
+    const nextCert = (certChange ? certChange.after : c.certNumber) as
+      | string
+      | null;
+
+    if (certChange || graderChange) {
+      // Lihat `CERT_WITHOUT_GRADER_MESSAGE`. Dipicu HANYA kalau koreksinya menyentuh salah satu
+      // dari pasangan itu: baris WARISAN yang sudah terlanjur berbentuk begitu tetap boleh
+      // diperbaiki nama/set-nya tanpa dipaksa menyelesaikan urusan grader lebih dulu — memblokir
+      // koreksi yang TIDAK ADA hubungannya hanya akan membuat rute ini ikut buntu.
+      if (nextCert != null && nextGrader == null) {
+        throw new BadRequestException(
+          `${CERT_WITHOUT_GRADER_MESSAGE} (Sesudah koreksi ini baris ${id} akan berbunyi ` +
+            `grader=(kosong), certNumber="${nextCert}".)`,
         );
+      }
+      if (nextCert != null && nextGrader != null) {
+        const clash = await this.prisma.consignment.findFirst({
+          where: {
+            grader: nextGrader,
+            certNumber: nextCert,
+            id: { not: id },
+            ...liveConsignmentWhere(),
+          },
+          select: { id: true, status: true },
+        });
+        if (clash) {
+          throw new ConflictException(
+            `Sertifikat ${nextGrader} ${nextCert} SUDAH dipakai titipan aktif lain ` +
+              `(${clash.id}, status ${clash.status}). Satu kartu fisik tidak bisa punya dua ` +
+              'titipan hidup — periksa lagi nomor yang tertera di slab-nya.',
+          );
+        }
       }
     }
 
@@ -2484,7 +3004,7 @@ export class ConsignmentService {
         // bentuk dari baris yang dipajang dengan nilai benar sejak awal.
         const labelChange = changes.find((ch) => ch.field === 'gradeLabel');
         const scoreChange = changes.find((ch) => ch.field === 'gradeScore');
-        if (labelChange || scoreChange) {
+        if (labelChange || scoreChange || graderChange) {
           // DIBACA DARI `changes`, BUKAN dari `data` dengan `??`: koreksi yang MENGOSONGKAN
           // `gradeLabel` menulis `null`, dan `null ?? c.gradeLabel` akan diam-diam memulihkan
           // label LAMA ke baris listing — persis label palsu yang rute ini ada untuk menghapus.
@@ -2495,9 +3015,18 @@ export class ConsignmentService {
           const nextScore = (scoreChange ? scoreChange.after : c.gradeScore) as
             | number
             | null;
+          // `nextGrader` (bukan `c.grader`) supaya rumus cadangan "PSA 10" tidak menyebut grader
+          // LAMA pada baris yang grader-nya barusan diperbaiki.
           listingData.grade =
-            nextLabel ?? `${c.grader ?? ''} ${nextScore ?? ''}`.trim();
+            nextLabel ?? `${nextGrader ?? ''} ${nextScore ?? ''}`.trim();
           listingData.gradeScore = nextScore ?? 0;
+          // Kolomnya sendiri ikut, dan hanya kalau ada nilai yang sah: mengosongkannya selagi
+          // listing ACTIVE sudah ditolak di atas, jadi cabang null di sini tidak bisa tercapai
+          // untuk baris yang benar-benar tayang — tapi `updateMany` di bawah berpagar ACTIVE dan
+          // NOT NULL-nya dijaga database, jadi kami tetap tidak mengirim null ke sana.
+          if (graderChange && nextGrader != null) {
+            listingData.grader = nextGrader;
+          }
         }
         if (Object.keys(listingData).length > 0) {
           listingMirrorAttempted = true;
@@ -2608,7 +3137,27 @@ export class ConsignmentService {
       },
       orderBy: { createdAt: 'desc' },
     });
-    return rows.map((r) => ({ ...r, ...this.custodyFlags(r) }));
+    // ╔════════════════════════════════════════════════════════════════════════════════════════╗
+    // ║ LISTING YANG SUDAH MATI TIDAK IKUT KELUAR DARI SINI.                                  ║
+    // ╚════════════════════════════════════════════════════════════════════════════════════════╝
+    //
+    // `Listing.consignmentId` @unique, jadi relasi ini 1-1 dan baris listing yang sama DIPAKAI
+    // ULANG saat kartunya dipajang lagi. Akibatnya sebuah titipan yang pemiliknya tarik dari
+    // pajangan tetap menggendong baris listing CANCELLED — lengkap dengan HARGA PAJANG
+    // TERAKHIRNYA, yang bisa jauh di bawah `askPriceIdr` di struk bertanda tangan yang dipegang
+    // pemiliknya. Selama baris itu ikut terkirim, layar mana pun bisa membacanya sebagai "harga
+    // yang disepakati" dan menunjukkan angka yang LEBIH RENDAH daripada yang ada di kertasnya.
+    //
+    // Dipotong DI SUMBERNYA, bukan di satu layar: harga pajang hanya berarti selama pajangannya
+    // HIDUP, dan tautan "lihat di marketplace" ke listing yang sudah dibatalkan juga bukan
+    // tautan — ia jalan buntu. `custodyFlags(r)` sengaja dihitung dari baris ASLI (di situ
+    // `effectivePriceIdr` memang sudah jatuh ke `askPriceIdr` untuk listing non-ACTIVE), jadi
+    // tidak ada bendera yang ikut berubah arti karenanya.
+    return rows.map((r) => ({
+      ...r,
+      ...this.custodyFlags(r),
+      listing: r.listing?.status === ListingStatus.CANCELLED ? null : r.listing,
+    }));
   }
 
   /**
@@ -2701,7 +3250,14 @@ export class ConsignmentService {
       omit: ConsignmentService.OMIT_SECRETS,
       include: {
         photos: { select: { id: true, kind: true, url: true } },
-        listing: { select: { id: true, status: true, priceIdrx: true } },
+        // `buyerId` ikut DENGAN SENGAJA: ia salah satu dari tiga fakta yang menjawab "kartu ini
+        // sudah punya pembeli yang membayar?" (`isConsignmentSoldToBuyer`), dan jawabannya
+        // menentukan SIAPA yang harus dipulihkan kalau kartunya hilang. Tanpa kolom ini,
+        // `actionRequired` akan menyuruh membayar pemilik untuk kartu yang pemiliknya sudah
+        // dibayar.
+        listing: {
+          select: { id: true, status: true, priceIdrx: true, buyerId: true },
+        },
         // BISA null sejak titipan boleh diterima dari orang tanpa akun. Kolom snapshot
         // `consignorNameAtIntake`/`consignorPhoneAtIntake` ikut terkirim di baris yang sama dan
         // SELALU terisi — itulah yang dipakai operator untuk menghubungi orangnya.
@@ -2716,6 +3272,70 @@ export class ConsignmentService {
     const unlinkedStaleBefore = new Date(
       now - UNLINKED_CUSTODY_DAYS * 24 * 60 * 60 * 1000,
     );
+
+    /* ══════════ DUA PEMBACAAN TAMBAHAN — KEDUANYA MENJAWAB "APA YANG MASIH KAMI UTANGI" ══════
+       Keduanya dibaca DARI FAKTA, bukan dari status baris titipannya, karena justru statusnyalah
+       yang berbohong di kedua kasus: LOST terbaca "selesai" padahal ganti ruginya belum dibayar
+       sepeser pun, dan SOLD terbaca "beres" padahal custody-nya tidak pernah ditutup. */
+
+    /** Titipan LOST yang ganti ruginya SUDAH tercatat di ledger → yang tidak ada di sini, belum. */
+    const compensatedIds = new Set<string>();
+    const lostIds = rows
+      .filter((r) => r.status === ConsignmentStatus.LOST)
+      .map((r) => r.id);
+    if (lostIds.length > 0) {
+      const entries = await this.prisma.balanceEntry.findMany({
+        where: {
+          reason: CONSIGNMENT_COMPENSATION_REASON,
+          refId: { in: lostIds },
+        },
+        select: { refId: true },
+      });
+      for (const e of entries) if (e.refId) compensatedIds.add(e.refId);
+    }
+
+    /**
+     * Baris SOLD yang paketnya SUDAH berangkat menurut jalur kirim, per `listingId`.
+     *
+     * Penutupan custody saat paket berangkat bersifat BEST-EFFORT di luar transaksi (lihat
+     * admin.service.ts, PATCH redemption → SHIPPED): kalau tulisannya gagal, kegagalannya hanya
+     * hidup di satu baris log yang tidak dibaca siapa pun, dan catatan titipan orang lain tetap
+     * berbunyi "masih di rak Hoshi" selamanya. Pembacaan ini yang memunculkannya kembali.
+     *
+     * IN_TRANSIT & DELIVERED ikut, bukan cuma SHIPPED: ketiganya sama-sama berarti paketnya
+     * SUDAH keluar dari tangan Hoshi, dan baris yang terlanjur maju ke status berikutnya justru
+     * yang paling lama tertinggal.
+     */
+    const shippedByListingId = new Map<string, string>();
+    const openSoldListingIds = rows
+      .filter(
+        (r) =>
+          r.status === ConsignmentStatus.SOLD &&
+          r.custodyReleasedAt == null &&
+          r.listing != null,
+      )
+      .map((r) => r.listing!.id);
+    if (openSoldListingIds.length > 0) {
+      const shipped = await this.prisma.cardRedemption.findMany({
+        where: {
+          listingId: { in: openSoldListingIds },
+          status: {
+            in: [
+              RedemptionStatus.SHIPPED,
+              RedemptionStatus.IN_TRANSIT,
+              RedemptionStatus.DELIVERED,
+            ],
+          },
+        },
+        select: { id: true, listingId: true, status: true },
+      });
+      for (const s of shipped) {
+        if (s.listingId) {
+          shippedByListingId.set(s.listingId, `${s.id} (${s.status})`);
+        }
+      }
+    }
+
     const actionRequired = rows
       .map((r) => {
         const reasons: string[] = [];
@@ -2816,13 +3436,62 @@ export class ConsignmentService {
             );
           }
         }
+        // ── KARTU HILANG YANG GANTI RUGINYA BELUM DIBAYAR SEPESER PUN ────────────────────
+        //
+        // Begitu admin mencatat LOST, barisnya pindah ke tab "Selesai / hilang" — dan di sanalah
+        // ia berhenti dilihat siapa pun. Padahal LOST bukan akhir apa pun: ia titik ketika Hoshi
+        // MULAI BERUTANG. Sebuah tab berlabel "Selesai" yang memuat utang yang belum dibayar
+        // adalah cara paling rapi untuk melupakan janji tertulis kepada pemilik kartu.
+        //
+        // Kalimatnya MENYEBUT NOMINAL YANG DIJANJIKAN STRUK (`askPriceIdr`) karena itulah dasar
+        // ganti ruginya (lihat `compensate`) — peringatan yang tidak menyebut angkanya menyuruh
+        // operator mencari sendiri apa yang harus dibayar, dan itu langkah yang akan dilewati.
+        if (r.status === ConsignmentStatus.LOST && !compensatedIds.has(r.id)) {
+          reasons.push(
+            isConsignmentSoldToBuyer(r)
+              ? `HILANG/RUSAK SESUDAH TERJUAL dan belum ada pemulihan yang tercatat. Pemiliknya ` +
+                  `sudah menerima payout Rp ${r.payoutIdrx ?? 0}; yang memegang NOL kartu dan NOL ` +
+                  `Rupiah adalah PEMBELI (order ${r.soldOrderId ?? '(tidak tercatat)'}). Utangnya ` +
+                  'ada di baris pembayaran itu sebagai REFUND_DUE — buka /admin/transactions, ' +
+                  'verifikasi, lalu kembalikan Rupiah-nya ke pembeli. JANGAN mengkredit pemilik.'
+              : `HILANG/RUSAK tapi GANTI RUGINYA BELUM TERCATAT. Struk serah terima yang ` +
+                  `ditandatangani kedua pihak menjanjikan Rp ${r.askPriceIdr.toLocaleString('id-ID')} ` +
+                  '(harga jual yang disepakati). Kartunya milik orang lain, dan ini janji ' +
+                  'tertulis, bukan kebijakan yang bisa ditunda. ' +
+                  // Kalimat yang menyuruh membayar padahal pembayarannya PASTI ditolak adalah
+                  // kalimat yang mengajari operator mengabaikan daftar ini. Titipan tanpa
+                  // pemilik tertaut tidak punya akun untuk dikredit — yang dibutuhkan lebih
+                  // dulu adalah menelepon orangnya, bukan menekan tombol bayar.
+                  (isConsignorLinked(r)
+                    ? 'Bayar lewat POST /admin/consignments/:id/compensate.'
+                    : `Pemiliknya BELUM tertaut akun, jadi ganti ruginya belum punya tujuan: ` +
+                      `hubungi ${r.consignorNameAtIntake} di ${r.consignorPhoneAtIntake}, ` +
+                      'tautkan akunnya, BARU bayar.'),
+          );
+        }
         // Sudah terjual, tapi pembeli belum meminta pengiriman — kartunya masih di rak kita.
         if (
           r.status === ConsignmentStatus.SOLD &&
           r.custodyReleasedAt == null
         ) {
+          // ── PAKETNYA SUDAH BERANGKAT TAPI CUSTODY-NYA TIDAK PERNAH DITUTUP ─────────────
+          //
+          // Penutupan custody saat paket diserahkan ke kurir BEST-EFFORT di luar transaksi
+          // (admin.service.ts, PATCH redemption → SHIPPED), jadi kegagalannya cuma hidup di log.
+          // Akibatnya catatan titipan orang lain berbunyi "masih di rak Hoshi" untuk kartu yang
+          // sudah di tangan pembelinya — kebalikan dari kenyataan, di satu-satunya tempat yang
+          // dijadikan rujukan kalau nanti ada sengketa.
+          const shipment = r.listing
+            ? shippedByListingId.get(r.listing.id)
+            : undefined;
           reasons.push(
-            'Sudah TERJUAL tapi kartunya masih di rak Hoshi (pembeli belum minta kirim).',
+            shipment
+              ? `Paketnya SUDAH berangkat (redemption ${shipment}) tapi custody titipan ini ` +
+                  'TIDAK PERNAH ditutup — `custodyReleasedAt` masih kosong, jadi catatan ini ' +
+                  'masih berbunyi "kartunya di rak Hoshi" untuk kartu yang sudah di tangan ' +
+                  'pembelinya. Tutup sekarang lewat POST /admin/consignments/:id/release ' +
+                  '(SHIPPED_TO_BUYER).'
+              : 'Sudah TERJUAL tapi kartunya masih di rak Hoshi (pembeli belum minta kirim).',
           );
         }
         return reasons.length > 0

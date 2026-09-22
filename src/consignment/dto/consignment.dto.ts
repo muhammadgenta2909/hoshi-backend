@@ -713,13 +713,38 @@ export class MarkConsignmentLostDto {
   note!: string;
 }
 
-/** Ganti rugi ke pemilik lewat ledger saldo yang SUDAH ADA. Idempoten per consignment. */
+/**
+ * ╔══════════════════════════════════════════════════════════════════════════════════════════════╗
+ * ║ GANTI RUGI — NOMINALNYA TIDAK DIKETIK OPERATOR. Ia DIBACA dari struk.                       ║
+ * ╚══════════════════════════════════════════════════════════════════════════════════════════════╝
+ *
+ * KEPUTUSAN PEMILIK PRODUK: dasar ganti rugi adalah `Consignment.askPriceIdr` — "Harga jual yang
+ * disepakati" yang TERCETAK di struk serah terima dua lembar yang ditandatangani kedua pihak.
+ * Bukan `reservePriceIdr` (harga dasar), bukan taksiran pasar hari ini. Alasannya kepercayaan
+ * pemilik kartu: angka yang ia bawa pulang di kertasnya HARUS sama dengan angka yang ia terima.
+ *
+ * KENAPA `amountIdr` MASIH ADA, dan kenapa ia OPSIONAL SEKARANG:
+ *   • ia bukan lagi PERINTAH melainkan KONFIRMASI. Kalau dikirim, ia WAJIB sama persis dengan
+ *     `askPriceIdr`; kalau berbeda, permintaannya DITOLAK dengan kedua angka disebutkan. Itulah
+ *     yang membunuh salah ketik "kurang satu nol" — bentuk kesalahan yang dulu diam-diam lolos
+ *     dan mengkredit pemilik sepersepuluh dari yang dijanjikan struknya.
+ *   • opsional supaya layar yang sudah tidak lagi menanyakan nominalnya (karena memang bukan
+ *     keputusan operator) tidak tertolak `forbidNonWhitelisted`, dan layar lama yang masih
+ *     mengirimkannya tetap jalan.
+ */
 export class CompensateConsignmentDto {
-  @ApiProperty({ example: 20_000_000, description: 'Rupiah utuh.' })
+  @ApiPropertyOptional({
+    example: 20_000_000,
+    description:
+      'KONFIRMASI, bukan perintah. Rupiah utuh. Kalau dikirim, HARUS sama persis dengan ' +
+      '`askPriceIdr` titipan (angka yang tercetak di struk serah terima) — selisih berapa pun ' +
+      'DITOLAK. Boleh dikosongkan: server memakai `askPriceIdr` apa pun isinya.',
+  })
+  @IsOptional()
   @IsInt()
   @Min(1)
   @Max(IDR_MAX)
-  amountIdr!: number;
+  amountIdr?: number;
 
   @ApiProperty()
   @IsString()
@@ -809,6 +834,41 @@ export class CorrectConsignmentLabelDto {
   @Min(0)
   @Max(10)
   gradeScore?: number;
+
+  /**
+   * ╔════════════════════════════════════════════════════════════════════════════════════════╗
+   * ║ `grader` — SATU-SATUNYA JALAN KELUAR dari kartu yang terkunci di rak.                  ║
+   * ╚════════════════════════════════════════════════════════════════════════════════════════╝
+   *
+   * Sebelum field ini ada, dropdown Grader yang tertinggal kosong saat intake adalah kesalahan
+   * PERMANEN: `createListingFor` menolak SELAMANYA kartu tanpa grader ("kartu mentah belum bisa
+   * dipajang"), dan tidak ada SATU rute pun di repo ini yang bisa mengisi kolom itu sesudah
+   * serah-terima. Fotonya lengkap, struknya ditandatangani, custody diterima — dan kartu fisik
+   * milik orang lain duduk di rak tanpa bisa dijual, dengan satu-satunya jalan keluar dari
+   * IN_CUSTODY berupa RELEASE ("dikembalikan" — padahal tidak) atau LOST ("hilang" — padahal
+   * tidak). Dua-duanya FAKTA PALSU yang ditulis ke buku besar yang sengaja append-only.
+   *
+   * STRING KOSONG = KOSONGKAN (kartunya ternyata mentah). Nilai lain WAJIB PSA/CGC/BGS.
+   *
+   * TIGA SYARAT, ditegakkan di service (lihat `correctLabel`):
+   *   (a) ikut memicu pra-cek bentrok nomor sertifikat — kunci anti-dobel-titip adalah PASANGAN
+   *       (grader, certNumber), jadi mengubah separuhnya sama saja dengan mengubah kuncinya;
+   *   (b) `Listing.grader`/`grade` ikut diperbarui di transaksi yang SAMA kalau listing-nya
+   *       masih ACTIVE — dan MENGOSONGKAN grader ditolak selama listing itu tayang, karena
+   *       `Listing.grader` NOT NULL dan tidak ada nilai jujur untuk kartu mentah di sana;
+   *   (c) DITOLAK kalau titipannya sudah punya pembeli. Grading yang dibaca pembeli SAAT IA
+   *       MEMBAYAR tidak boleh berubah sesudahnya.
+   */
+  @ApiPropertyOptional({
+    enum: Grader,
+    description:
+      'Grader kartu (PSA/CGC/BGS). String kosong = kosongkan (kartunya ternyata MENTAH). ' +
+      'Ikut diperiksa terhadap kunci anti-dobel-titip (grader, certNumber) dan DITOLAK kalau ' +
+      'titipannya sudah terjual.',
+  })
+  @IsOptional()
+  @IsIn([...Object.values(Grader), ''])
+  grader?: Grader | '';
 
   @ApiProperty({
     description:
