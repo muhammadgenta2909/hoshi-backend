@@ -154,6 +154,37 @@ class EnvironmentVariables {
   @IsString()
   HOSHI_CC_BUY_ENABLED?: string;
 
+  /* ══════════════════════════════════════════════════════════════════════════════════════════
+     RESELLER CC — SATU-SATUNYA JALUR DI REPO INI YANG MEMBELANJAKAN USDC TREASURY SENDIRI.
+
+     Keduanya dipakai di `PaymentsService.fulfilListing` tapi tidak pernah terdaftar di sini,
+     jadi tidak ada satu pun tempat yang menuliskan artinya — padahal yang kedua adalah BATAS
+     BELANJA.
+
+     `HOSHI_CC_RESELL_ENABLED` dibaca sebagai `.trim().toLowerCase() === 'true'`, jadi "1",
+     "yes", "TRUE " tidak menyalakannya. Itu memang disengaja untuk saklar belanja: satu-satunya
+     cara menyalakannya adalah mengetik persis kata itu, dan tidak ada nilai yang "kira-kira
+     menyala".
+
+     `HOSHI_CC_MAX_CARD_PRICE_USDC` dalam BASE UNIT USDC (6 desimal) — $100 = 100000000.
+     Dibaca `intConfig`, yang MELEMPAR untuk nilai cacat (bagus, fail-closed) dan hanya memakai
+     bawaan kalau var-nya TIDAK ADA. Jadi bahayanya bukan salah ketik; bahayanya BAWAANNYA
+     SENDIRI: 5_000_000_000 = $5.000 PER KARTU. Itu bukan plafon yang pernah diputuskan siapa
+     pun, dan ia berkali-kali lipat di atas float treasury yang wajar untuk fase ini.
+
+     Tidak diubah di sini, karena mengubah batas belanja diam-diam sama salahnya dengan
+     mewarisinya diam-diam. Yang ditambahkan: ia sekarang PUNYA NAMA di berkas ini, dan boot
+     BERTERIAK kalau jalur belanjanya diarmed sementara plafonnya tidak pernah diisi — lihat
+     `warnIfResellCapUnset`.
+     ══════════════════════════════════════════════════════════════════════════════════════════ */
+  @IsOptional()
+  @IsString()
+  HOSHI_CC_RESELL_ENABLED?: string;
+
+  @IsOptional()
+  @IsString()
+  HOSHI_CC_MAX_CARD_PRICE_USDC?: string;
+
   // Opsional — kurs USD→IDR untuk mengubah harga katalog CC menjadi harga display
   // IDRX saat listing PERTAMA dibuat (re-sync tidak menyentuh harga). String
   // (bukan @IsInt) mengikuti pola HOSHI_PACK_MARGIN_BPS: salah ketik tidak boleh
@@ -655,8 +686,48 @@ export function validateEnv(config: Record<string, unknown>) {
   assertDomesticShippingRateSane(config);
   assertMainnetConsistency(config);
   warnIfPaymentReturnUrlMissing(config);
+  warnIfResellCapUnset(config);
   warnIfBiteshipConfigIncomplete(config);
   return validated;
+}
+
+/**
+ * PLAFON BELANJA RESELLER — berteriak HANYA ketika ia benar-benar berbahaya.
+ *
+ * `HOSHI_CC_MAX_CARD_PRICE_USDC` punya bawaan $5.000 PER KARTU. Selama jalur reseller MATI
+ * (keadaan default), angka itu tidak membelanjakan apa pun dan tidak perlu diributkan — memaksa
+ * orang mengisinya untuk fitur yang tidak mereka pakai adalah cara melatih peringatan diabaikan.
+ *
+ * Tapi begitu `HOSHI_CC_RESELL_ENABLED=true`, jalur itu membeli kartu dengan USDC treasury
+ * SUNGGUHAN, dan plafon yang tidak pernah diisi berarti setiap pembelian diadili oleh angka yang
+ * tidak pernah diputuskan siapa pun. Di situlah — dan hanya di situlah — ini layak berteriak.
+ *
+ * Tidak menolak start, alasan yang sama dengan tetangganya: plafon bawaan tetap sebuah plafon,
+ * dan mematikan seluruh backend karena satu var yang belum diisi menukar risiko sempit dengan
+ * situs yang mati. Yang menahan belanja sungguhan tetap saldo treasury dan gerbang di kodenya.
+ */
+function warnIfResellCapUnset(config: Record<string, unknown>): void {
+  // `typeof === 'string'` dulu, bukan `String(...)`: nilai non-string tidak pernah bisa menjadi
+  // 'true' lewat jalur aslinya (ConfigService membaca env sebagai string), dan memaksanya jadi
+  // string di sini hanya menciptakan cara kedua sebuah saklar belanja bisa terbaca menyala.
+  const flag = config.HOSHI_CC_RESELL_ENABLED;
+  const armed =
+    typeof flag === 'string' && flag.trim().toLowerCase() === 'true';
+  if (!armed) return;
+
+  const cap = config.HOSHI_CC_MAX_CARD_PRICE_USDC;
+  const terisi = typeof cap === 'string' ? cap.trim() !== '' : cap != null;
+  if (terisi) return;
+
+  // console, bukan Logger Nest: validateEnv berjalan SEBELUM aplikasi (dan logger-nya) berdiri.
+  console.error(
+    '[ENV] HOSHI_CC_RESELL_ENABLED=true TAPI HOSHI_CC_MAX_CARD_PRICE_USDC TIDAK DIISI. ' +
+      'Jalur reseller akan membeli kartu dengan USDC treasury SUNGGUHAN, dan plafon per-kartunya ' +
+      'jatuh ke bawaan 5000000000 base unit = $5.000 PER KARTU — angka yang tidak pernah ' +
+      'diputuskan siapa pun. Isi HOSHI_CC_MAX_CARD_PRICE_USDC di backend.env dengan plafon yang ' +
+      'memang kamu maksud (base unit USDC, 6 desimal: $100 = 100000000), atau matikan lagi ' +
+      'HOSHI_CC_RESELL_ENABLED sampai plafonnya diputuskan.',
+  );
 }
 
 /**
@@ -763,7 +834,13 @@ function warnIfPaymentReturnUrlMissing(config: Record<string, unknown>): void {
  * tentu terjangkau saat validasi env, dan satu blip DB tidak boleh menggagalkan start.
  */
 function assertDomesticShippingRateSane(config: Record<string, unknown>): void {
-  const raw = String(config.HOSHI_DOMESTIC_SHIPPING_FLAT_IDR ?? '').trim();
+  // `typeof === 'string'` dulu, bukan `String(...)`: alasan sama dengan warnIfResellCapUnset —
+  // nilai non-string tidak pernah datang dari env, dan memaksanya jadi string di sini hanya
+  // menciptakan cara kedua sebuah TARIF bisa terbaca "terisi". (Juga membersihkan
+  // @typescript-eslint/no-base-to-string di baris ini.)
+  const v = config.HOSHI_DOMESTIC_SHIPPING_FLAT_IDR;
+  const raw =
+    typeof v === 'string' ? v.trim() : typeof v === 'number' ? String(v) : '';
   if (!raw) return; // tidak diisi = pakai tarif dashboard / tier penampung. Sah.
   const parsed = Number(raw);
   if (
