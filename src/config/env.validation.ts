@@ -4,7 +4,9 @@ import {
   IsInt,
   IsOptional,
   IsString,
+  IsUrl,
   Matches,
+  ValidateIf,
   MinLength,
   validateSync,
 } from 'class-validator';
@@ -52,6 +54,46 @@ class EnvironmentVariables {
   @IsOptional()
   @IsString()
   FRONTEND_ORIGIN?: string;
+
+  /* ══════════════════════════════════════════════════════════════════════════════════════════
+     ALAMAT KEMBALI SETELAH BAYAR — didaftarkan supaya salah ketiknya ketahuan saat BOOT.
+
+     Dibaca `requiredConfig` di TIGA jalur penerbitan tagihan, termasuk satu-satunya rail yang
+     menerbitkan tagihan untuk kartu TITIPAN. `requiredConfig` melempar saat DIPANGGIL, bukan
+     saat start — jadi sebelum ini: var-nya salah ketik atau terhapus saat menyunting
+     backend.env di droplet → boot BERHASIL, log bersih, dashboard hijau, dan kegagalannya baru
+     muncul di depan PEMBELI PERTAMA yang menekan tombol Beli.
+
+     DUA PERLAKUAN, DAN PERBEDAANNYA DISENGAJA:
+
+       nilai ADA tapi CACAT  → DITOLAK KERAS di sini. Konfigurasi cacat tidak pernah bisa jalan,
+                               jadi tidak ada yang dipertukarkan dengan menolaknya, dan boot
+                               adalah titik termurah untuk memperbaikinya.
+
+       nilai HILANG/KOSONG   → PERINGATAN saja (`warnIfPaymentReturnUrlMissing` di bawah), backend
+                               TETAP menyala. Alasannya ditulis lengkap di fungsi itu; singkatnya,
+                               menolak start akan menukar checkout yang rusak dengan SELURUH situs
+                               yang mati.
+
+     `@ValidateIf` di bawah itulah yang memisahkan keduanya. Ia perlu karena `@IsOptional()` saja
+     tidak cukup: `HOSHI_PAYMENT_RETURN_URL=` (baris ada, nilainya kosong) adalah cara paling wajar
+     orang "menghapus" sebuah var di backend.env, dan bagi @IsOptional itu nilai yang ADA — lalu
+     @IsUrl menolaknya sebagai cacat, dan boot mati justru di kasus yang paling sering terjadi.
+     ══════════════════════════════════════════════════════════════════════════════════════════ */
+  @ValidateIf(
+    (o: EnvironmentVariables) =>
+      typeof o.HOSHI_PAYMENT_RETURN_URL === 'string' &&
+      o.HOSHI_PAYMENT_RETURN_URL.trim().length > 0,
+  )
+  @IsUrl(
+    { require_tld: false, require_protocol: true },
+    {
+      message:
+        'HOSHI_PAYMENT_RETURN_URL harus URL lengkap berikut protokolnya, mis. ' +
+        'https://hoshimarket.xyz/open-packs — ini alamat yang dibuka pembeli setelah membayar.',
+    },
+  )
+  HOSHI_PAYMENT_RETURN_URL?: string;
 
   @IsOptional()
   @IsString()
@@ -544,7 +586,45 @@ export function validateEnv(config: Record<string, unknown>) {
   assertSponsorCapsReadable(config);
   assertDomesticShippingRateSane(config);
   assertMainnetConsistency(config);
+  warnIfPaymentReturnUrlMissing(config);
   return validated;
+}
+
+/**
+ * ALAMAT KEMBALI SETELAH BAYAR — MEMPERINGATKAN saat boot, tidak menolak start.
+ *
+ * `HOSHI_PAYMENT_RETURN_URL` dibaca `requiredConfig` di TIGA jalur penerbitan tagihan, termasuk
+ * satu-satunya rail yang menerbitkan tagihan untuk kartu TITIPAN. `requiredConfig` melempar saat
+ * DIPANGGIL, bukan saat start — jadi var yang terhapus saat menyunting backend.env menghasilkan
+ * boot yang berhasil, log bersih, dan kegagalan yang baru muncul di depan pembeli pertama.
+ *
+ * ┌──── KENAPA INI MEMPERINGATKAN, PADAHAL TETANGGANYA DI ATAS MENOLAK START ─────────────────┐
+ * │ `assertDomesticShippingRateSane` dan interlock mainnet menolak start karena yang mereka   │
+ * │ jaga adalah BATAS BELANJA dan KONSISTENSI JARINGAN: menyala dengan nilai yang salah di    │
+ * │ sana berarti membelanjakan uang dengan batas yang tidak pernah diminta siapa pun.         │
+ * │                                                                                            │
+ * │ Var ini tidak begitu. Kalau ia hilang, yang rusak HANYA penerbitan tagihan. Menolak start │
+ * │ justru menukar kerusakan sempit itu dengan kerusakan total: di droplet, migrasi dan server │
+ * │ dirantai `&&` dalam satu CMD, jadi boot yang gagal berarti api.hoshimarket.xyz MATI —     │
+ * │ marketplace, vault, riwayat, semuanya — bukan cuma checkout-nya.                          │
+ * │                                                                                            │
+ * │ Menukar checkout yang rusak dengan situs yang mati bukan perbaikan.                        │
+ * └────────────────────────────────────────────────────────────────────────────────────────────┘
+ *
+ * Bentuk nilainya tetap DIVALIDASI KERAS di atas (`@IsUrl`): nilai yang ADA tapi cacat ditolak,
+ * karena di situ tidak ada pertukaran apa pun — konfigurasi yang cacat tidak pernah bisa jalan.
+ */
+function warnIfPaymentReturnUrlMissing(config: Record<string, unknown>): void {
+  const raw = config.HOSHI_PAYMENT_RETURN_URL;
+  const ada = typeof raw === 'string' && raw.trim().length > 0;
+  if (ada) return;
+  // console, bukan Logger Nest: validateEnv berjalan SEBELUM aplikasi (dan logger-nya) berdiri.
+  console.error(
+    '[ENV] HOSHI_PAYMENT_RETURN_URL TIDAK TERISI. Backend tetap menyala, tetapi SETIAP ' +
+      'penerbitan tagihan akan gagal — pack, stok Hoshi, dan kartu TITIPAN. Pembeli akan ' +
+      'melihat kegagalan di tombol Beli, bukan di sini. Isi var ini di backend.env, mis. ' +
+      'HOSHI_PAYMENT_RETURN_URL=https://hoshimarket.xyz/open-packs',
+  );
 }
 
 /**
