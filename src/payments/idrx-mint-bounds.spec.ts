@@ -104,12 +104,65 @@ describe('batas harga yang bisa ditagihkan', () => {
     expect(s).toContain(CHARGEABLE_PRICE_MAX_IDRX.toLocaleString('id-ID'));
   });
 
-  /* Angka hari ini, ditulis apa adanya sebagai dokumentasi. Kalau fee atau batas mint berubah,
-     test ini merah DENGAN SENGAJA — supaya perubahan itu disadari dan tulisan di layar admin
-     ikut diperbarui, bukan diam-diam berbeda dari kenyataan. */
+  /* ══════════════════════════════════════════════════════════════════════════════════════════
+     ANGKA HARI INI — DAN TEST INI ADALAH SATU-SATUNYA HAL YANG MENJAGA SALINANNYA DI FRONTEND.
+
+     Formulir intake titipan menampilkan rentang ini kepada operator SEBELUM ia menyepakati harga
+     dengan pemilik kartu, dan ia menahan tombol Simpan dengan ambang yang sama. Tapi nilainya
+     TIDAK terekspos lewat rute mana pun, jadi frontend MENYALINNYA sebagai angka ketikan di:
+
+         c:\GENTA\hoshi-poc-solana\lib\consignment.ts
+         → CHARGEABLE_PRICE_MIN_IDR / CHARGEABLE_PRICE_MAX_IDR
+
+     Salinan angka uang yang bisa berbeda sendiri adalah bagaimana sebuah kartu tayang dengan
+     tombol Beli menyala sementara tagihannya tidak pernah bisa terbit — kelas bug yang sama yang
+     seluruh berkas ini dibangun untuk menutup. Repo frontend TIDAK PUNYA test runner sama sekali,
+     jadi tidak ada apa pun di sana yang bisa berbunyi kalau salinannya basi.
+
+     ⚠️ KALAU TEST INI MERAH karena `QRIS_FEE_BPS` atau batas mint berubah: jangan cuma
+     memperbarui angka di bawah. PERBARUI JUGA BERKAS FRONTEND DI ATAS pada perubahan yang sama.
+     ══════════════════════════════════════════════════════════════════════════════════════════ */
   it('nilainya hari ini: Rp 19.860 – Rp 993.048.659', () => {
     expect(CHARGEABLE_PRICE_MIN_IDRX).toBe(19_860);
     expect(CHARGEABLE_PRICE_MAX_IDRX).toBe(993_048_659);
+  });
+
+  /**
+   * PENJAGA DRIFT YANG BENAR-BENAR BERBUNYI, bukan sekadar komentar di atas.
+   *
+   * Membaca salinan frontend LANGSUNG dari disk dan membandingkannya. Kalau checkout frontend-nya
+   * tidak ada di sebelah (CI yang hanya mengambil backend, misalnya), test ini LEWAT dengan tenang
+   * — ia tidak punya hak menggagalkan build karena sebuah repo lain tidak ada.
+   *
+   * Itu membuatnya tidak berguna di CI, dan memang begitu: yang diincar adalah MESIN ORANG YANG
+   * MENGUBAH FEE-nya. Di situlah kedua repo ada bersebelahan, dan di situlah satu-satunya momen
+   * drift-nya bisa ditangkap sebelum sampai ke produksi.
+   */
+  it('salinan di frontend tidak boleh basi', () => {
+    /* eslint-disable @typescript-eslint/no-require-imports */
+    const fs = require('fs') as typeof import('fs');
+    const path = require('path') as typeof import('path');
+    /* eslint-enable @typescript-eslint/no-require-imports */
+
+    const berkas = path.resolve(
+      __dirname,
+      '../../../hoshi-poc-solana/lib/consignment.ts',
+    );
+    if (!fs.existsSync(berkas)) return; // frontend tidak ada di sebelah — bukan urusan test ini
+
+    const isi = fs.readFileSync(berkas, 'utf8');
+    const angka = (nama: string): number | null => {
+      const m = new RegExp(`${nama}\\s*=\\s*([0-9_]+)`).exec(isi);
+      return m ? Number(m[1].replace(/_/g, '')) : null;
+    };
+
+    const min = angka('CHARGEABLE_PRICE_MIN_IDR');
+    const max = angka('CHARGEABLE_PRICE_MAX_IDR');
+    // Konstantanya hilang/berganti nama = penjaga ini mati diam-diam. Itu harus terlihat.
+    expect({ min, max }).not.toEqual({ min: null, max: null });
+
+    expect(min).toBe(CHARGEABLE_PRICE_MIN_IDRX);
+    expect(max).toBe(CHARGEABLE_PRICE_MAX_IDRX);
   });
 
   /* ── JEBAKAN SATU RUPIAH, DICATAT SUPAYA TIDAK DIULANG ────────────────────────────────────
