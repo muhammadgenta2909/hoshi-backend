@@ -51,6 +51,10 @@ import {
   type DomesticShippingQuote,
 } from '../payments/domestic-shipping-rate';
 import {
+  chargeablePriceRangeSentence,
+  isChargeablePrice,
+} from '../payments/idrx-mint-bounds';
+import {
   CLAIM_CODE_TTL_DAYS,
   claimCodeExpiryFrom,
   formatClaimCode,
@@ -282,6 +286,27 @@ export class ConsignmentService {
     // PERSIS. Sebelumnya cek dan simpan sama-sama memakai dto mentah, jadi '12345' dan '12345 '
     // lolos sebagai dua titipan hidup untuk SATU kartu fisik — index unik parsialnya mencocokkan
     // string apa adanya. Butuh operator salah ketik di dua intake terpisah; murah untuk ditutup.
+    /* ── HARGA YANG TIDAK BISA DITAGIHKAN DITOLAK DI SINI, DI DEPAN PEMILIK KARTU ────────────
+       Batas IDRX berlaku pada nominal yang DITAGIHKAN — yaitu harga + fee QRIS ~0,7%. Tanpa
+       pemeriksaan ini, harga Rp 15.000 (kartu graded murah, sangat mungkin) atau Rp 1,2 miliar
+       (kartu kelas atas; batas DTO-nya sendiri 2 miliar, jadi memang dianggap mungkin) LOLOS
+       intake, LOLOS "Pajang sekarang", tayang ACTIVE dengan tombol Beli yang menyala — dan baru
+       gagal 400 saat ada pembeli sungguhan menekannya.
+
+       Nol Rupiah hilang di situ, dan justru itu yang membuatnya berbahaya: TIDAK ADA SEORANG PUN
+       yang tahu kartunya tidak bisa dibeli. Tidak operator, tidak pemiliknya. Kartu orang
+       "dijual" berminggu-minggu tanpa satu pun peluang laku.
+
+       Ditolak PALING AWAL karena di sinilah angkanya masih bisa dirundingkan: operator sedang
+       duduk di depan pemilik kartu dan struknya belum ditandatangani. Pola yang sama sudah
+       dipakai tarif ongkir admin — lihat kepala berkas payments/idrx-mint-bounds.ts. */
+    if (!isChargeablePrice(dto.askPriceIdr)) {
+      throw new BadRequestException(
+        `Harga Rp ${dto.askPriceIdr.toLocaleString('id-ID')} tidak bisa ditagihkan. ` +
+          chargeablePriceRangeSentence(),
+      );
+    }
+
     const certNumber = dto.certNumber?.trim() || null;
     if (certNumber && dto.grader) {
       const clash = await this.prisma.consignment.findFirst({
@@ -1055,6 +1080,16 @@ export class ConsignmentService {
     });
 
     const price = dto.priceIdrx ?? c.askPriceIdr;
+    /* Pagar KEDUA, dan ia bukan pengulangan: harga di sini boleh datang dari `dto.priceIdrx`
+       (operator menimpa harga kesepakatan saat memajang), dan baris lama yang sudah tersimpan
+       sebelum pagar di `createIntake` ada bisa membawa `askPriceIdr` di luar rentang. Inilah
+       titik terakhir sebelum kartunya tayang dengan tombol Beli yang menyala. */
+    if (!isChargeablePrice(price)) {
+      throw new BadRequestException(
+        `Harga pajang Rp ${price.toLocaleString('id-ID')} tidak bisa ditagihkan, jadi kartunya ` +
+          `akan tayang tanpa pernah bisa dibeli. ${chargeablePriceRangeSentence()}`,
+      );
+    }
     // MEMPERINGATKAN, BUKAN MENOLAK — lihat `belowReserveWarning`. Kalimatnya ikut masuk baris
     // audit, jadi "dipajang di bawah lantai yang disepakati" selalu punya jejak tertulis.
     const reserveWarning = belowReserveWarning(c.reservePriceIdr, price);
@@ -1169,6 +1204,15 @@ export class ConsignmentService {
           'Kartu ini sudah tidak ada di penyimpanan Hoshi — harganya tidak bisa diubah lagi.',
         consignmentId: id,
       });
+    }
+    /* Pagar KETIGA. Menurunkan harga adalah jalan paling mudah untuk tidak sengaja menjatuhkan
+       kartu ke bawah batas tagihan — dan kalau itu terjadi pada kartu yang SUDAH tayang, ia
+       berubah dari bisa dibeli menjadi tidak, tanpa ada yang berubah di layar. */
+    if (!isChargeablePrice(dto.askPriceIdr)) {
+      throw new BadRequestException(
+        `Harga baru Rp ${dto.askPriceIdr.toLocaleString('id-ID')} tidak bisa ditagihkan — ` +
+          `kartunya akan tetap tayang tapi tidak bisa dibeli. ${chargeablePriceRangeSentence()}`,
+      );
     }
     const before = c.askPriceIdr;
     // MEMPERINGATKAN, BUKAN MENOLAK — lihat `belowReserveWarning`. Inilah tempat paling mungkin

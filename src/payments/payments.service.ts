@@ -67,7 +67,12 @@ import {
   resolveDomesticShippingIdr,
   type DomesticShippingQuote,
 } from './domestic-shipping-rate';
-import { IDRX_MAX_MINT_IDR, IDRX_MIN_MINT_IDR } from './idrx-mint-bounds';
+import {
+  BPS_DENOMINATOR,
+  IDRX_MAX_MINT_IDR,
+  IDRX_MIN_MINT_IDR,
+  QRIS_FEE_BPS,
+} from './idrx-mint-bounds';
 import { CreatePackOrderDto } from './dto/create-pack-order.dto';
 import { IdrxClient } from './idrx.client';
 
@@ -77,14 +82,15 @@ const DEFAULT_PACK_TYPE = 'pokemon_50';
 /** USDC base unit: 6 desimal. $50 = 50_000_000. JANGAN pernah dibaca sebagai rupiah. */
 const USDC_UNITS = 1_000_000;
 
-const BPS_DENOMINATOR = 10_000;
+/* `BPS_DENOMINATOR` dan `QRIS_FEE_BPS` PINDAH ke ./idrx-mint-bounds.ts (diimpor di atas).
+   Biaya QRIS IDRX 0,7% dibebankan DI ATAS jumlah yang di-mint, supaya treasury menerima harga
+   penuh; kalau tidak, tiap penjualan diam-diam rugi 0,7%.
 
-/**
- * Biaya QRIS IDRX: 0,7% (untuk nominal ≤ Rp 10 juta), DIBEBANKAN DI ATAS jumlah yang
- * di-mint. Kita masukkan ke harga jual supaya treasury menerima penuh harga pack +
- * margin; kalau tidak, tiap pack diam-diam rugi 0,7%.
- */
-const QRIS_FEE_BPS = 70;
+   KENAPA PINDAH: harga yang DITENTUKAN MANUSIA — tarif ongkir yang di-set admin, dan harga kartu
+   titipan yang disepakati di ruang tamu pemilik kartu — harus diuji terhadap batas tagihan yang
+   SAMA PERSIS dengan yang dipakai di sini. Selama angkanya privat di berkas ini, jalur-jalur itu
+   cuma bisa menyalinnya, dan salinan yang bisa berbeda sendiri adalah bagaimana sebuah kartu
+   tayang dengan tombol Beli yang menyala tapi tagihannya tidak pernah bisa terbit. */
 
 /* Batas nominal mint-request IDRX (IDRX_MIN_MINT_IDR / IDRX_MAX_MINT_IDR) kini hidup di
    ./idrx-mint-bounds.ts — jalur ONGKIR DOMESTIK harus memvalidasi tarif yang di-set ADMIN
