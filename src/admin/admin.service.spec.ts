@@ -1088,3 +1088,279 @@ describe('AdminService.listRedemptions — baris titipan membawa identitas pemil
     expect(row.consignment).toBeNull();
   });
 });
+
+/* ════════════════════════════════════════════════════════════════════════════════════════════════
+   ANTREAN UTANG REFUND — `listTransactions` adalah SATU-SATUNYA sumber layar /admin/transactions.
+
+   Tiga hal yang diuji di sini semuanya berakhir di pertanyaan yang sama: "uang siapa yang kami
+   pegang tanpa mereka menerima apa pun, dan mana yang boleh ditransfer?"
+
+     1. `refundSafe` + `error` BENAR-BENAR TERBAWA. Kalau keduanya tidak pernah meninggalkan
+        backend, layar admin menyajikan setiap utang sebagai "silakan refund" — termasuk yang
+        refundSafe=false, yaitu yang membayarnya berarti membayar DUA KALI.
+     2. Baris TITIPAN ber-type CONSIGNMENT dan BUKAN P2P. Kartu titipan wajib punya `sellerId`,
+        jadi predikat bentuk lama (`sellerId != null ⇒ P2P`) menelan setiap penjualannya.
+     3. Penyaring `status=REFUND_DUE` benar-benar diteruskan ke Prisma (daftar kerjanya sendiri).
+   ══════════════════════════════════════════════════════════════════════════════════════════════ */
+describe('AdminService.listTransactions — antrean utang refund & jenis TITIPAN', () => {
+  const BUYER = {
+    id: 'user-buyer',
+    walletAddress: 'BuyerWalletBase58xxxx',
+    displayName: 'Rina',
+  };
+  const OWNER = {
+    id: 'user-owner',
+    walletAddress: 'OwnerWalletBase58xxxx',
+    displayName: 'Budi Santoso',
+  };
+
+  /** Baris PaymentOrder seperlunya — kolom yang tidak dibaca serializer sengaja tidak dikarang. */
+  const order = (over: Record<string, unknown> = {}) => ({
+    id: 'ord-1',
+    merchantOrderId: 'HOSHI-1',
+    userId: BUYER.id,
+    packType: 'MARKETPLACE',
+    listingId: 'listing-1' as string | null,
+    priceIdr: 1_000_000,
+    status: PaymentStatus.FULFILLED,
+    refundSafe: true,
+    error: null as string | null,
+    createdAt: new Date('2026-09-20T03:00:00Z'),
+    paidAt: new Date('2026-09-20T03:05:00Z'),
+    fulfilledAt: new Date('2026-09-20T03:06:00Z'),
+    ...over,
+  });
+
+  /** Baris Listing seperlunya — bentuknya persis `select` yang dipakai `listTransactions`. */
+  const listing = (over: Record<string, unknown> = {}) => ({
+    id: 'listing-1',
+    name: 'Charizard PSA 10',
+    sellerId: null as string | null,
+    sellerAddress: 'HoshiVault',
+    source: 'HOSHI',
+    consignmentId: null as string | null,
+    sellable: true,
+    ...over,
+  });
+
+  const make = (
+    orders: Record<string, unknown>[],
+    listings: Record<string, unknown>[],
+    users: Record<string, unknown>[] = [BUYER],
+  ) => {
+    const prisma = {
+      paymentOrder: {
+        findMany: jest.fn().mockResolvedValue(orders),
+        count: jest.fn().mockResolvedValue(orders.length),
+      },
+      listing: { findMany: jest.fn().mockResolvedValue(listings) },
+      // Dipanggil DUA KALI (pembeli, lalu penjual). Dijawab dari id yang diminta supaya test
+      // tidak bergantung pada urutan panggilannya.
+      user: {
+        findMany: jest.fn((args: { where: { id: { in: string[] } } }) =>
+          Promise.resolve(
+            users.filter((u) => args.where.id.in.includes(u.id as string)),
+          ),
+        ),
+      },
+    };
+    const service = new AdminService(
+      prisma as unknown as PrismaService,
+      {} as unknown as JwtService,
+      {} as unknown as ConfigService,
+      {} as unknown as MarketplaceService,
+      {} as unknown as EscrowService,
+    );
+    return { service, prisma };
+  };
+
+  /* ───────────────────────── 1. GERBANG UANG + ALASANNYA IKUT TERKIRIM ───────────────────────── */
+
+  it('membawa refundSafe=false APA ADANYA beserta teks `error` yang menjelaskan sebabnya', async () => {
+    const REASON =
+      'UTANG KE PEMBELI — KARTU TITIPAN HILANG SESUDAH TERJUAL. payout sudah masuk ke saldo ' +
+      'pemilik kartu, jadi memulihkan pembeli adalah KERUGIAN HOSHI.';
+    const { service } = make(
+      [
+        order({
+          status: PaymentStatus.REFUND_DUE,
+          refundSafe: false,
+          error: REASON,
+        }),
+      ],
+      [listing({ sellerId: OWNER.id, consignmentId: 'cons-1' })],
+      [BUYER, OWNER],
+    );
+
+    const { data } = await service.listTransactions({});
+
+    expect(data[0].refundSafe).toBe(false);
+    // APA ADANYA: tidak dipotong, tidak diringkas, tidak diganti kalimat generik.
+    expect(data[0].error).toBe(REASON);
+  });
+
+  it('membawa refundSafe=true (utang yang uangnya memang ada pada kami) tanpa mengarang teks error', async () => {
+    const TEXT =
+      'Listing keburu tidak ACTIVE saat settlement. Rupiah pembeli utuh.';
+    const { service } = make(
+      [
+        order({
+          status: PaymentStatus.REFUND_DUE,
+          refundSafe: true,
+          error: TEXT,
+        }),
+      ],
+      [listing({ sellerId: 'user-seller', consignmentId: null })],
+      [BUYER, { ...OWNER, id: 'user-seller' }],
+    );
+
+    const { data } = await service.listTransactions({});
+
+    expect(data[0].refundSafe).toBe(true);
+    expect(data[0].error).toBe(TEXT);
+  });
+
+  it('order yang sehat tetap membawa kedua kolom (refundSafe default true, error null) — bukan undefined', async () => {
+    const { service } = make([order()], [listing()]);
+
+    const { data } = await service.listTransactions({});
+
+    expect(data[0]).toMatchObject({ refundSafe: true, error: null });
+    // `in` — bukan sekadar nilainya: field yang ABSEN dari respons adalah persis cacat yang
+    // membuat gerbangnya tak pernah sampai ke mata operator.
+    expect('refundSafe' in data[0]).toBe(true);
+    expect('error' in data[0]).toBe(true);
+  });
+
+  /* ───────────────────────── 2. TITIPAN ≠ P2P ───────────────────────── */
+
+  it("baris TITIPAN ber-type 'CONSIGNMENT', BUKAN 'P2P' — walaupun sellerId-nya terisi", async () => {
+    const { service } = make(
+      [order({ status: PaymentStatus.REFUND_DUE, refundSafe: false })],
+      // Bentuknya SAMA PERSIS dengan listing P2P kecuali satu kolom: consignmentId.
+      [listing({ sellerId: OWNER.id, consignmentId: 'cons-1' })],
+      [BUYER, OWNER],
+    );
+
+    const { data } = await service.listTransactions({});
+
+    expect(data[0].type).toBe('CONSIGNMENT');
+    expect(data[0].type).not.toBe('P2P');
+  });
+
+  it('baris titipan membawa PEMILIK KARTU sebagai penjual — dialah yang payout-nya sudah cair', async () => {
+    const { service } = make(
+      [order()],
+      [listing({ sellerId: OWNER.id, consignmentId: 'cons-1' })],
+      [BUYER, OWNER],
+    );
+
+    const { data } = await service.listTransactions({});
+
+    expect(data[0].seller).toBe('Budi Santoso');
+    expect(data[0].buyer).toBe('Rina');
+  });
+
+  it("vault baris titipan tetap 'HOSHI' meski source-nya berbunyi COLLECTORCRYPT — kartunya di rak Hoshi", async () => {
+    const { service } = make(
+      [order()],
+      [
+        listing({
+          sellerId: OWNER.id,
+          consignmentId: 'cons-1',
+          // `source` cuma LABEL. Kalau vault diturunkan darinya, layar admin akan menyuruh
+          // operator menunggu paket dari gudang CC di Amerika untuk kartu di rak sebelahnya.
+          source: 'COLLECTORCRYPT',
+        }),
+      ],
+      [BUYER, OWNER],
+    );
+
+    const { data } = await service.listTransactions({});
+
+    expect(data[0].vault).toBe('HOSHI');
+  });
+
+  it('listing USER biasa (consignmentId null) TETAP P2P — perbaikan ini tidak menelan ember sebelahnya', async () => {
+    const { service } = make(
+      [order()],
+      [listing({ sellerId: OWNER.id, consignmentId: null })],
+      [BUYER, OWNER],
+    );
+
+    const { data } = await service.listTransactions({});
+
+    expect(data[0].type).toBe('P2P');
+    expect(data[0].vault).toBe('HOSHI');
+  });
+
+  it('katalog CC (sellerId null, source COLLECTORCRYPT) tetap RESELLER + CC vault', async () => {
+    const { service } = make(
+      [order()],
+      [listing({ sellerId: null, source: 'COLLECTORCRYPT' })],
+    );
+
+    const { data } = await service.listTransactions({});
+
+    expect(data[0].type).toBe('RESELLER');
+    expect(data[0].vault).toBe('CC');
+    expect(data[0].seller).toBe('Hoshi');
+  });
+
+  it('order pack (listingId null) tetap PACK tanpa vault, dan tidak menanyakan listing apa pun', async () => {
+    const { service, prisma } = make(
+      [order({ listingId: null, packType: 'BRONZE' })],
+      [],
+    );
+
+    const { data } = await service.listTransactions({});
+
+    expect(data[0].type).toBe('PACK');
+    expect(data[0].vault).toBeNull();
+    expect(data[0].item).toBe('BRONZE');
+    expect(prisma.listing.findMany).not.toHaveBeenCalled();
+  });
+
+  /* ───────────────────────── 3. PENYARING REFUND_DUE ───────────────────────── */
+
+  it('status=REFUND_DUE diteruskan ke Prisma sebagai predikat — daftar kerjanya, bukan hasil saring klien', async () => {
+    const { service, prisma } = make(
+      [order({ status: PaymentStatus.REFUND_DUE, refundSafe: false })],
+      [listing({ sellerId: OWNER.id, consignmentId: 'cons-1' })],
+      [BUYER, OWNER],
+    );
+
+    const { data, total } = await service.listTransactions({
+      status: 'REFUND_DUE',
+    });
+
+    const findArg = (
+      prisma.paymentOrder.findMany.mock.calls[0] as [
+        { where: Record<string, unknown> },
+      ]
+    )[0];
+    expect(findArg.where).toEqual({ status: PaymentStatus.REFUND_DUE });
+    // `count` WAJIB memakai where yang SAMA — kalau tidak, paginasi antreannya berbohong.
+    const countArg = (
+      prisma.paymentOrder.count.mock.calls[0] as [
+        { where: Record<string, unknown> },
+      ]
+    )[0];
+    expect(countArg.where).toEqual({ status: PaymentStatus.REFUND_DUE });
+    expect(total).toBe(1);
+    expect(data[0].status).toBe(PaymentStatus.REFUND_DUE);
+  });
+
+  it('status sampah tidak menjadi predikat (tak ada where.status) — antrean tidak diam-diam kosong', async () => {
+    const { service, prisma } = make([order()], [listing()]);
+
+    await service.listTransactions({ status: 'BUKAN_STATUS' });
+
+    const findArg = (
+      prisma.paymentOrder.findMany.mock.calls[0] as [
+        { where: Record<string, unknown> },
+      ]
+    )[0];
+    expect(findArg.where).toEqual({});
+  });
+});

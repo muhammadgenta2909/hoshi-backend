@@ -136,7 +136,12 @@ export class AdminController {
   @ApiBearerAuth()
   @UseGuards(AdminGuard)
   @ApiOperation({
-    summary: 'Ledger transaksi (PACK / RESELLER / P2P) dari PaymentOrder',
+    summary:
+      'Ledger transaksi (PACK / RESELLER / CONSIGNMENT / P2P) dari PaymentOrder. ' +
+      '`status=REFUND_DUE` memberi ANTREAN UTANG REFUND: setiap barisnya membawa `refundSafe` ' +
+      '(GERBANG UANG — false berarti JANGAN transfer sebelum diverifikasi di luar sistem) dan ' +
+      'teks `error` apa adanya. Tidak ada rute apa pun yang mengirim uangnya; refund dikerjakan ' +
+      'manusia di luar sistem.',
   })
   transactions(
     @Query('page') page?: string,

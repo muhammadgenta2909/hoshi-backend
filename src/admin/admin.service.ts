@@ -38,6 +38,7 @@ import {
 // SATU definisi "baris listing ini titipan atau bukan?" — lihat `financeSummary`.
 import {
   isConsignedListing,
+  listingKindOf,
   nonConsignedListingWhere,
 } from '../common/listing-kind';
 // Penolakan BER-RUTE untuk aksi listing yang memang tidak berlaku bagi kartu TITIPAN.
@@ -232,6 +233,18 @@ function redemptionActionRequired(
   }
   return out;
 }
+
+/**
+ * Ember ledger `/admin/transactions`. Ini LABEL LAPORAN, bukan gerbang settlement — gerbangnya
+ * tetap `listingKindOf` (src/common/listing-kind.ts), dan label di sini DITURUNKAN darinya.
+ *
+ * CONSIGNMENT berdiri sendiri karena satu-satunya alternatifnya adalah menyembunyikannya di dalam
+ * P2P, dan "P2P" di layar uang berarti "kartunya milik user, uangnya jadi saldo penjual, kalau
+ * gagal kembalikan saja". Untuk kartu titipan yang sudah terjual lalu hilang, ketiga kalimat itu
+ * salah sekaligus: payout-nya SUDAH cair ke pemilik, jadi memulihkan pembeli adalah KERUGIAN
+ * Hoshi — bukan mengembalikan uang yang masih kami pegang.
+ */
+export type AdminTransactionType = 'PACK' | 'RESELLER' | 'CONSIGNMENT' | 'P2P';
 
 export interface AdminStatsResponse {
   totalListings: number;
@@ -1494,10 +1507,34 @@ export class AdminService {
 
   /**
    * Ledger transaksi pembayaran (PaymentOrder) untuk admin — dipisah per jenis:
-   *   • PACK     : order buka-pack gacha (listingId null)
-   *   • RESELLER : beli kartu katalog CC yang dijual Hoshi (listing.sellerId null)
-   *   • P2P      : beli kartu antar user (listing.sellerId ada)
+   *   • PACK        : order buka-pack gacha (listingId null)
+   *   • RESELLER    : kartu yang dijual HOSHI sendiri — katalog CC maupun stok Hoshi (sellerId null)
+   *   • CONSIGNMENT : kartu TITIPAN, milik ORANG LAIN, fisiknya di rak Hoshi
+   *   • P2P         : beli kartu antar user
    * PaymentOrder tak punya relasi Prisma ke Listing (listingId cuma string), jadi kita join manual.
+   *
+   * ╔════════════════════════════════════════════════════════════════════════════════════════════╗
+   * ║ DUA HAL YANG DULU HILANG DI SINI, DAN KEDUANYA SOAL UANG YANG KAMI PEGANG TANPA BARANG.   ║
+   * ╚════════════════════════════════════════════════════════════════════════════════════════════╝
+   *
+   * 1. `refundSafe` + `error` SEKARANG IKUT TERKIRIM. Status `REFUND_DUE` cuma berarti "user sudah
+   *    bayar dan tidak menerima apa pun" — ia TIDAK menjawab "boleh saya transfer sekarang?".
+   *    Yang menjawab itu adalah kolom `refundSafe` (lihat komentarnya di prisma/schema.prisma:
+   *    "GERBANG REFUND. Gerbang refund apa pun WAJIB membaca FIELD ini"), dan yang menjelaskan APA
+   *    yang terjadi adalah teks `error` yang ditulis penulis utangnya. Selama dua kolom itu tidak
+   *    pernah meninggalkan backend, satu-satunya cara operator melihat gerbangnya adalah membaca
+   *    log — jadi layar ini secara efektif menyajikan setiap utang sebagai "silakan refund".
+   *
+   *    Keduanya dikirim APA ADANYA: `error` TIDAK dipotong/diperhalus di sini (teksnya ditulis
+   *    justru supaya dibaca manusia), dan `refundSafe` TIDAK PERNAH diturunkan ulang dari status
+   *    atau dari teks — ia disalin dari baris.
+   *
+   * 2. JENISNYA DIJAWAB `listingKindOf`, BUKAN `sellerId != null`. Kartu titipan WAJIB punya
+   *    `sellerId` (kalau tidak, tidak ada siapa pun yang bisa dikredit saat terjual), jadi predikat
+   *    bentuk lama menelan SETIAP penjualan titipan dan melabelinya "P2P" — persis jebakan yang
+   *    didokumentasikan src/common/listing-kind.ts. Akibatnya di layar ini bukan sekadar label
+   *    salah: utang titipan yang hilang sesudah terjual (refundSafe=false, KERUGIAN Hoshi, bukan
+   *    pengembalian uang yang kami pegang) terbaca sebagai transaksi P2P biasa.
    */
   async listTransactions(query: {
     page?: number;
@@ -1536,6 +1573,11 @@ export class AdminService {
               sellerId: true,
               sellerAddress: true,
               source: true,
+              // Dua kolom ini ADA HANYA untuk memberi makan `listingKindOf`: `consignmentId`
+              // adalah FAKTA yang membedakan titipan dari P2P, dan `sellable` adalah syarat
+              // ketiga `isHoshiSellableStock`. Jangan dihapus "karena tidak dipakai di output".
+              consignmentId: true,
+              sellable: true,
             },
           })
         : Promise.resolve(
@@ -1545,6 +1587,8 @@ export class AdminService {
               sellerId: string | null;
               sellerAddress: string;
               source: ListingSource;
+              consignmentId: string | null;
+              sellable: boolean;
             }[],
           ),
       this.prisma.user.findMany({
@@ -1573,25 +1617,42 @@ export class AdminService {
 
     const data = orders.map((o) => {
       const listing = o.listingId ? listingMap.get(o.listingId) : null;
-      const type: 'PACK' | 'RESELLER' | 'P2P' = !o.listingId
+      // Jenisnya DITANYAKAN ke helper kanonik, bukan ditebak ulang dari bentuk baris. Empat kind
+      // dipetakan ke tiga label ledger: CC_CATALOG/HOSHI_STOCK/NOT_SELLABLE semuanya "dijual
+      // Hoshi sendiri" (tidak ada penjual user yang harus dikredit), jadi mereka satu ember.
+      const kind = listing ? listingKindOf(listing) : null;
+      const type: AdminTransactionType = !o.listingId
         ? 'PACK'
-        : listing && listing.sellerId == null
-          ? 'RESELLER'
-          : 'P2P';
+        : kind === 'CONSIGNMENT'
+          ? 'CONSIGNMENT'
+          : // `kind === null` = baris listing-nya sudah tidak ada. Label warisannya 'P2P' dan itu
+            // TETAP AMAN untuk pertanyaan yang layar ini urus: `deleteListing` MENOLAK baris
+            // ber-consignmentId (lihat penolakannya di bawah), jadi baris yatim TIDAK PERNAH
+            // titipan. Yang hilang cuma bisa listing user atau stok Hoshi.
+            kind === 'USER_P2P' || kind === null
+            ? 'P2P'
+            : 'RESELLER';
       // "Vault" ala model PM: CC vault (kartu CC, harga default, Hoshi 0% margin) vs Hoshi vault
       // (Hoshi ambil 5% / stok Hoshi sendiri). RESELLER katalog CC = CC vault; RESELLER stok Hoshi
       // (source ≠ COLLECTORCRYPT) & P2P antar user = Hoshi vault; PACK/TOPUP bukan kartu vault.
+      //
+      // TITIPAN DISEBUT EKSPLISIT, DAN ITU BUKAN KERAPIAN. Di layar ini `vault` menjawab "SIAPA
+      // yang mengirim barangnya" (dashboard menulisnya sebagai "Kirim oleh: CollectorCrypt (gudang
+      // US)" / "Hoshi"). Kartu titipan SELALU dikirim Hoshi — fisiknya ada di rak Hoshi, itu
+      // definisi custody-nya. Dulu ia kebetulan benar karena jatuh ke cabang P2P; begitu jenisnya
+      // diperbaiki ia akan jatuh ke cabang terakhir dan membaca `source`, yang cuma LABEL dan
+      // BUKAN FAKTA (admin bisa mengubahnya). Satu baris titipan ber-`source=COLLECTORCRYPT` akan
+      // menyuruh operator menunggu paket dari gudang di Amerika untuk kartu yang ada di rak
+      // sebelahnya. Maka jawabannya diambil dari JENISNYA, bukan dari labelnya.
       const vault: 'CC' | 'HOSHI' | null =
         type === 'PACK'
           ? null
-          : type === 'P2P'
+          : type === 'P2P' || type === 'CONSIGNMENT'
             ? 'HOSHI'
             : listing?.source === ListingSource.COLLECTORCRYPT
               ? 'CC'
               : 'HOSHI';
-      const seller = listing?.sellerId
-        ? sellerMap.get(listing.sellerId)
-        : null;
+      const seller = listing?.sellerId ? sellerMap.get(listing.sellerId) : null;
       return {
         id: o.id,
         merchantOrderId: o.merchantOrderId,
@@ -1601,12 +1662,22 @@ export class AdminService {
         priceIdr: o.priceIdr,
         item: listing?.name ?? (type === 'PACK' ? o.packType : null),
         buyer: label(buyerMap.get(o.userId)) ?? o.userId,
+        // Baris titipan IKUT membawa penjualnya: yang tertulis di sana adalah PEMILIK KARTU, dan
+        // pada utang titipan-hilang dialah orang yang payout-nya sudah terlanjur cair.
         seller:
           type === 'RESELLER'
             ? 'Hoshi'
-            : type === 'P2P'
+            : type === 'P2P' || type === 'CONSIGNMENT'
               ? (label(seller) ?? listing?.sellerAddress ?? null)
               : null,
+        /**
+         * GERBANG UANG, disalin apa adanya dari baris. false = JANGAN transfer sebelum
+         * diverifikasi di luar sistem (on-chain / dashboard IDRX). Tidak pernah diturunkan dari
+         * `status` dan tidak pernah dari `error`.
+         */
+        refundSafe: o.refundSafe,
+        /** Teks alasan APA ADANYA — satu-satunya yang menjelaskan APA yang sebenarnya terjadi. */
+        error: o.error,
         createdAt: o.createdAt,
         paidAt: o.paidAt,
         fulfilledAt: o.fulfilledAt,
