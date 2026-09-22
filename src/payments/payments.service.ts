@@ -1397,6 +1397,10 @@ export class PaymentsService {
         city: redemption.city,
         state: redemption.state,
         country: redemption.country,
+        // Kode pos = satu-satunya masukan LAPIS 0 (tarif kurir nyata lewat Biteship). Dioper di
+        // SINI dan di `createDomesticShippingOrder` dengan sumber yang SAMA (`redemption.zip`),
+        // supaya taksiran di layar dan angka yang ditagihkan tidak bisa lahir dari alamat berbeda.
+        zip: redemption.zip,
       },
       env: (k) => this.config.get<string>(k),
     });
@@ -1483,8 +1487,16 @@ export class PaymentsService {
 
     await this.assertOrderQuota(user.id);
 
-    // 1. TARIF. Dari baris admin kalau ada, lalu env, lalu penampung sementara — dan selalu
-    //    divalidasi ke batas mint IDRX (resolveDomesticShippingIdr yang menegakkannya).
+    // 1. TARIF. TARIF KURIR NYATA (Biteship, per kode pos) kalau lapis itu menyala dan menjawab;
+    //    kalau tidak — mati, timeout, belum dikonfigurasi, jawaban cacat — lanjut ke baris admin,
+    //    env, lalu penampung sementara. Selalu divalidasi ke batas mint IDRX
+    //    (resolveDomesticShippingIdr yang menegakkannya).
+    //
+    //    DIPANGGIL TEPAT SEKALI di seluruh penerbitan tagihan ini, dan hasilnya (`priceIdr`) yang
+    //    persis itulah yang masuk ke mint-request DAN ke kolom PaymentOrder.priceIdr di bawah.
+    //    Tidak ada kuotasi ulang di titik mana pun sesudah ini: masuk ulang ke fungsi ini akan
+    //    mengembalikan order PENDING yang sudah ada (lihat `existingPending` di atas), jadi tarif
+    //    yang bergeser di sisi kurir tidak bisa mengubah tagihan yang sudah dipegang pembeli.
     const rate = await resolveDomesticShippingIdr({
       prisma: this.prisma,
       logger: this.logger,
@@ -1492,6 +1504,7 @@ export class PaymentsService {
         city: redemption.city,
         state: redemption.state,
         country: redemption.country,
+        zip: redemption.zip,
       },
       env: (k) => this.config.get<string>(k),
     });
@@ -1597,6 +1610,17 @@ export class PaymentsService {
         `(tarif scope ${rate.scope}, sumber ${rate.source}, wilayah ${rate.region}, ` +
         `provinsi '${rate.province}'). NOL USDC, NOL CC, NOL burn.`,
     );
+    // Tarif yang DINAIKKAN ke lantai mint IDRX dicatat dengan ANGKA MENTAHNYA. Selisihnya bukan
+    // margin yang kita pilih — ia batas gateway — tapi ia tetap Rupiah yang dibayar pembeli di
+    // atas ongkos kurir, dan angka semacam itu tidak boleh cuma hidup di layar yang sudah ditutup.
+    if (rate.raisedToMintFloor && rate.courierPriceIdr != null) {
+      this.logger.warn(
+        `Ongkir domestik ${created.merchantOrderId}: tarif kurir Rp ${rate.courierPriceIdr} ADA ` +
+          `DI BAWAH minimum mint IDRX Rp ${IDRX_MIN_MINT_IDR} → yang ditagihkan Rp ${priceIdr} ` +
+          `(selisih Rp ${priceIdr - rate.courierPriceIdr}). Batasnya milik rail pembayaran, ` +
+          'bukan kurir. Angka yang sama inilah yang ditampilkan ke pembeli.',
+      );
+    }
     // Provinsi yang TIDAK terpetakan ke tier mana pun ditagih tarif PENAMPUNG. Bukan kegagalan —
     // tapi ia harus TERLIHAT, karena artinya ada ejaan provinsi yang belum masuk daftar tier dan
     // pembelinya mungkin ditagih lebih mahal dari seharusnya.

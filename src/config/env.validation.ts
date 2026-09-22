@@ -23,6 +23,10 @@ import {
   IDRX_MAX_MINT_IDR,
   IDRX_MIN_MINT_IDR,
 } from '../payments/idrx-mint-bounds';
+// Idem — src/payments/biteship-rate-env.ts TIDAK mengimpor apa pun, dengan sengaja. Aturan baca
+// konfigurasi tarif kurir yang dipakai saat BOOT wajib aturan yang SAMA dengan yang dipakai saat
+// benar-benar memanggil API-nya, bukan dua salinan yang bisa menyimpang diam-diam.
+import { biteshipConfigProblems } from '../payments/biteship-rate-env';
 
 /**
  * Skema validasi environment. Dipanggil ConfigModule saat boot — kalau ada yang
@@ -393,6 +397,70 @@ class EnvironmentVariables {
   @IsString()
   HOSHI_DOMESTIC_SHIPPING_FLAT_IDR?: string;
 
+  /* ══════════════════════════════════════════════════════════════════════════════════════════
+     TARIF ONGKIR NYATA DARI KURIR (BITESHIP) — LAPIS 0, DI ATAS KELIMA LAPIS DI ATAS.
+
+     Kelimanya di bawah ini OPSIONAL, dan SATU-SATUNYA saklarnya BITESHIP_API_KEY. Kosong = lapis
+     tarif kurir DIAM SEPENUHNYA dan ongkir diresolusi persis seperti sebelum lapis ini ada
+     (baris DB → env flat → tier penampung). Itu keadaan produksi HARI INI: tidak boleh ada satu
+     pun var di blok ini yang, dengan dibiarkan kosong, mengubah perilaku apa pun.
+
+     ┌──── KENAPA BLOK INI MEMPERINGATKAN DAN TIDAK PERNAH MENOLAK START ──────────────────────┐
+     │ `assertDomesticShippingRateSane` di bawah MENOLAK START untuk ongkir env yang cacat, dan │
+     │ itu benar: nilainya adalah NOMINAL YANG DITAGIHKAN, jadi yang salah di sana berarti      │
+     │ menagih pembeli angka yang tidak pernah diputuskan siapa pun.                            │
+     │                                                                                          │
+     │ Var di blok ini tidak begitu. Tidak satu pun dari mereka ADALAH sebuah harga: mereka     │
+     │ menentukan apakah kita BERTANYA ke kurir. Kalau salah satunya cacat, yang terjadi adalah │
+     │ lapis 0 diam dan ongkir kembali ke tarif tier — yaitu PERSIS keadaan produksi hari ini,  │
+     │ yang jelas tidak rusak. Menolak start karenanya berarti menukar "fitur tambahan mati"    │
+     │ dengan api.hoshimarket.xyz MATI SELURUHNYA (di droplet, migrasi dan server dirantai `&&` │
+     │ dalam satu CMD). Itu bukan perbaikan — alasannya sama persis dengan                      │
+     │ `warnIfPaymentReturnUrlMissing`.                                                          │
+     │                                                                                          │
+     │ Gantinya: `warnIfBiteshipConfigIncomplete` MENCETAK KERAS setiap masalahnya saat boot,   │
+     │ dan klien tarifnya melog ulang saat jalan. Diam adalah satu-satunya arah gagal yang      │
+     │ benar-benar berbahaya di sini — seseorang memasang kunci API, mengira tarif nyata sudah  │
+     │ menyala, dan tidak pernah tahu bahwa yang ditagihkan masih angka penampung.              │
+     └──────────────────────────────────────────────────────────────────────────────────────────┘
+
+     Aturan pembacaan semua var ini hidup di src/payments/biteship-rate-env.ts — file TANPA
+     import sama sekali, SENGAJA, supaya aturan yang dipakai saat BOOT adalah aturan yang SAMA
+     dengan yang dipakai saat benar-benar memanggil API-nya.
+     ══════════════════════════════════════════════════════════════════════════════════════════ */
+
+  // Kunci API Biteship ("biteship_live.…" / "biteship_test.…"). RAHASIA: tidak pernah dikirim ke
+  // browser, dan setiap teks yang dilog jalur tarif disaring lebih dulu (redactApiKey).
+  // KOSONG = lapis tarif kurir MATI TOTAL, tanpa satu baris log pun.
+  @IsOptional()
+  @IsString()
+  BITESHIP_API_KEY?: string;
+
+  // Kode pos GUDANG HOSHI (asal kiriman), TEPAT 5 digit, mis. "12440". Wajib diisi kalau
+  // BITESHIP_API_KEY diisi — tanpa asal, tarif tidak bisa dihitung sama sekali.
+  @IsOptional()
+  @IsString()
+  BITESHIP_ORIGIN_POSTAL_CODE?: string;
+
+  // Kode kurir yang benar-benar kita pakai, dipisah koma, mis. "jne,sicepat,jnt". Kosong = bawaan
+  // di kode. SATU kode kurir yang tidak dikenal membuat Biteship menolak SELURUH request.
+  @IsOptional()
+  @IsString()
+  BITESHIP_COURIERS?: string;
+
+  // Berat satu kiriman dalam GRAM, mis. "250" (satu slab + kemasan). Kosong/cacat = bawaan di
+  // kode. String (bukan @IsInt) mengikuti pola HOSHI_PACK_MARGIN_BPS: salah ketik tidak boleh
+  // diam-diam jadi angka — di sini ia dilaporkan lalu bawaan yang dipakai.
+  @IsOptional()
+  @IsString()
+  BITESHIP_WEIGHT_GRAMS?: string;
+
+  // Base URL API Biteship. Kosong = https://api.biteship.com. Ada supaya staging bisa diarahkan
+  // ke mock tanpa kunci sungguhan — sama seperti COLLECTORCRYPT_SHIPPING_BASE_URL.
+  @IsOptional()
+  @IsString()
+  BITESHIP_BASE_URL?: string;
+
   // ── CC Vault Shipping: kirim kartu fisik keluar dari vault CC ─────────────
   // Opsional — "true" MENGAKTIFKAN jalur REAL kirim kartu fisik: user bayar ongkir Rupiah, treasury
   // MENDANAI USDC ongkir ke wallet user, user menandatangani burn+ship CC. Default MATI: redemption
@@ -587,7 +655,36 @@ export function validateEnv(config: Record<string, unknown>) {
   assertDomesticShippingRateSane(config);
   assertMainnetConsistency(config);
   warnIfPaymentReturnUrlMissing(config);
+  warnIfBiteshipConfigIncomplete(config);
   return validated;
+}
+
+/**
+ * TARIF KURIR NYATA (Biteship) — MEMPERINGATKAN saat boot, tidak pernah menolak start.
+ *
+ * Alasan lengkap kenapa blok ini memperingatkan alih-alih menolak ada di atas, di deklarasi
+ * var-nya. Singkatnya: tidak satu pun var di sini ADALAH sebuah harga — mereka menentukan apakah
+ * kita BERTANYA ke kurir — jadi yang cacat cuma mengembalikan ongkir ke tarif tier, yaitu keadaan
+ * produksi hari ini. Menolak start karenanya akan mematikan seluruh api.hoshimarket.xyz demi
+ * sebuah lapis tambahan.
+ *
+ * Yang DITUTUP fungsi ini adalah arah gagal yang sesungguhnya berbahaya: DIAM. Seseorang memasang
+ * BITESHIP_API_KEY di droplet, mengira tarif nyata sudah menyala, dan tidak pernah tahu bahwa
+ * kode pos gudangnya salah ketik sehingga setiap pembeli masih ditagih angka PENAMPUNG.
+ */
+function warnIfBiteshipConfigIncomplete(config: Record<string, unknown>): void {
+  const problems = biteshipConfigProblems((key) => {
+    const raw = config[key];
+    return typeof raw === 'string' ? raw : undefined;
+  });
+  if (problems.length === 0) return;
+  // console, bukan Logger Nest: validateEnv berjalan SEBELUM aplikasi (dan logger-nya) berdiri.
+  console.error(
+    '[ENV] TARIF KURIR NYATA (Biteship) TIDAK AKAN DIPAKAI sepenuhnya — backend tetap menyala ' +
+      'dan ongkir domestik jatuh ke tarif tier/penampung (Rp 25.000 / Rp 50.000), yang BUKAN ' +
+      'tarif kurir sungguhan:\n' +
+      problems.map((p) => `  • ${p}`).join('\n'),
+  );
 }
 
 /**

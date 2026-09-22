@@ -116,9 +116,15 @@ export class RedemptionController {
       'Ongkir kirim DOMESTIK (Rupiah) untuk permintaan kirim stok Hoshi. READ-ONLY: nol uang, ' +
       'nol order, nol efek samping. Sumber angkanya PERSIS sama dengan yang ditagihkan ' +
       'POST /payments/shipping/domestic, jadi yang dilihat user dan yang ditagihkan tidak bisa ' +
-      'lahir dari dua kalkulasi berbeda. Ongkirnya BERTINGKAT PER WILAYAH: respons menyebut ' +
+      'lahir dari dua kalkulasi berbeda. Angkanya datang dari TARIF KURIR NYATA (Biteship, ' +
+      'dihitung dari kode pos) bila lapis itu menyala dan menjawab — `source: "COURIER_API"` — ' +
+      'dan kalau tidak, dari tier per wilayah seperti sebelumnya. Respons menyebut ' +
       '`scope`/`label` tier yang menang, `province` yang dibaca dari alamat, dan ' +
-      '`regionUnresolved` (true = provinsinya tak dikenal → dipakai tarif penampung). Alamat di ' +
+      '`regionUnresolved` (true = provinsinya tak dikenal → dipakai tarif penampung). ' +
+      'UNTUK TARIF KURIR: `priceIdr` adalah SATU-SATUNYA angka yang ditagihkan; kalau tarif ' +
+      'kurirnya di bawah minimum penerbitan tagihan (Rp 20.000) ia sudah DINAIKKAN, dan itu ' +
+      'dinyatakan lewat `raisedToMintFloor: true` + `courierPriceIdr` (tarif mentah kurir, JEJAK ' +
+      'saja). Layar WAJIB menampilkan `priceIdr`, bukan `courierPriceIdr`. Alamat di ' +
       'luar Indonesia ditolak 400 (ADDRESS_UNSUPPORTED) — DI SINI, sebelum user menekan bayar. ' +
       'Baris jalur CollectorCrypt ditolak 400 (WRONG_RAIL).',
   })

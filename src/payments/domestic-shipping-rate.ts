@@ -5,6 +5,7 @@ import {
   domesticError,
 } from '../common/hoshi-domestic-shipping';
 import { IDRX_MAX_MINT_IDR, IDRX_MIN_MINT_IDR } from './idrx-mint-bounds';
+import { fetchBiteshipRateIdr } from './biteship-rate.client';
 
 /**
  * ╔══════════════════════════════════════════════════════════════════════════════════════════════╗
@@ -30,6 +31,7 @@ import { IDRX_MAX_MINT_IDR, IDRX_MIN_MINT_IDR } from './idrx-mint-bounds';
  * BUKAN supaya ia jadi harga yang dipakai selamanya.
  *
  * ┌──────────────────── LAPIS RESOLUSI, dari yang paling spesifik ─────────────────────────────┐
+ * │ 0. TARIF KURIR NYATA (Biteship, per KODE POS)    → lihat blok LAPIS 0 di bawah              │
  * │ 1. baris DB AKTIF ber-scope `STATE:<provinsi>`   → harga khusus satu provinsi               │
  * │ 2. baris DB AKTIF yang `provinces`-nya memuat provinsi tujuan → TIER wilayah                │
  * │ 3. baris DB AKTIF ber-`fallback=true`            → tier penampung (provinsi tak dikenal)    │
@@ -37,6 +39,29 @@ import { IDRX_MAX_MINT_IDR, IDRX_MIN_MINT_IDR } from './idrx-mint-bounds';
  * │ 5. env HOSHI_DOMESTIC_SHIPPING_FLAT_IDR          → flat nasional yang diputuskan operator   │
  * │ 6. DOMESTIC_DEFAULT_TIERS (penampung di kode)    → Jawa / luar Jawa                         │
  * │ 7. DOMESTIC_SHIPPING_FLAT_IDR_PLACEHOLDER        → jaring terakhir                          │
+ * └────────────────────────────────────────────────────────────────────────────────────────────┘
+ *
+ * ┌──────────────────── LAPIS 0: TARIF KURIR NYATA — APA YANG BERUBAH, DAN APA YANG TIDAK ─────┐
+ * │ Pemilik produk memilih memakai API ongkir sungguhan, karena tabel `domestic_shipping_rates` │
+ * │ KOSONG di produksi dan yang benar-benar dipakai selama ini adalah tier PENAMPUNG di kode —  │
+ * │ dua angka (Rp 25.000 / Rp 50.000) yang tidak pernah diputuskan siapa pun.                    │
+ * │                                                                                              │
+ * │ Lapis 0 TIDAK MENGGANTIKAN APA PUN. Ia satu-satunya lapis yang boleh menjawab "tidak tahu":  │
+ * │ belum dikonfigurasi, API mati, timeout, kunci salah, kuota habis, respons cacat, atau angka  │
+ * │ mustahil → resolusi lanjut ke lapis 1 dan seterusnya PERSIS seperti sebelum ia ada. TANPA    │
+ * │ BITESHIP_API_KEY ia DIAM SEPENUHNYA — nol log, nol perubahan perilaku. Itu keadaan produksi  │
+ * │ hari ini, dan ia tidak boleh rusak.                                                          │
+ * │                                                                                              │
+ * │ SATU-SATUNYA masukan barunya: KODE POS tujuan (`dest.zip`, dari `CardRedemption.zip`). Tidak │
+ * │ ada tabel pemetaan kota, tidak ada kolom baru, tidak ada migrasi. Provinsi tetap dibaca      │
+ * │ seperti biasa dan tetap dilaporkan di hasilnya, supaya jejaknya tetap bisa dibandingkan      │
+ * │ dengan tarif tier yang akan dipakai kalau lapis 0 diam.                                      │
+ * │                                                                                              │
+ * │ LANTAI Rp 20.000 (minimum mint IDRX) TIDAK berlaku sebagai PENOLAKAN untuk lapis ini: tarif  │
+ * │ kurir Rp 12.000 bukan salah ketik, itu harga yang benar, dan yang tidak sanggup menagihnya   │
+ * │ adalah rail pembayaran kita. Ia DINAIKKAN, bukan dibuang — alasan lengkapnya ada di          │
+ * │ `applyMintFloor` (biteship-rate.client.ts). Lapis 1–7 TIDAK berubah: di sana angka di bawah  │
+ * │ lantai tetap DITOLAK, karena di sana angkanya DIKETIK MANUSIA.                                │
  * └────────────────────────────────────────────────────────────────────────────────────────────┘
  *
  * NOL DANA TREASURY di seluruh file ini: ia hanya MENGHITUNG nominal Rupiah yang akan ditagihkan
@@ -249,10 +274,21 @@ export const DOMESTIC_SHIPPING_FLAT_IDR_ENV =
 /* ═══════════════════════════ BENTUK HASIL ═══════════════════════════ */
 
 /** Dari mana angka yang dipakai berasal — dikembalikan supaya admin/log bisa membuktikannya. */
-export type DomesticRateSource = 'DB' | 'ENV' | 'DEFAULT_TIER' | 'PLACEHOLDER';
+/** `COURIER_API` = LAPIS 0, tarif NYATA dari kurir (Biteship) yang dihitung dari kode pos. */
+export type DomesticRateSource =
+  | 'COURIER_API'
+  | 'DB'
+  | 'ENV'
+  | 'DEFAULT_TIER'
+  | 'PLACEHOLDER';
 
 /** BAGAIMANA wilayah tujuan dipetakan ke tier — dikembalikan supaya bisa diaudit. */
 export type DomesticRegionMatch =
+  /**
+   * Tujuan dihitung KURIR dari KODE POS — lebih halus daripada tier mana pun, dan karena itu
+   * `regionUnresolved` selalu false di sini: tidak ada tier yang perlu "dikenali" sama sekali.
+   */
+  | 'COURIER_API'
   /** Baris `STATE:<provinsi>` — harga khusus satu provinsi. */
   | 'STATE'
   /** `provinces` sebuah tier memuat provinsi tujuan. */
@@ -262,8 +298,15 @@ export type DomesticRegionMatch =
   /** Tidak ada tier sama sekali → flat nasional / env / jaring terakhir. */
   | 'NATIONWIDE';
 
+/** Scope untuk tarif yang datang dari API kurir — sengaja BUKAN scope yang bisa ditulis admin. */
+export const DOMESTIC_RATE_SCOPE_COURIER_API = 'COURIER:BITESHIP';
+
 export interface DomesticShippingQuote {
-  /** Ongkir Rupiah UTUH yang akan ditagihkan. */
+  /**
+   * Ongkir Rupiah UTUH yang akan ditagihkan. SATU-SATUNYA angka yang boleh ditampilkan ke pembeli
+   * DAN satu-satunya yang boleh masuk mint-request IDRX — termasuk ketika ia sudah DINAIKKAN ke
+   * lantai mint (lihat `courierPriceIdr` di bawah).
+   */
   priceIdr: number;
   /** Scope baris/tier yang menang. */
   scope: string;
@@ -279,6 +322,16 @@ export interface DomesticShippingQuote {
    * berarti "ada provinsi yang belum masuk daftar tier mana pun".
    */
   regionUnresolved: boolean;
+  /**
+   * LAPIS 0 saja: tarif MENTAH dari kurir sebelum lantai rail pembayaran. `null` di lapis lain.
+   *
+   * Ia ada supaya layar bisa MENGAKU: "tarif kurirnya Rp 12.000, yang ditagihkan Rp 20.000 karena
+   * itu minimum penerbitan tagihan". Ia JEJAK, bukan harga — tidak ada satu pun jalur penagihan
+   * yang membacanya, dan tidak boleh ada.
+   */
+  courierPriceIdr: number | null;
+  /** true = `priceIdr` sudah dinaikkan dari `courierPriceIdr` ke minimum mint IDRX. */
+  raisedToMintFloor: boolean;
 }
 
 /** Alamat tujuan seperlunya. */
@@ -286,6 +339,12 @@ export interface DomesticDestination {
   city: string;
   state: string | null;
   country: string;
+  /**
+   * KODE POS tujuan (`CardRedemption.zip` / alamat pengembalian titipan). Opsional DENGAN SENGAJA:
+   * ia HANYA dipakai lapis 0, dan pemanggil yang tidak mengopernya cukup kehilangan tarif kurir
+   * nyata — bukan kehilangan ongkir. Kode pos yang bukan 5 digit diperlakukan sama dengan kosong.
+   */
+  zip?: string | null;
 }
 
 /* ═══════════════════════════ VALIDASI NOMINAL ═══════════════════════════ */
@@ -446,6 +505,26 @@ export function pickTier(
  * │   ditagih kurang — dan `regionUnresolved: true` membuatnya TERLIHAT, bukan senyap.          │
  * │ • angka TIDAK MASUK AKAL di lapis mana pun → DITOLAK (fail-closed). Lebih baik user melihat │
  * │   "ongkir belum bisa dihitung" daripada dikirimi tagihan Rp 1 yang ditolak gateway.         │
+ * │ • LAPIS 0 (API kurir) gagal/diam/menjawab aneh  → DILEWATI, bukan ditolak. Ia satu-satunya  │
+ * │   lapis yang boleh menjawab "tidak tahu", karena di belakangnya masih ada tujuh lapis yang  │
+ * │   SELALU menghasilkan angka. Mematikan pembayaran gara-gara API pihak ketiga yang sedang    │
+ * │   mati adalah menukar "tarif kurang presisi" dengan "pembeli terjebak" — bukan perbaikan.   │
+ * └────────────────────────────────────────────────────────────────────────────────────────────┘
+ *
+ * ┌──── YANG DIQUOTE = YANG DITAGIH, DAN BAGAIMANA ITU DIJAGA ─────────────────────────────────┐
+ * │ Fungsi ini TIDAK menyimpan apa pun. Yang membekukan angkanya adalah pola yang SUDAH ada di  │
+ * │ `createDomesticShippingOrder`: ia me-resolve SEKALI, menuliskannya ke `PaymentOrder.priceIdr`│
+ * │ dan ke mint-request IDRX dalam satu jalur, lalu setiap masuk ulang MENGEMBALIKAN order       │
+ * │ PENDING yang sama alih-alih menghitung lagi. Sesudah tagihan terbit, tidak ada satu pun      │
+ * │ jalur yang bertanya lagi ke kurir — jadi tarif yang berubah di Biteship tidak bisa mengubah  │
+ * │ tagihan yang sudah dipegang pembeli. Lapis 0 sengaja TIDAK menambah panggilan kedua di       │
+ * │ jalur penagihan.                                                                             │
+ * │                                                                                              │
+ * │ Yang TERSISA, dan ini jujur disebut: `quoteDomesticShipping` (taksiran READ-ONLY di layar)   │
+ * │ dan penerbitan tagihan adalah dua panggilan terpisah, jadi tarif kurir BISA bergeser di      │
+ * │ antara "pembeli melihat angka" dan "pembeli menekan bayar". Untuk lapis 1–7 selisih itu      │
+ * │ mustahil (angkanya deterministik). Membekukannya untuk lapis 0 butuh menyimpan kuotasi —     │
+ * │ kolom baru + migrasi — dan itu SENGAJA tidak dikerjakan di sini.                             │
  * └────────────────────────────────────────────────────────────────────────────────────────────┘
  */
 export async function resolveDomesticShippingIdr(args: {
@@ -463,8 +542,48 @@ export async function resolveDomesticShippingIdr(args: {
   // Provinsi dulu; kalau kosong, COBA KOTA sebagai nama provinsi. Banyak alamat Indonesia ditulis
   // dengan kota saja ("Jakarta"), dan kota itu memang nama provinsinya. Cuma DICOBA, tidak
   // diklaim: kalau kotanya tidak dikenal juga, hasilnya tetap tier penampung.
+  //
+  // Dihitung SEBELUM lapis 0 dengan sengaja: ia ikut dilaporkan walau yang menang tarif kurir,
+  // supaya jejak tiap kuotasi tetap menyebut wilayah yang AKAN dipakai kalau lapis 0 diam.
   const province =
     normalizeRegionKey(dest.state) || normalizeRegionKey(dest.city);
+
+  // ══ LAPIS 0 — TARIF KURIR NYATA (Biteship). Lihat blok LAPIS 0 di kepala file. ══════════════
+  // `fetchBiteshipRateIdr` TIDAK PERNAH MELEMPAR: itu kontraknya, dan ia sendiri sudah dibungkus
+  // jaring terakhir di dalamnya. Yang di bawah ini SABUK KEDUA — murah, dan menutup kemungkinan
+  // kontrak itu dilanggar suatu hari oleh perubahan di file sana. Sebuah tarif ongkir yang gagal
+  // TIDAK BOLEH menjelma kegagalan pembayaran.
+  let courier: Awaited<ReturnType<typeof fetchBiteshipRateIdr>> = null;
+  try {
+    courier = await fetchBiteshipRateIdr({
+      logger,
+      env: (k) => env?.(k),
+      destinationZip: dest.zip,
+    });
+  } catch (err) {
+    logger.error(
+      `Lapis tarif kurir MELEMPAR, padahal kontraknya tidak boleh ` +
+        `(${err instanceof Error ? err.message : String(err)}). Ongkir jatuh ke tarif tier — ` +
+        'pembayaran TIDAK diblokir.',
+    );
+  }
+  if (courier) {
+    return {
+      // Angka yang SUDAH dinaikkan ke lantai mint bila perlu. Tidak ada angka kedua yang bisa
+      // dipakai menagih: yang mentah hidup di `courierPriceIdr` dan tidak dibaca penagih mana pun.
+      priceIdr: courier.priceIdr,
+      scope: DOMESTIC_RATE_SCOPE_COURIER_API,
+      source: 'COURIER_API',
+      label: courier.label,
+      province,
+      region: 'COURIER_API',
+      // Kurir menghitung dari KODE POS — tujuannya terselesaikan lebih halus daripada tier mana
+      // pun, jadi tidak ada wilayah yang "belum dikenali" untuk dilaporkan ke operator.
+      regionUnresolved: false,
+      courierPriceIdr: courier.courierPriceIdr,
+      raisedToMintFloor: courier.raisedToMintFloor,
+    };
+  }
 
   // Tabel ini berisi SEGELINTIR baris (satu per tier), jadi seluruh baris aktif ditarik lalu
   // dipilih di sini. Itu juga yang membuat aturan pencocokan hidup di SATU fungsi (pickTier)
@@ -500,6 +619,11 @@ export async function resolveDomesticShippingIdr(args: {
       region: fromDb.region,
       regionUnresolved:
         fromDb.region === 'FALLBACK_TIER' || fromDb.region === 'NATIONWIDE',
+      // Lapis 1–7 adalah angka yang DIKETIK MANUSIA, bukan tarif kurir: tidak ada tarif mentah
+      // untuk dijejaki, dan tidak pernah ada kenaikan ke lantai — `assertSaneRate` sudah MENOLAK
+      // apa pun di bawah lantai sebelum sampai ke sini, dan itu tetap sikap yang benar di sana.
+      courierPriceIdr: null,
+      raisedToMintFloor: false,
     };
   }
 
@@ -517,6 +641,8 @@ export async function resolveDomesticShippingIdr(args: {
       province,
       region: 'NATIONWIDE',
       regionUnresolved: true,
+      courierPriceIdr: null,
+      raisedToMintFloor: false,
     };
   }
 
@@ -539,6 +665,8 @@ export async function resolveDomesticShippingIdr(args: {
       province,
       region: fromSeed.region,
       regionUnresolved: fromSeed.region === 'FALLBACK_TIER',
+      courierPriceIdr: null,
+      raisedToMintFloor: false,
     };
   }
 
@@ -552,5 +680,7 @@ export async function resolveDomesticShippingIdr(args: {
     province,
     region: 'NATIONWIDE',
     regionUnresolved: true,
+    courierPriceIdr: null,
+    raisedToMintFloor: false,
   };
 }

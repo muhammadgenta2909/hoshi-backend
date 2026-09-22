@@ -1557,7 +1557,15 @@ export class ConsignmentService {
           quote = await resolveDomesticShippingIdr({
             prisma: this.prisma,
             logger: this.logger,
-            dest: { city: a.city.trim(), state: a.state.trim(), country },
+            dest: {
+              city: a.city.trim(),
+              state: a.state.trim(),
+              country,
+              // Kode pos → LAPIS 0 (tarif kurir nyata). Sama sekali tidak mengubah sikap blok
+              // ini: lapis itu pun tidak pernah melempar, dan taksiran yang gagal tetap cuma
+              // membiarkan `returnShippingFeeIdr` kosong untuk diisi operator dari struk kurir.
+              zip: a.zip.trim(),
+            },
             env: (k) => this.config.get<string>(k),
           });
           data.returnShippingFeeIdr = quote.priceIdr;

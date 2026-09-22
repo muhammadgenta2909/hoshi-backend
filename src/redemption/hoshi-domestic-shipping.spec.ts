@@ -343,13 +343,19 @@ const IDRX_FAKE = {
  * `ccEnabled: true` HANYA untuk test yang sengaja menempuh rute CC (untuk membuktikan rute itu
  * MENOLAK baris domestik): di sana gerbang CC memang harus lolos supaya yang teruji adalah
  * gerbang RAIL-nya, bukan gerbang fiturnya.
+ *
+ * `idrx`/`config` HANYA untuk test yang perlu MELIHAT nominal yang benar-benar dikirim ke penerbit
+ * tagihan (blok 10c: yang diquote = yang ditagih). Keduanya default ke fake di atas.
  */
-const payments = (world: World, opts: { ccEnabled?: boolean } = {}) =>
+const payments = (
+  world: World,
+  opts: { ccEnabled?: boolean; idrx?: any; config?: any } = {},
+) =>
   new PaymentsService(
     fakePrisma(world),
-    IDRX_FAKE,
+    opts.idrx ?? IDRX_FAKE,
     {} as any,
-    CONFIG,
+    opts.config ?? CONFIG,
     {} as any,
     {} as any,
     {} as any,
@@ -1948,6 +1954,194 @@ describe('tier ongkir per-wilayah', () => {
     const after = await admin(world).listDomesticShippingRates();
     expect(after.effective.some((t) => t.placeholder)).toBe(false);
     expect(after.actionRequired).toEqual([]);
+  });
+});
+
+/* ══════════════════════ 10c. TARIF KURIR NYATA (LAPIS 0) DI JALUR PENAGIHAN ══════════════════
+
+   Kontrak lapis 0 sendiri diuji lengkap di src/payments/biteship-domestic-rate.spec.ts. Yang
+   dijaga DI SINI adalah hal yang hanya bisa dibuktikan dari ujung ke ujung, lewat PaymentsService
+   yang sesungguhnya:
+
+     • ANGKA YANG DIQUOTE = ANGKA YANG DITAGIH. Taksiran di layar (`quoteDomesticShipping`) dan
+       nominal yang benar-benar masuk mint-request IDRX harus angka yang SAMA — terutama pada
+       kasus yang paling mudah salah: tarif kurir DI BAWAH minimum mint, yang DINAIKKAN. Menampilkan
+       Rp 12.000 lalu menagih Rp 20.000 adalah kegagalan yang tidak akan ketahuan dari unit test
+       resolver mana pun, karena di sana kedua angka memang ada dua-duanya.
+     • DAN ia harus DIKUOTASI SEKALI: sesudah tagihan terbit, masuk ulang TIDAK boleh bertanya lagi
+       ke kurir, supaya tarif yang bergeser di sisi mereka tidak bisa mengubah tagihan yang sudah
+       dipegang pembeli. */
+
+describe('tarif kurir NYATA di jalur penagihan (lapis 0, ujung ke ujung)', () => {
+  const BITESHIP_ENV: Record<string, string> = {
+    BITESHIP_API_KEY: 'biteship_test.kunci-harness',
+    BITESHIP_ORIGIN_POSTAL_CODE: '12440',
+  };
+  /** CONFIG harness + env Biteship, supaya lapis 0 benar-benar menyala di test ini. */
+  const CONFIG_BITESHIP = {
+    get: (k: string) => BITESHIP_ENV[k] ?? (CONFIG.get(k) as string | undefined),
+  } as any;
+
+  /**
+   * Jawaban Biteship dengan satu opsi kurir berharga `price`.
+   *
+   * Response BARU tiap panggilan, bukan satu objek yang dipakai ulang: body sebuah Response hanya
+   * bisa dibaca SEKALI, jadi stub `mockResolvedValue(response)` akan membuat panggilan KEDUA
+   * seolah-olah jawabannya kosong — dan test yang memang menguji dua panggilan berturut-turut
+   * (quote lalu tagih) akan gagal karena harness-nya, bukan karena kodenya.
+   */
+  const biteshipAnswers = (price: number) =>
+    jest.fn().mockImplementation(() =>
+      Promise.resolve(
+        new Response(
+          JSON.stringify({
+            success: true,
+            pricing: [
+              {
+                courier_code: 'jne',
+                courier_name: 'JNE',
+                courier_service_code: 'reg',
+                courier_service_name: 'REG',
+                price,
+              },
+            ],
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        ),
+      ),
+    );
+
+  const idrxSpy = () => ({
+    mintRequest: jest.fn().mockResolvedValue({
+      data: {
+        merchantOrderId: MERCHANT_ORDER_ID,
+        id: 99,
+        reference: 'ref-1',
+        paymentUrl: 'https://idrx.test/pay/1',
+      },
+    }),
+  });
+
+  afterEach(() => {
+    delete (globalThis as any).fetch;
+  });
+
+  it('tarif kurir Rp 32.000 dipakai apa adanya: yang diquote = yang ditagih = yang tersimpan', async () => {
+    (globalThis as any).fetch = biteshipAnswers(32_000);
+    const world = baseWorld({
+      redemption: domesticRow(RedemptionStatus.REQUESTED),
+    });
+    const idrx = idrxSpy();
+    const svc = payments(world, { idrx, config: CONFIG_BITESHIP });
+
+    const quote = await svc.quoteDomesticShipping(RED_ID, USER);
+    expect(quote).toMatchObject({
+      priceIdr: 32_000,
+      source: 'COURIER_API',
+      raisedToMintFloor: false,
+    });
+
+    await svc.createDomesticShippingOrder(RED_ID, USER);
+    expect(idrx.mintRequest).toHaveBeenCalledWith(
+      expect.objectContaining({ toBeMinted: String(quote.priceIdr) }),
+    );
+    expect(world.order).toMatchObject({ priceIdr: quote.priceIdr, priceUsdc: 0 });
+  });
+
+  /**
+   * INI KASUS YANG PALING MUDAH TERLEWAT, dan sekaligus yang PALING SERING di produksi:
+   * Jabodetabek/intra-kota. Tarif kurirnya Rp 12.000, minimum mint IDRX Rp 20.000.
+   */
+  it('tarif DI BAWAH minimum mint: yang DINAIKKAN itulah yang ditampilkan DAN yang ditagihkan', async () => {
+    (globalThis as any).fetch = biteshipAnswers(12_000);
+    const world = baseWorld({
+      redemption: domesticRow(RedemptionStatus.REQUESTED),
+    });
+    const idrx = idrxSpy();
+    const svc = payments(world, { idrx, config: CONFIG_BITESHIP });
+
+    const quote = await svc.quoteDomesticShipping(RED_ID, USER);
+    expect(quote.priceIdr).toBe(IDRX_MIN_MINT_IDR);
+    expect(quote.courierPriceIdr).toBe(12_000);
+    expect(quote.raisedToMintFloor).toBe(true);
+
+    const dto = await svc.createDomesticShippingOrder(RED_ID, USER);
+
+    // Yang masuk ke gateway = yang dilihat pembeli. Kalau baris ini pernah merah, artinya ada
+    // layar yang menjanjikan Rp 12.000 sementara kartu kreditnya ditagih Rp 20.000.
+    expect(idrx.mintRequest).toHaveBeenCalledWith(
+      expect.objectContaining({ toBeMinted: String(IDRX_MIN_MINT_IDR) }),
+    );
+    expect(world.order!.priceIdr).toBe(IDRX_MIN_MINT_IDR);
+    expect(dto.priceIdr).toBe(quote.priceIdr);
+    // Dan tagihannya BENAR-BENAR TERBIT — inilah yang gagal kalau Rp 12.000 ditolak mentah-mentah
+    // sebagai "tidak masuk akal" seperti tarif yang diketik admin.
+    expect(dto.merchantOrderId).toBe(MERCHANT_ORDER_ID);
+    expect(world.redemption!.status).toBe(RedemptionStatus.AWAITING_PAYMENT);
+  });
+
+  it('sesudah tagihan terbit, masuk ulang TIDAK bertanya lagi ke kurir', async () => {
+    const fetchSpy = biteshipAnswers(32_000);
+    (globalThis as any).fetch = fetchSpy;
+    const world = baseWorld({
+      redemption: domesticRow(RedemptionStatus.AWAITING_PAYMENT, {
+        paymentOrderId: ORDER_ROW_ID,
+      }),
+      order: shippingOrder(PaymentStatus.PENDING),
+    });
+    const idrx = idrxSpy();
+
+    const dto = await payments(world, {
+      idrx,
+      config: CONFIG_BITESHIP,
+    }).createDomesticShippingOrder(RED_ID, USER);
+
+    // Order PENDING yang masih hidup dikembalikan apa adanya: nol panggilan kurir, nol mint baru,
+    // jadi tarif yang bergeser di sisi Biteship tidak bisa mengubah tagihan yang sudah dipegang.
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(idrx.mintRequest).not.toHaveBeenCalled();
+    expect(dto.priceIdr).toBe(DOMESTIC_SHIPPING_FLAT_IDR_PLACEHOLDER);
+  });
+
+  it('API kurir MATI → tagihan tetap terbit dengan tarif tier, nol lemparan ke pembeli', async () => {
+    (globalThis as any).fetch = jest
+      .fn()
+      .mockRejectedValue(new Error('ECONNREFUSED'));
+    const world = baseWorld({
+      redemption: domesticRow(RedemptionStatus.REQUESTED),
+    });
+    const idrx = idrxSpy();
+
+    const dto = await payments(world, {
+      idrx,
+      config: CONFIG_BITESHIP,
+    }).createDomesticShippingOrder(RED_ID, USER);
+
+    expect(dto.merchantOrderId).toBe(MERCHANT_ORDER_ID);
+    expect(world.order).toMatchObject({
+      priceIdr: DOMESTIC_SHIPPING_FLAT_IDR_PLACEHOLDER,
+    });
+  });
+
+  it('tanpa BITESHIP_API_KEY (keadaan produksi hari ini) jalur bayar tidak berubah sama sekali', async () => {
+    const fetchSpy = biteshipAnswers(12_000);
+    (globalThis as any).fetch = fetchSpy;
+    const world = baseWorld({
+      redemption: domesticRow(RedemptionStatus.REQUESTED),
+    });
+    const idrx = idrxSpy();
+
+    // CONFIG harness biasa: tidak mengenal satu pun var Biteship.
+    const dto = await payments(world, { idrx }).createDomesticShippingOrder(
+      RED_ID,
+      USER,
+    );
+
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(dto.merchantOrderId).toBe(MERCHANT_ORDER_ID);
+    expect(world.order).toMatchObject({
+      priceIdr: DOMESTIC_SHIPPING_FLAT_IDR_PLACEHOLDER,
+    });
   });
 });
 
