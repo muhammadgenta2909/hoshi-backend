@@ -36,7 +36,12 @@ import {
   unescrowedUserListingWhere,
 } from '../marketplace/p2p.gate';
 // SATU definisi "baris listing ini titipan atau bukan?" — lihat `financeSummary`.
-import { nonConsignedListingWhere } from '../common/listing-kind';
+import {
+  isConsignedListing,
+  nonConsignedListingWhere,
+} from '../common/listing-kind';
+// Penolakan BER-RUTE untuk aksi listing yang memang tidak berlaku bagi kartu TITIPAN.
+import { consignmentUnsupported } from '../common/consignment.gate';
 import { PrismaService } from '../prisma/prisma.service';
 import {
   recordShippingRefundDebts,
@@ -644,6 +649,11 @@ export class AdminService {
       take: 200,
     });
     const ongkirById = await this.summarizeOngkir(rows.map((r) => r.id));
+    // KARTU SIAPA yang dipegang operator. `source='CONSIGNMENT'` sudah mengatakan "ini barang
+    // orang lain", tapi tidak menyebut SIAPA — dan operator yang harus mengambil satu slab dari
+    // rak butuh nama pemiliknya, bukan sekadar kategori. SATU query untuk seluruh halaman.
+    const consignmentByListing =
+      await this.consignmentRefsForListings(rows.map((r) => r.listingId));
 
     return rows.map((r) => {
       const domestic = isDomesticRedemption(r);
@@ -672,6 +682,12 @@ export class AdminService {
         ...r,
         rail,
         ongkir,
+        /**
+         * Titipan yang kartunya sedang dikirim ini — null kalau baris ini BUKAN titipan.
+         * LABEL, bukan gerbang (sama seperti `source`): railnya tetap dibaca dari `listingId`.
+         */
+        consignment:
+          (r.listingId ? consignmentByListing.get(r.listingId) : null) ?? null,
         /** Tombol yang boleh dirender. Sudah dikurangi pagar ongkir — bukan tabel mentah. */
         allowedNextStatuses,
         /**
@@ -683,6 +699,54 @@ export class AdminService {
         actionRequired: redemptionActionRequired(r.status, rail, ongkir),
       };
     });
+  }
+
+  /**
+   * "Kartu ini titipan siapa?" untuk BANYAK baris redemption sekaligus (satu query, bukan N+1).
+   *
+   * Dibaca dari `Listing.consignment`, yaitu FAKTA yang sama dengan yang dipakai `listingKindOf`
+   * — BUKAN dari `CardRedemption.source`, yang memang cuma label dan pada baris warisan bisa
+   * berbunyi 'HOSHI' untuk kartu titipan. Map kosong = tidak ada satu pun baris titipan.
+   */
+  private async consignmentRefsForListings(
+    listingIds: (string | null)[],
+  ): Promise<
+    Map<
+      string,
+      { id: string; status: string; consignorName: string; askPriceIdr: number }
+    >
+  > {
+    const out = new Map<
+      string,
+      { id: string; status: string; consignorName: string; askPriceIdr: number }
+    >();
+    const ids = [...new Set(listingIds.filter((v): v is string => !!v))];
+    if (ids.length === 0) return out;
+    const rows = await this.prisma.listing.findMany({
+      where: { id: { in: ids }, consignmentId: { not: null } },
+      select: {
+        id: true,
+        consignment: {
+          select: {
+            id: true,
+            status: true,
+            consignorNameAtIntake: true,
+            askPriceIdr: true,
+          },
+        },
+      },
+    });
+    for (const row of rows) {
+      if (!row.consignment) continue;
+      out.set(row.id, {
+        id: row.consignment.id,
+        status: row.consignment.status,
+        // SNAPSHOT saat serah-terima — tetap benar meski nama akunnya berubah kemudian.
+        consignorName: row.consignment.consignorNameAtIntake,
+        askPriceIdr: row.consignment.askPriceIdr,
+      });
+    }
+    return out;
   }
 
   /**
@@ -1693,6 +1757,20 @@ export class AdminService {
     };
   }
 
+  /**
+   * ╔══════════════════════════════════════════════════════════════════════════════════════════╗
+   * ║ LAYAR INI MENCAMPUR STOK HOSHI DENGAN BARANG ORANG LAIN — jadi ia WAJIB mengatakannya.   ║
+   * ╚══════════════════════════════════════════════════════════════════════════════════════════╝
+   *
+   * `Listing.consignmentId` sudah ikut terbawa (tidak ada `select` yang menyaringnya), tapi
+   * tanpa NAMA PEMILIKNYA badge di layar cuma bisa berbunyi "titipan" tanpa menyebut titipan
+   * SIAPA — dan operator yang tidak tahu kartu siapa yang dipegangnya adalah operator yang
+   * menekan Deactivate/Delete tanpa rasa takut. `consignorNameAtIntake` adalah SNAPSHOT saat
+   * serah-terima (lihat schema), jadi ia tetap benar meski nama akunnya berubah kemudian.
+   *
+   * `askPriceIdr` ikut DENGAN SENGAJA: itu harga dasar yang DISEPAKATI pemiliknya. Layar yang
+   * menampilkan `priceIdrx` sendirian tidak bisa memperlihatkan kalau keduanya sudah menyimpang.
+   */
   async listListings(query: QueryAdminListingsDto) {
     const page = query.page ?? 1;
     const limit = query.limit ?? 20;
@@ -1717,7 +1795,18 @@ export class AdminService {
         orderBy,
         skip: (page - 1) * limit,
         take: limit,
-        include: { nft: true },
+        include: {
+          nft: true,
+          // null ⇔ baris ini BUKAN titipan. Relasi 1-1, jadi nol query tambahan.
+          consignment: {
+            select: {
+              id: true,
+              status: true,
+              consignorNameAtIntake: true,
+              askPriceIdr: true,
+            },
+          },
+        },
       }),
       this.prisma.listing.count({ where }),
     ]);
@@ -1808,9 +1897,49 @@ export class AdminService {
     'contractAddress',
   ] as const satisfies readonly (keyof AdminUpdateListingDto)[];
 
+  /**
+   * Field EKONOMI pada baris listing: angka yang menentukan berapa Rupiah yang berpindah.
+   *
+   * Untuk kartu TITIPAN ketiganya punya kembaran di `Consignment` (`askPriceIdr` + `ConsignmentEvent`)
+   * yang TIDAK ikut berubah kalau ditulis dari sini — lihat gerbang di `updateListing`.
+   */
+  private static readonly CONSIGNMENT_ECONOMIC_FIELDS = [
+    'price',
+    'expectedValue',
+    'buyback',
+  ] as const satisfies readonly (keyof AdminUpdateListingDto)[];
+
   async updateListing(id: string, dto: AdminUpdateListingDto) {
     const existing = await this.prisma.listing.findUnique({ where: { id } });
     if (!existing) throw new NotFoundException('Listing not found.');
+    // ╔══════════════════════════════════════════════════════════════════════════════════════╗
+    // ║ HARGA KARTU TITIPAN TIDAK BOLEH BERUBAH DARI SINI — DAN ITU BUKAN SOAL IZIN.        ║
+    // ╚══════════════════════════════════════════════════════════════════════════════════════╝
+    //
+    // Tulisan di bawah cuma menyentuh `priceIdrx`. Untuk baris titipan itu berarti tiga hal yang
+    // semuanya tidak terlihat di layar ini: `Consignment.askPriceIdr` — harga yang DISEPAKATI
+    // pemiliknya — tetap seperti semula, NOL baris `ConsignmentEvent` lahir sehingga pemiliknya
+    // tidak punya satu pun jejak untuk dibaca, dan harga dasar (reserve) yang ia setujui tidak
+    // pernah diperiksa. Karena payout dihitung dari harga yang pembeli BENAR-BENAR bayar, sebuah
+    // ketikan di sini mengkredit pemilik kartu dari angka yang tidak pernah ia setujui.
+    //
+    // Rute yang benar menulis KEDUANYA dalam satu transaksi + satu event ber-aktor.
+    const economic = AdminService.CONSIGNMENT_ECONOMIC_FIELDS.filter(
+      (field) => dto[field] !== undefined,
+    );
+    if (isConsignedListing(existing) && economic.length > 0) {
+      consignmentUnsupported(
+        `Kartu ini TITIPAN — miliknya orang lain, fisiknya dititipkan ke rak Hoshi. Harga kartu ` +
+          `titipan tidak bisa diubah dari layar listing (field: ${economic.join(', ')}): ` +
+          `tulisan di sini hanya mengubah harga pajangan, sementara harga yang DISEPAKATI ` +
+          `pemiliknya (Consignment.askPriceIdr) tetap seperti semula dan tidak ada satu pun ` +
+          `catatan riwayat yang lahir. Pakai PATCH /admin/consignments/${existing.consignmentId ?? ':id'}/price ` +
+          `(layar /admin/titipan): rute itu menulis harga pajangan DAN harga kesepakatan dalam ` +
+          `satu transaksi, memeriksa harga dasar yang disetujui pemiliknya, dan meninggalkan ` +
+          `satu baris ConsignmentEvent yang bisa dibaca pemiliknya sendiri.`,
+        id,
+      );
+    }
     if (existing.source === ListingSource.COLLECTORCRYPT) {
       const locked = AdminService.CC_LOCKED_FIELDS.filter(
         (field) => dto[field] !== undefined,
@@ -1871,6 +2000,33 @@ export class AdminService {
   async setListingStatus(id: string, status: 'ACTIVE' | 'CANCELLED') {
     const existing = await this.prisma.listing.findUnique({ where: { id } });
     if (!existing) throw new NotFoundException('Listing not found.');
+    // ╔══════════════════════════════════════════════════════════════════════════════════════╗
+    // ║ MENURUNKAN LISTING TITIPAN DARI SINI MEMBELAH SATU KARTU JADI DUA KEBENARAN.        ║
+    // ╚══════════════════════════════════════════════════════════════════════════════════════╝
+    //
+    // Tulisan di bawah hanya menyentuh `Listing.status`. Baris `Consignment`-nya TETAP LISTED,
+    // dan dari situ dua kegagalan terbit sekaligus:
+    //   • Order yang SUDAH terbit tetap bisa dibayar. Saat callback-nya mendarat, klaim
+    //     settlement menuntut listing `status: ACTIVE` → cocok NOL baris → pembeli membayar dan
+    //     tidak menerima apa pun.
+    //   • Pemilik menekan "minta kartu saya kembali" → `takeDown` cabang LISTED menemukan
+    //     listing yang sudah CANCELLED dan gagal di klaimnya sendiri.
+    // Rute yang benar menurunkan listing DAN mengembalikan titipannya ke IN_CUSTODY dalam SATU
+    // transaksi, plus satu baris ConsignmentEvent yang bisa dibaca pemilik kartunya.
+    if (isConsignedListing(existing)) {
+      consignmentUnsupported(
+        'Kartu ini TITIPAN — miliknya orang lain, fisiknya dititipkan ke rak Hoshi. ' +
+          'Mengaktifkan/menonaktifkan pajangannya dari layar listing hanya mengubah baris ' +
+          'listing, sementara catatan titipannya tetap berstatus LISTED — pembeli yang sudah ' +
+          'memegang tagihan tetap bisa membayar dan tidak akan menerima apa pun, dan permintaan ' +
+          'tarik dari pemiliknya akan menabrak keadaan yang tidak konsisten. ' +
+          `Turunkan pajangannya lewat POST /admin/consignments/${existing.consignmentId ?? ':id'}/withdraw ` +
+          '(layar /admin/titipan) — rute itu menurunkan listing dan mengembalikan titipannya ke ' +
+          'IN_CUSTODY dalam satu transaksi, dan meninggalkan jejak audit yang pemiliknya sendiri ' +
+          'bisa baca. Untuk memajangnya kembali: POST /admin/consignments/:id/listing.',
+        id,
+      );
+    }
     if (existing.status === ListingStatus.SOLD) {
       throw new BadRequestException(
         'Listing yang sudah SOLD tidak bisa diaktifkan/nonaktifkan.',
@@ -2160,6 +2316,31 @@ export class AdminService {
   async deleteListing(id: string) {
     const existing = await this.prisma.listing.findUnique({ where: { id } });
     if (!existing) throw new NotFoundException('Listing not found.');
+    // ╔══════════════════════════════════════════════════════════════════════════════════════╗
+    // ║ INI PENOLAKAN YANG PALING TIDAK BOLEH DILONGGARKAN DI SELURUH LAYAR ADMIN.          ║
+    // ╚══════════════════════════════════════════════════════════════════════════════════════╝
+    //
+    // Menghapus baris listing titipan MENGUNCI KARTU FISIK MILIK ORANG LAIN DI RAK HOSHI
+    // SELAMANYA. Yang tertinggal adalah `Consignment` berstatus LISTED dengan `listing = null`,
+    // dan SETIAP jalan keluarnya buntu: `takeDown` cabang LISTED tidak punya listing untuk
+    // diturunkan, dan `createListingFor` menolak karena `listClaimWhere` menuntut IN_CUSTODY.
+    // Satu-satunya perbaikan sesudahnya adalah UPDATE tangan ke database produksi.
+    //
+    // (Cabang penyelamat di `takeDown` sekarang bisa mengembalikan baris yatim yang TERLANJUR
+    // ada ke IN_CUSTODY — itu jaring pengaman untuk data lama, BUKAN izin membuat yang baru.)
+    if (isConsignedListing(existing)) {
+      consignmentUnsupported(
+        'Kartu ini TITIPAN — miliknya orang lain, fisiknya ada di rak Hoshi. Barisnya TIDAK ' +
+          'BOLEH dihapus: yang tersisa sesudahnya adalah catatan titipan tanpa listing, dan di ' +
+          'keadaan itu kartunya tidak bisa ditarik pemiliknya maupun dipajang ulang — kartu ' +
+          'fisik milik orang lain terkunci di rak Hoshi tanpa jalan keluar. ' +
+          `Turunkan pajangannya lewat POST /admin/consignments/${existing.consignmentId ?? ':id'}/withdraw, ` +
+          'lalu kembalikan kartunya lewat POST /admin/consignments/:id/release (layar ' +
+          '/admin/titipan). Dua rute itu menjaga status titipannya tetap benar dan meninggalkan ' +
+          'jejak audit yang pemiliknya sendiri bisa baca.',
+        id,
+      );
+    }
     try {
       await this.prisma.listing.delete({ where: { id } });
     } catch (err) {

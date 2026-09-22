@@ -1498,7 +1498,63 @@ describe('PaymentsService', () => {
       );
     });
 
-    it('commissionBps di luar akal (negatif / > 100%) DI-CLAMP: payout tidak pernah negatif', async () => {
+    /**
+     * ╔════════════════════════════════════════════════════════════════════════════════════════╗
+     * ║ KOMISI YANG MENGHABISKAN SELURUH HASIL PENJUALAN MEMBATALKAN SETTLEMENT —              ║
+     * ║ BUKAN "melewati kreditnya lalu tetap commit".                                          ║
+     * ╚════════════════════════════════════════════════════════════════════════════════════════╝
+     *
+     * `commissionBps` di-SNAPSHOT dari input operator saat intake dan baru dipakai berbulan-bulan
+     * kemudian. Satu nol kelebihan (500 → 5000, 1000 → 10000) membuat `commission = paidBaseIdrx`
+     * dan `payout = 0`.
+     *
+     * Dulu jalur ini menanganinya dengan `if (payout > 0)` di sekeliling `balance.credit` — sebuah
+     * gerbang yang MELEWATI, bukan MENOLAK. Akibatnya settlement tetap commit PENUH: listing SOLD,
+     * titipan SOLD dengan `payoutIdrx = 0`, order FULFILLED, dan email "kartumu terjual" terkirim
+     * — sementara pemiliknya menerima NOL tanpa SATU BARIS `BalanceEntry` pun di riwayat saldonya.
+     * Perjanjian yang ia tandatangani berbunyi 5%.
+     *
+     * Lebih baik pembeli di-refund daripada pemilik kartu kehilangan seluruh hasil penjualannya
+     * diam-diam: uang pembeli bisa dikembalikan, kartu yang sudah berpindah tangan tidak.
+     */
+    it('KOMISI MEMBUAT BAGIAN PEMILIK NOL → settlement DIBATALKAN (REFUND_DUE), bukan diteruskan', async () => {
+      prisma.paymentOrder.findUnique.mockResolvedValue(consignedOrder);
+      prisma.listing.findUnique.mockResolvedValue(consignedListing);
+      prisma.consignment.findUnique.mockResolvedValue({
+        ...liveConsignment,
+        // Salah ketik satu nol pada baris lama (plafon DTO sekarang 3.000 bps menolaknya di
+        // depan; baris yang sudah terlanjur tersimpan tetap harus ditolak DI SINI).
+        commissionBps: 10_000,
+      });
+
+      const outcome = await service.handleCallback({
+        merchantOrderId: MERCHANT_ORDER_ID,
+      });
+
+      expect(outcome).toBe('REFUND_DUE');
+      // NOL saldo bergerak, order TIDAK FULFILLED, dan TIDAK ADA email "kartumu terjual" —
+      // penjualan yang di-rollback tidak boleh dikabarkan sebagai penjualan yang terjadi.
+      expect(balance.credit).not.toHaveBeenCalled();
+      expect(allStatusesWritten()).not.toContain(PaymentStatus.FULFILLED);
+      expect(consignmentNotify.notifySold).not.toHaveBeenCalled();
+      // Rupiah pembeli TERBUKTI di treasury dan TERBUKTI tidak membeli apa pun → aman di-refund.
+      expect(refundSafeWritten()).not.toBe(false);
+      // Pesannya MENYEBUT komisi tersnapshot-nya: pemulihannya bukan "coba lagi" melainkan
+      // memperbaiki angka itu pada baris titipannya.
+      const reason = (
+        prisma.paymentOrder.updateMany.mock.calls as [
+          { data?: { status?: unknown; error?: unknown } },
+        ][]
+      ).find(([a]) => a?.data?.status === PaymentStatus.REFUND_DUE)?.[0]?.data
+        ?.error;
+      expect(String(reason)).toContain('10000 bps');
+      expect(String(reason)).toContain('commissionBps');
+    });
+
+    it('commissionBps di luar akal (negatif / > 100%) DI-CLAMP dulu: payout tidak pernah NEGATIF', async () => {
+      // Clamp tetap ada dan tetap perlu — ia yang menjamin angkanya tidak pernah membuat `payout`
+      // MINUS (yang akan berarti menarik saldo pemilik kartu). Yang berubah: sesudah clamp, hasil
+      // NOL tidak lagi diam-diam diteruskan, melainkan membatalkan settlement seperti test di atas.
       prisma.paymentOrder.findUnique.mockResolvedValue(consignedOrder);
       prisma.listing.findUnique.mockResolvedValue(consignedListing);
       prisma.consignment.findUnique.mockResolvedValue({
@@ -1506,14 +1562,40 @@ describe('PaymentsService', () => {
         commissionBps: 99_999,
       });
 
-      await service.handleCallback({ merchantOrderId: MERCHANT_ORDER_ID });
+      const outcome = await service.handleCallback({
+        merchantOrderId: MERCHANT_ORDER_ID,
+      });
 
-      // Clamp ke 100% → komisi = seluruh basis, payout = 0 → TIDAK dikredit (dan tidak minus).
+      expect(outcome).toBe('REFUND_DUE');
       expect(balance.credit).not.toHaveBeenCalled();
-      expect(prisma.consignment.updateMany).toHaveBeenCalledWith(
-        expect.objectContaining({
-          data: expect.objectContaining({ payoutIdrx: 0 }) as unknown,
-        }),
+      // Clamp ke 100% → payout 0, BUKAN angka negatif.
+      const written = (
+        prisma.consignment.updateMany.mock.calls as [
+          { data?: { payoutIdrx?: number } },
+        ][]
+      ).map(([a]) => a?.data?.payoutIdrx);
+      for (const v of written) expect(v).toBeGreaterThanOrEqual(0);
+    });
+
+    it('komisi 30% (plafon DTO) TETAP menyisakan bagian pemilik — gerbangnya menolak NOL, bukan "komisi besar"', async () => {
+      // Penjaga terhadap perbaikan yang kebablasan: yang salah bukan komisi yang tinggi, melainkan
+      // komisi yang tidak menyisakan APA PUN. Kesepakatan khusus 30% harus tetap bisa di-settle.
+      prisma.paymentOrder.findUnique.mockResolvedValue(consignedOrder);
+      prisma.listing.findUnique.mockResolvedValue(consignedListing);
+      prisma.consignment.findUnique.mockResolvedValue({
+        ...liveConsignment,
+        commissionBps: 3_000,
+      });
+
+      const outcome = await service.handleCallback({
+        merchantOrderId: MERCHANT_ORDER_ID,
+      });
+
+      expect(outcome).toBe('FULFILLED');
+      expect(balance.credit).toHaveBeenCalledWith(
+        // 800.000 − 30% = 560.000.
+        expect.objectContaining({ amountIdrx: 560_000 }),
+        expect.anything(),
       );
     });
 
@@ -1799,6 +1881,67 @@ describe('PaymentsService', () => {
       });
       // NOL Rupiah diminta: mint-request IDRX tidak pernah dibuat.
       expect(idrx.mintRequest).not.toHaveBeenCalled();
+    });
+
+    /**
+     * ╔════════════════════════════════════════════════════════════════════════════════════════╗
+     * ║ TITIPAN IN_CUSTODY + LISTING ACTIVE: keadaan yang membuat pembeli MEMBAYAR kartu yang  ║
+     * ║ MUSTAHIL di-settle. Ditolak DI GERBANG TAGIHAN, sebelum satu Rupiah pun diminta.       ║
+     * ╚════════════════════════════════════════════════════════════════════════════════════════╝
+     *
+     * Keadaan ini BISA NYATA: listing titipan yang di-CANCEL lalu di-`Activate` lewat rute admin
+     * umum, atau titipan yang ditarik dari pajangan sementara baris listing-nya tertinggal ACTIVE.
+     *
+     * Dulu gerbang tagihan memakai `isInHoshiCustody` (menerima IN_CUSTODY **atau** LISTED)
+     * sementara klaim settlement menuntut LISTED saja. Selisih satu status itu berarti: kartu
+     * tayang → pembeli menekan Beli → tagihan TERBIT → pembeli MEMBAYAR → Rupiah mendarat di
+     * treasury → klaim listing ACTIVE→SOLD MENANG → klaim titipan cocok NOL baris → SELURUH
+     * transaksi rollback. Uang pembeli di treasury, kartunya tidak bergerak, refund MANUAL.
+     */
+    it('createListingOrder: titipan IN_CUSTODY (kartunya di rak, TIDAK sedang dipajang) ditolak TANPA menerbitkan invoice', async () => {
+      prisma.listing.findUnique.mockResolvedValue(consignedListing);
+      prisma.consignment.findUnique.mockResolvedValue({
+        ...liveConsignment,
+        // Kartunya TERBUKTI ada di rak — stempel custody-nya utuh. Yang kurang hanya satu:
+        // titipannya tidak sedang dipajang, jadi klaim settlement PASTI menolaknya nanti.
+        status: 'IN_CUSTODY',
+      });
+
+      await expect(
+        service.createListingOrder(consignedListing.id, user),
+      ).rejects.toMatchObject({
+        response: expect.objectContaining({
+          code: 'CONSIGNMENT_NOT_IN_CUSTODY',
+          stage: 'NO_EFFECT',
+        }) as unknown,
+      });
+      // INILAH intinya: NOL Rupiah diminta, jadi tidak ada utang refund yang pernah lahir.
+      expect(idrx.mintRequest).not.toHaveBeenCalled();
+      expect(prisma.paymentOrder.create).not.toHaveBeenCalled();
+    });
+
+    it('fulfilConsignment: pembacaan kustodi memakai predikat yang SAMA — IN_CUSTODY tidak pernah menyentuh klaim SOLD', async () => {
+      // Pagar kedua untuk cacat yang sama, di sisi settlement. Kalau pembacaan di sini lebih
+      // longgar dari klaimnya, urutannya jadi: klaim listing ACTIVE→SOLD MENANG lebih dulu, lalu
+      // klaim titipan kalah → rollback SESUDAH uang mendarat. Menolak di depan berarti listing
+      // tidak pernah tersentuh sama sekali.
+      prisma.paymentOrder.findUnique.mockResolvedValue(consignedOrder);
+      prisma.listing.findUnique.mockResolvedValue(consignedListing);
+      prisma.consignment.findUnique.mockResolvedValue({
+        ...liveConsignment,
+        status: 'IN_CUSTODY',
+      });
+
+      const outcome = await service.handleCallback({
+        merchantOrderId: MERCHANT_ORDER_ID,
+      });
+
+      expect(outcome).toBe('REFUND_DUE');
+      expect(prisma.listing.updateMany).not.toHaveBeenCalled();
+      expect(prisma.consignment.updateMany).not.toHaveBeenCalled();
+      expect(balance.credit).not.toHaveBeenCalled();
+      expect(consignmentNotify.notifySold).not.toHaveBeenCalled();
+      expect(refundSafeWritten()).not.toBe(false);
     });
 
     it('createListingOrder: kartu titipan yang MASIH di rak → invoice terbit, plafon treasury TIDAK disentuh, priceUsdc 0', async () => {

@@ -1027,11 +1027,36 @@ export class ConsignmentService {
         consignmentId: id,
       });
     }
-    if (c.listing) {
+    // ╔════════════════════════════════════════════════════════════════════════════════════════╗
+    // ║ "SUDAH PUNYA LISTING" TIDAK SAMA DENGAN "MASIH PUNYA LISTING YANG HIDUP".              ║
+    // ╚════════════════════════════════════════════════════════════════════════════════════════╝
+    //
+    // Gerbang ini DULU berbunyi `if (c.listing) throw` — menolak SELAMANYA begitu baris Listing
+    // pernah ada. Itu mengunci jalur yang paling manusiawi di seluruh fitur ini: pemilik menekan
+    // "minta kartu saya kembali" dari HP-nya, `takeDown` menurunkan listing-nya ke CANCELLED dan
+    // titipannya kembali ke IN_CUSTODY (kartunya MASIH di rak — custody sengaja tidak dilepas),
+    // lalu ia berubah pikiran atau sadar salah pencet. Sesudah itu tidak ada satu pun rute di
+    // repo ini yang bisa memajangnya lagi: `Listing.consignmentId` `@unique`, jadi baris CANCELLED
+    // itu memegang slotnya, dan satu-satunya "pemulihan" adalah menyuruh pemiliknya menarik
+    // kartunya sungguhan lalu menitipkannya kembali dari nol.
+    //
+    // Yang ditolak sekarang hanya listing yang BELUM CANCELLED. Batasnya penting: baris SOLD
+    // TIDAK BOLEH ikut bisa dihidupkan — kartunya sudah MILIK PEMBELI, dan menghidupkannya berarti
+    // menjual kartu yang sama kepada orang kedua. Baris ACTIVE juga ditolak, karena tidak ada apa
+    // pun yang perlu dihidupkan dan menimpanya diam-diam akan menyembunyikan keadaan yang justru
+    // harus diperiksa manusia.
+    //
+    // Pemeriksaan di sini ADA UNTUK PESANNYA. Yang MENEGAKKAN aturannya adalah `listClaimWhere`
+    // (yang predikatnya kini menerima "belum punya listing ATAU listing-nya CANCELLED") plus
+    // klaim atomik `CANCELLED → ACTIVE` di dalam transaksi di bawah.
+    if (c.listing && c.listing.status !== ListingStatus.CANCELLED) {
       throw new ConflictException(
-        `Titipan ini sudah punya listing (${c.listing.id}).`,
+        `Titipan ini sudah punya listing (${c.listing.id}) berstatus ${c.listing.status}; ` +
+          'hanya listing yang sudah DIBATALKAN yang bisa dipajang ulang.',
       );
     }
+    /** Baris Listing CANCELLED milik titipan ini yang akan DIHIDUPKAN KEMBALI, kalau ada. */
+    const revivableListingId = c.listing?.id ?? null;
     // ╔════════════════════════════════════════════════════════════════════════════════════════╗
     // ║ GERBANG KEDUA, DAN SEBABNYA BERBEDA DARI GERBANG DI ATAS. JANGAN DISATUKAN.           ║
     // ╚════════════════════════════════════════════════════════════════════════════════════════╝
@@ -1093,11 +1118,75 @@ export class ConsignmentService {
     // MEMPERINGATKAN, BUKAN MENOLAK — lihat `belowReserveWarning`. Kalimatnya ikut masuk baris
     // audit, jadi "dipajang di bawah lantai yang disepakati" selalu punya jejak tertulis.
     const reserveWarning = belowReserveWarning(c.reservePriceIdr, price);
+    /**
+     * ISI BARIS LISTING — SATU objek, dipakai jalur BUAT-BARU dan jalur HIDUPKAN-KEMBALI.
+     *
+     * SENGAJA satu sumber. Kalau kedua jalur menulis daftar kolomnya sendiri-sendiri, "kartu yang
+     * dipajang ulang" perlahan akan berbeda dari "kartu yang baru dipajang" di kolom yang tidak
+     * pernah dilihat siapa pun sampai ia salah — mis. foto lama tertinggal padahal operator baru
+     * mengunggah foto yang benar. Memajang ulang HARUS menghasilkan baris yang sama persis dengan
+     * memajang pertama kali.
+     *
+     * ── BENTUK YANG DIPAKU CHECK CONSTRAINT `listings_consignment_shape_chk` ──
+     * source HOSHI (default, bukan COLLECTORCRYPT) · sellable FALSE (default) · ccNftAddress NULL ·
+     * escrowedAt NULL · sellerId NON-NULL. Kelimanya juga ditegakkan Postgres, jadi "kartu titipan
+     * tidak bisa menempuh settlement escrow" adalah invarian DATABASE, bukan janji code-review.
+     */
+    const listingFields = {
+      name: c.cardName,
+      set: c.cardSet ?? dto.category ?? 'Consignment',
+      rarity: dto.rarity ?? 'Rare',
+      image: dto.image,
+      imageBack: dto.imageBack ?? null,
+      priceIdrx: price,
+      expectedValueIdrx: dto.expectedValueIdrx ?? price,
+      buybackIdrx: 0,
+      grade: c.gradeLabel ?? `${c.grader} ${c.gradeScore ?? ''}`.trim(),
+      // Non-null TANPA `!`: gerbang "kartu MENTAH belum bisa dipajang" di atas sudah melempar
+      // untuk `grader == null`, dan objek ini dibangun DI LUAR callback transaksi — jadi
+      // penyempitan tipe TypeScript-nya masih berlaku di sini.
+      grader: c.grader,
+      gradeScore: c.gradeScore ?? 0,
+      language: c.language ?? 'English',
+      era: dto.era ?? c.cardSet ?? 'Unknown',
+      element: dto.element ?? 'Unknown',
+      category: dto.category ?? 'Consignment',
+      tcg: c.tcg ?? null,
+      cardNumber: c.cardNumber ?? null,
+      certificate: c.certNumber ?? null,
+      vaultLocation: c.storageLocation ?? null,
+      status: ListingStatus.ACTIVE,
+      // Penjualnya DI-SEGARKAN tiap kali dipajang: wallet pemilik bisa berubah di antara dua
+      // pemajangan, dan `sellerAddress` adalah salinan yang dibekukan — kalau ia basi, settlement
+      // menulis alamat lama ke feed dan pemeriksaan `consignorId === sellerId` bisa melenceng.
+      sellerId: consignor.id,
+      sellerAddress: shortWallet(consignor.walletAddress),
+    };
     const listingId = await this.prisma.$transaction(async (tx) => {
-      // ══ KLAIM ATOMIK DULU. Kalau kalah, TIDAK ADA baris Listing yang pernah dibuat. ══
+      // ══ KLAIM ATOMIK DULU. Kalau kalah, TIDAK ADA baris Listing yang pernah dibuat/dihidupkan. ══
       const claimed = await tx.consignment.updateMany({
         where: listClaimWhere(id),
-        data: { status: ConsignmentStatus.LISTED },
+        data: {
+          status: ConsignmentStatus.LISTED,
+          // ── PERMINTAAN PENARIKAN DICABUT, dan ini WAJIB ikut ditulis di sini ────────────
+          //
+          // Sejak kartu yang ditarik dari pajangan bisa dipajang ULANG, `withdrawRequestedAt`
+          // yang tertinggal berarti: kartunya tayang di marketplace DAN sekaligus duduk
+          // selamanya di `actionRequired` admin sebagai "pemilik minta kartunya kembali, atur
+          // serah-terimanya" — sebuah peringatan yang tindakannya MUSTAHIL dari status LISTED
+          // (`withdrawnReleaseClaimWhere` menuntut IN_CUSTODY), jadi ia tidak akan pernah bisa
+          // hilang. Itu persis bentuk peringatan yang mengajari orang mengabaikan daftarnya.
+          //
+          // Ini BUKAN menghapus fakta custody: `custodyAcceptedAt`/`custodyReleasedAt` tidak
+          // tersentuh. Yang dicabut adalah sebuah PERMINTAAN yang memang sudah tidak berlaku —
+          // pemiliknya memilih menjual lagi — dan riwayatnya tetap utuh di `ConsignmentEvent`
+          // (baris WITHDRAW_REQUEST / TAKE_DOWN lama + baris LIST yang baru).
+          //
+          // Rencana pengembaliannya (`returnMethod`/alamat) SENGAJA TIDAK ikut dihapus: ia
+          // informasi yang mahal dikumpulkan, tidak menggerakkan gerbang mana pun selama
+          // statusnya LISTED, dan akan berguna lagi kalau pemiliknya menarik kartunya nanti.
+          withdrawRequestedAt: null,
+        },
       });
       if (claimed.count !== 1) {
         throw consignmentError({
@@ -1109,38 +1198,55 @@ export class ConsignmentService {
           consignmentId: id,
         });
       }
-      const listing = await tx.listing.create({
-        data: {
-          name: c.cardName,
-          set: c.cardSet ?? dto.category ?? 'Consignment',
-          rarity: dto.rarity ?? 'Rare',
-          image: dto.image,
-          imageBack: dto.imageBack ?? null,
-          priceIdrx: price,
-          expectedValueIdrx: dto.expectedValueIdrx ?? price,
-          buybackIdrx: 0,
-          grade: c.gradeLabel ?? `${c.grader} ${c.gradeScore ?? ''}`.trim(),
-          grader: c.grader!,
-          gradeScore: c.gradeScore ?? 0,
-          language: c.language ?? 'English',
-          era: dto.era ?? c.cardSet ?? 'Unknown',
-          element: dto.element ?? 'Unknown',
-          category: dto.category ?? 'Consignment',
-          tcg: c.tcg ?? null,
-          cardNumber: c.cardNumber ?? null,
-          certificate: c.certNumber ?? null,
-          vaultLocation: c.storageLocation ?? null,
-          status: ListingStatus.ACTIVE,
-          // ── BENTUK YANG DIPAKU CHECK CONSTRAINT `listings_consignment_shape_chk` ──
-          // source HOSHI (default, bukan COLLECTORCRYPT) · sellable FALSE (default) ·
-          // ccNftAddress NULL · escrowedAt NULL · sellerId NON-NULL.
-          // Kelimanya juga ditegakkan Postgres, jadi "kartu titipan tidak bisa menempuh
-          // settlement escrow" adalah invarian DATABASE, bukan janji code-review.
-          sellerId: consignor.id,
-          sellerAddress: shortWallet(consignor.walletAddress),
-          consignmentId: id,
-        },
-      });
+      let newListingId: string;
+      if (revivableListingId) {
+        // ╔══════════════════════════════════════════════════════════════════════════════════╗
+        // ║ HIDUPKAN KEMBALI baris CANCELLED — BUKAN buat baris baru.                        ║
+        // ╚══════════════════════════════════════════════════════════════════════════════════╝
+        //
+        // `Listing.consignmentId` `@unique`, jadi "baris baru" bukan pilihan yang ada: ia akan
+        // menabrak constraint. Dan itu KEBETULAN YANG BENAR — riwayat satu kartu titipan memang
+        // harus tinggal di SATU baris listing, supaya order lama, offer lama, dan baris activity
+        // yang menunjuk `listingId` itu tidak mendadak menunjuk kartu yang "lain".
+        //
+        // KLAIM ATOMIK, dengan alasan yang sama seperti klaim titipan di atas: predikatnya
+        // menyebut `status: CANCELLED`, jadi baris yang SOLD (atau yang sudah di-ACTIVE-kan
+        // permintaan lain sedetik lalu) cocok NOL baris dan seluruh transaksi dibatalkan.
+        // `consignmentId` ikut disebut supaya baris milik titipan LAIN tidak bisa tersentuh.
+        const revived = await tx.listing.updateMany({
+          where: {
+            id: revivableListingId,
+            consignmentId: id,
+            status: ListingStatus.CANCELLED,
+          },
+          data: {
+            ...listingFields,
+            // Jejak pembeli dari kehidupan sebelumnya DIBERSIHKAN. Baris ini dijual lagi dari
+            // nol; membiarkan `buyerId`/`soldAt` terisi berarti sebuah kartu yang sedang tayang
+            // membawa nama pembeli yang tidak pernah membelinya.
+            buyerId: null,
+            soldAt: null,
+          },
+        });
+        if (revived.count !== 1) {
+          throw consignmentError({
+            status: HttpStatus.CONFLICT,
+            code: CONSIGNMENT_ERROR_CODE.BAD_TRANSITION,
+            message:
+              `Listing ${revivableListingId} milik titipan ini tidak lagi berstatus DIBATALKAN ` +
+              '(sudah dipajang ulang oleh permintaan lain, atau sudah terjual). Tidak ada yang ' +
+              'diubah.',
+            consignmentId: id,
+            listingId: revivableListingId,
+          });
+        }
+        newListingId = revivableListingId;
+      } else {
+        const created = await tx.listing.create({
+          data: { ...listingFields, consignmentId: id },
+        });
+        newListingId = created.id;
+      }
       await this.writeEvent(tx, {
         consignmentId: id,
         kind: 'LIST',
@@ -1148,18 +1254,21 @@ export class ConsignmentService {
         toStatus: ConsignmentStatus.LISTED,
         actor: admin,
         note:
-          `Listing ${listing.id} dibuat pada harga Rp ${price}.` +
+          (revivableListingId
+            ? `Listing ${newListingId} DIPAJANG ULANG (baris yang sama, sebelumnya dibatalkan ` +
+              `atas permintaan pemilik) pada harga Rp ${price}.`
+            : `Listing ${newListingId} dibuat pada harga Rp ${price}.`) +
           (reserveWarning ? ` ${reserveWarning}` : ''),
       });
       await tx.activity.create({
         data: {
           type: ActivityType.LISTED_CARD,
-          listingId: listing.id,
-          itemName: listing.name,
-          itemImage: listing.image,
-          category: listing.category,
-          set: listing.set,
-          amount: listing.priceIdrx,
+          listingId: newListingId,
+          itemName: listingFields.name,
+          itemImage: listingFields.image,
+          category: listingFields.category,
+          set: listingFields.set,
+          amount: listingFields.priceIdrx,
           fromId: consignor.id,
           fromLabel:
             consignor.displayName?.trim() ||
@@ -1168,7 +1277,7 @@ export class ConsignmentService {
           toLabel: null,
         },
       });
-      return listing.id;
+      return newListingId;
     });
 
     this.logger.log(
@@ -1595,11 +1704,52 @@ export class ConsignmentService {
       // Terpajang → turunkan listing-nya lebih dulu, ATOMIK, dalam satu transaksi.
       case ConsignmentStatus.LISTED: {
         const listingId = c.listing?.id;
+        // ╔══════════════════════════════════════════════════════════════════════════════════╗
+        // ║ BARIS YATIM: LISTED tapi listing-nya SUDAH TIDAK ADA. JANGAN MELEMPAR.          ║
+        // ╚══════════════════════════════════════════════════════════════════════════════════╝
+        //
+        // Keadaan ini lahir dari satu sumber: `DELETE /admin/listings/:id` pernah menghapus
+        // baris listing titipan (sekarang ditolak di titik tulisnya). Yang tersisa adalah kartu
+        // FISIK MILIK ORANG LAIN di rak Hoshi tanpa satu pun jalan keluar — `takeDown` melempar
+        // "data tidak konsisten" dan `createListingFor` menolak karena menuntut IN_CUSTODY.
+        //
+        // Melempar di sini menjadikan kerusakan data milik Hoshi sebagai HUKUMAN BAGI PEMILIK
+        // KARTU. Yang benar: kerjakan klaim atomiknya apa adanya. Tidak ada listing yang perlu
+        // diturunkan (memang sudah tidak ada), tidak ada offer yang bisa hidup tanpa listing,
+        // dan tidak ada `LISTING_CANCELED` yang jujur untuk ditulis — yang tersisa justru satu
+        // hal yang penting: mengembalikan titipannya ke IN_CUSTODY supaya pemiliknya tetap bisa
+        // menarik kartunya lewat jalur pengembalian yang normal.
         if (!listingId) {
-          throw new ConflictException(
-            `Titipan ${id} berstatus LISTED tapi tidak punya baris listing — data tidak ` +
-              'konsisten; hubungi admin.',
-          );
+          await this.prisma.$transaction(async (tx) => {
+            const back = await tx.consignment.updateMany({
+              where: takeDownClaimWhere(id),
+              // Custody TIDAK dilepas — sama seperti cabang normal di bawah. Kartunya masih di
+              // rak kami sampai serah-terima pengembaliannya benar-benar dicatat.
+              data: {
+                status: ConsignmentStatus.IN_CUSTODY,
+                withdrawRequestedAt: new Date(),
+                ...(planned?.data ?? {}),
+              },
+            });
+            if (back.count !== 1) {
+              throw new ConflictException(
+                'Status titipan berubah barusan; tidak ada yang diubah.',
+              );
+            }
+            await this.writeEvent(tx, {
+              consignmentId: id,
+              kind: 'TAKE_DOWN',
+              fromStatus: ConsignmentStatus.LISTED,
+              toStatus: ConsignmentStatus.IN_CUSTODY,
+              actor,
+              note:
+                'PEMULIHAN: catatan titipan berstatus LISTED tapi baris listing-nya sudah tidak ' +
+                'ada (kemungkinan dihapus dari layar admin listings). Titipannya dikembalikan ke ' +
+                'IN_CUSTODY atas permintaan pemilik supaya kartunya tetap bisa ditarik. Kartunya ' +
+                `MASIH di rak Hoshi sampai serah-terima pengembaliannya dicatat. ${note}${planNote}`,
+            });
+          });
+          return this.byId(id);
         }
         await this.prisma.$transaction(async (tx) => {
           // Bentuk PERSIS `MarketplaceService.cancel`: gerbang ACTIVE→CANCELLED menutup jendela

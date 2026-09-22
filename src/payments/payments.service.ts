@@ -49,7 +49,7 @@ import {
   CONSIGNMENT_SALE_REASON,
   assertConsignmentSaleAvailable,
   consignmentSaleClaimWhere,
-  isInHoshiCustody,
+  isConsignmentSellableNow,
 } from '../common/consignment.gate';
 import { ConsignmentNotifyService } from '../consignment/consignment-notify.service';
 import {
@@ -124,6 +124,45 @@ class ConsignmentCustodyRaceLost extends Error {
       `Custody titipan ${consignmentId} berubah di tengah settlement — transaksi dibatalkan.`,
     );
     this.name = 'ConsignmentCustodyRaceLost';
+  }
+}
+
+/**
+ * ╔════════════════════════════════════════════════════════════════════════════════════════════╗
+ * ║ Sinyal INTERNAL `fulfilConsignment`: komisi tersnapshot MENGHABISKAN seluruh hasil          ║
+ * ║ penjualan, jadi bagian pemilik kartu = NOL. SETTLEMENT DIBATALKAN, BUKAN DITERUSKAN.       ║
+ * ╚════════════════════════════════════════════════════════════════════════════════════════════╝
+ *
+ * KENAPA INI ADA. `Consignment.commissionBps` adalah SNAPSHOT dari input operator saat intake.
+ * Satu nol kelebihan (500 → 5000, atau 1000 → 10000) membuat `commission = paidBaseIdrx` dan
+ * `payout = 0`. Sebelumnya jalur ini menanganinya dengan `if (payout > 0)` di sekeliling
+ * `balance.credit` — sebuah gerbang yang MELEWATI, bukan MENOLAK. Akibatnya settlement tetap
+ * commit PENUH: listing SOLD, titipan SOLD dengan `payoutIdrx = 0`, order FULFILLED, dan email
+ * "kartumu terjual" terkirim — sementara pemiliknya menerima NOL tanpa SATU BARIS `BalanceEntry`
+ * pun di riwayat saldonya. Perjanjian yang ia tandatangani berbunyi 5%.
+ *
+ * Tidak ada nilai `payout <= 0` yang BENAR di rail ini. Kalau ia muncul, salah satu dari dua hal
+ * sedang terjadi — komisi yang salah ketik, atau harga yang terlalu kecil untuk ditagihkan — dan
+ * KEDUANYA lebih baik diselesaikan dengan me-refund pembeli daripada dengan menyerahkan kartu
+ * orang lain secara gratis. Uang pembeli bisa dikembalikan; kartu yang sudah berpindah tangan
+ * tidak.
+ *
+ * MELEMPAR, BUKAN `return`, dengan alasan yang sama persis dengan `ConsignmentCustodyRaceLost`:
+ * klaim listing `ACTIVE → SOLD` dan klaim titipan `LISTED → SOLD` sudah MENANG di langkah
+ * sebelumnya, dan melempar di dalam `$transaction` adalah satu-satunya cara membatalkan keduanya.
+ */
+class ConsignmentPayoutEmpty extends Error {
+  constructor(
+    readonly consignmentId: string,
+    readonly feeBps: number,
+    readonly paidBaseIdrx: number,
+    readonly payout: number,
+  ) {
+    super(
+      `Payout pemilik titipan ${consignmentId} = Rp ${payout} (komisi tersnapshot ${feeBps} bps ` +
+        `atas basis Rp ${paidBaseIdrx}) — settlement dibatalkan.`,
+    );
+    this.name = 'ConsignmentPayoutEmpty';
   }
 }
 
@@ -2709,14 +2748,19 @@ export class PaymentsService {
           'diselesaikan. NOL kartu bergerak; Rupiah pembeli aman di-refund.',
       );
     }
-    if (!isInHoshiCustody(c)) {
+    // `isConsignmentSellableNow`, BUKAN `isInHoshiCustody`: predikat yang PERSIS SAMA dengan yang
+    // dipakai gerbang penerbitan tagihan DAN diturunkan jadi `consignmentSaleClaimWhere` di bawah.
+    // Kalau pembacaan di sini lebih LONGGAR dari klaimnya (dulu: menerima IN_CUSTODY), yang
+    // terjadi adalah settlement melewati penjaga ini, memenangkan klaim listing ACTIVE→SOLD, lalu
+    // kalah di klaim titipan — dan seluruhnya rollback SESUDAH Rupiah pembeli mendarat.
+    if (!isConsignmentSellableNow(c)) {
       return this.failToRefund(
         order,
-        `Kartu titipan ${consignmentId} TIDAK LAGI di penyimpanan Hoshi saat pembayaran mendarat ` +
+        `Kartu titipan ${consignmentId} TIDAK SEDANG DIJUAL saat pembayaran mendarat ` +
           `(status ${c.status}, custodyAcceptedAt=${c.custodyAcceptedAt ? 'ada' : 'null'}, ` +
-          `custodyReleasedAt=${c.custodyReleasedAt ? 'ada' : 'null'}) — ditarik pemiliknya, ` +
-          'sudah keluar, atau hilang. Listing TIDAK diklaim SOLD, pemilik TIDAK dikredit. ' +
-          'Rupiah pembeli aman di-refund seluruhnya.',
+          `custodyReleasedAt=${c.custodyReleasedAt ? 'ada' : 'null'}) — ditarik dari pajangan, ` +
+          'ditarik pemiliknya, sudah keluar, atau hilang. Listing TIDAK diklaim SOLD, pemilik ' +
+          'TIDAK dikredit. Rupiah pembeli aman di-refund seluruhnya.',
       );
     }
 
@@ -2803,17 +2847,30 @@ export class PaymentsService {
 
         // (c) KREDIT PEMILIK. Ledger yang SUDAH ADA, bukan buku besar kedua. Idempotensi
         //     `@@unique([reason, refId])` adalah pagar KEDUA; pagar pertama adalah klaim (a).
-        if (payout > 0) {
-          await this.balance.credit(
-            {
-              userId: sellerId,
-              amountIdrx: payout,
-              reason: CONSIGNMENT_SALE_REASON,
-              refId: order.merchantOrderId,
-            },
-            tx,
+        //
+        //     ══ GERBANG YANG MENOLAK, BUKAN YANG MELEWATI ══
+        //     Dulu baris ini berbunyi `if (payout > 0) { credit }` — yaitu: kalau bagian pemilik
+        //     nol, LEWATI kreditnya dan TERUSKAN settlement-nya. Itu menyerahkan kartu orang lain
+        //     kepada pembeli dan membayar pemiliknya NOL, tanpa satu baris ledger pun yang bisa ia
+        //     lihat di riwayat saldonya. Sekarang keadaan itu MEMBATALKAN seluruh transaksi.
+        //     Lihat `ConsignmentPayoutEmpty` untuk alasan lengkapnya.
+        if (payout <= 0) {
+          throw new ConsignmentPayoutEmpty(
+            consignmentId,
+            feeBps,
+            paidBaseIdrx,
+            payout,
           );
         }
+        await this.balance.credit(
+          {
+            userId: sellerId,
+            amountIdrx: payout,
+            reason: CONSIGNMENT_SALE_REASON,
+            refId: order.merchantOrderId,
+          },
+          tx,
+        );
 
         // (d) Order FULFILLED.
         await tx.paymentOrder.update({
@@ -2869,6 +2926,24 @@ export class PaymentsService {
             'hilang) tepat saat settlement berjalan. Seluruh transaksi dibatalkan: listing tetap ' +
             'seperti semula, pemilik TIDAK dikredit, NOL kartu bergerak. Rupiah pembeli aman ' +
             'di-refund seluruhnya.',
+        );
+      }
+      if (err instanceof ConsignmentPayoutEmpty) {
+        // Seluruh transaksi ter-rollback: listing TIDAK jadi SOLD, titipan TIDAK jadi SOLD, order
+        // TIDAK jadi FULFILLED, dan tidak ada email "kartumu terjual" yang terkirim.
+        //
+        // Pesannya MENYEBUT ANGKANYA — komisi tersnapshot, basis, dan hasil nol — karena
+        // pemulihannya bukan "coba lagi" melainkan MEMPERBAIKI `commissionBps` pada baris
+        // titipannya (salah ketik satu nol adalah bentuk yang paling mungkin). Operator yang
+        // membaca "settlement gagal" tanpa angka tidak punya apa pun untuk ditindaklanjuti.
+        return this.failToRefund(
+          order,
+          `Settlement titipan ${consignmentId} DIBATALKAN: komisi tersnapshot ${err.feeBps} bps ` +
+            `menghabiskan seluruh hasil penjualan (basis Rp ${err.paidBaseIdrx}, bagian pemilik ` +
+            `Rp ${err.payout}). Pemilik kartu tidak boleh menerima NOL secara diam-diam, jadi ` +
+            'listing TIDAK diklaim SOLD dan NOL saldo bergerak. Rupiah pembeli aman di-refund ' +
+            `seluruhnya. PERBAIKI commissionBps pada titipan ${consignmentId} (5% = 500 bps), ` +
+            'lalu kartunya bisa dijual lagi.',
         );
       }
       // Kegagalan DB transien: TIDAK ADA yang ter-commit (semuanya satu transaksi), jadi aman

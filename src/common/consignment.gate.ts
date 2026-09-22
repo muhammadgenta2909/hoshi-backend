@@ -1,5 +1,5 @@
 import { HttpStatus } from '@nestjs/common';
-import { ConsignmentStatus, Prisma } from '@prisma/client';
+import { ConsignmentStatus, ListingStatus, Prisma } from '@prisma/client';
 import { CONSIGNMENT_ERROR_CODE, consignmentError } from './consignment.errors';
 
 /**
@@ -22,6 +22,9 @@ import { CONSIGNMENT_ERROR_CODE, consignmentError } from './consignment.errors';
  * │   LISTING TITIPAN BOLEH HIDUP  ⇔  custodyAcceptedAt != null                                  │
  * │                                 ∧  custodyReleasedAt == null                                 │
  * │                                 ∧  status ∈ { IN_CUSTODY, LISTED }                           │
+ * │                                                                                              │
+ * │   BOLEH DITAGIHKAN SEKARANG    ⇔  dua baris pertama yang sama                                │
+ * │                                 ∧  status = LISTED   (LEBIH KETAT — `isConsignmentSellableNow`)│
  * └──────────────────────────────────────────────────────────────────────────────────────────────┘
  *
  * DUA KOLOM, BUKAN SATU YANG DI-TOGGLE — dan itu PENINGKATAN yang disengaja atas `escrowedAt`.
@@ -87,11 +90,13 @@ export function isInHoshiCustody(c: ConsignmentCustodyFacts): boolean {
 /**
  * true ⇔ kartunya MASIH SECARA FISIK di rak Hoshi — tanpa peduli sudah terjual atau belum.
  *
- * SENGAJA BERBEDA dari `isInHoshiCustody`, dan perbedaannya penting. Ada dua pertanyaan yang
- * mudah tertukar:
+ * SENGAJA BERBEDA dari `isInHoshiCustody`, dan perbedaannya penting. Ada tiga pertanyaan yang
+ * mudah tertukar (yang ketiga ditambahkan belakangan — lihat `isConsignmentSellableNow`):
  *
- *   "Boleh dijual?"      → `isInHoshiCustody`. Butuh status IN_CUSTODY/LISTED. Kartu yang sudah
- *                          SOLD jelas tidak boleh dijual lagi ke orang kedua.
+ *   "Dalam pengawasan?"  → `isInHoshiCustody`. Butuh status IN_CUSTODY/LISTED. Inilah yang
+ *                          menjawab "boleh DIPAJANG" dan "masih tanggung jawab kita".
+ *   "Boleh DITAGIHKAN?"  → `isConsignmentSellableNow`. LEBIH KETAT: HANYA LISTED. Kartu yang
+ *                          duduk di rak tanpa dipajang tidak sedang dijual kepada siapa pun.
  *   "Masih ada di rak?"  → fungsi INI. Hanya soal fisik: pernah diterima, belum pernah keluar.
  *                          Kartu yang sudah SOLD MASIH ADA di rak — justru sedang menunggu
  *                          dikirim ke pembelinya.
@@ -107,6 +112,70 @@ export function isInHoshiCustody(c: ConsignmentCustodyFacts): boolean {
  */
 export function isPhysicallyHeldByHoshi(c: ConsignmentCustodyFacts): boolean {
   return c.custodyAcceptedAt != null && c.custodyReleasedAt == null;
+}
+
+/* ══════════ PERTANYAAN KETIGA: "BOLEH DITAGIHKAN KE PEMBELI SEKARANG?" ══════════ */
+
+/**
+ * ╔══════════════════════════════════════════════════════════════════════════════════════════════╗
+ * ║ TIGA PERTANYAAN, TIGA PREDIKAT. Menukarnya sudah pernah jadi bug — DUA KALI.                 ║
+ * ╠══════════════════════════════════════════════════════════════════════════════════════════════╣
+ * ║   "boleh DIPAJANG / masih dalam pengawasan kita?" → isInHoshiCustody  (IN_CUSTODY ∨ LISTED)  ║
+ * ║   "masih ada di RAK secara fisik?"                → isPhysicallyHeldByHoshi (abaikan status) ║
+ * ║   "boleh DITAGIHKAN ke pembeli SEKARANG?"         → isConsignmentSellableNow (LISTED saja)   ║
+ * ╚══════════════════════════════════════════════════════════════════════════════════════════════╝
+ *
+ * KENAPA YANG KETIGA HARUS ADA SENDIRI, dan kenapa ia LEBIH KETAT dari `isInHoshiCustody`:
+ *
+ * `isInHoshiCustody` menerima IN_CUSTODY, dan itu BENAR untuk pertanyaan yang ia jawab — kartu
+ * yang duduk di rak tanpa dipajang memang masih dalam pengawasan Hoshi, masih bisa ditarik, masih
+ * harus terhitung di stok opname. Tapi ia TIDAK SEDANG DIJUAL: tidak ada perjanjian harga yang
+ * sedang tayang, dan klaim settlement (`consignmentSaleClaimWhere`) menuntut LISTED.
+ *
+ * Selama gerbang PENERBITAN TAGIHAN memakai predikat yang LONGGAR sementara klaim SETTLEMENT
+ * memakai yang KETAT, ada satu keadaan yang mematikan dan ia BISA NYATA (titipan IN_CUSTODY dengan
+ * baris Listing yang ACTIVE — mis. listing yang di-CANCEL lalu di-`Activate` lewat rute admin
+ * umum, atau titipan yang ditarik dari pajangan sementara listing-nya tertinggal ACTIVE):
+ *
+ *   kartu tayang → pembeli menekan Beli → gerbang longgar MELOLOSKAN → tagihan TERBIT →
+ *   pembeli MEMBAYAR → Rupiah mendarat di treasury → klaim listing ACTIVE→SOLD MENANG →
+ *   klaim titipan LISTED→SOLD cocok NOL baris → seluruh transaksi ROLLBACK.
+ *
+ * Hasil akhirnya: uang pembeli ada di treasury, kartunya tidak bergerak, pemiliknya tidak dikredit,
+ * dan satu-satunya jalan keluar adalah refund MANUAL. Itu bukan balapan yang kalah — itu gerbang
+ * yang MEMBUKA pintu yang tidak bisa ditutup di ujung sana.
+ *
+ * Karena itu SATU fungsi ini yang dipakai gerbang penerbitan tagihan DAN pembacaan kustodi di
+ * settlement, dan `consignmentSaleClaimWhere` DITURUNKAN darinya (lihat di bawah) — supaya "boleh
+ * ditagihkan" dan "boleh diklaim" tidak bisa lagi berbeda tanpa seseorang mengubah SATU baris.
+ *
+ * JANGAN melonggarkan fungsi ini supaya ia bisa dipakai untuk dua pertanyaan yang lain, dan jangan
+ * menghapus keduanya supaya semuanya memakai yang ini. Ketiganya menjawab hal yang berbeda; kartu
+ * yang sudah SOLD, misalnya, MASIH ADA DI RAK (yang ketiga: tidak boleh dijual lagi; yang kedua:
+ * ya, dan justru itu yang membuatnya bisa dikirim ke pembelinya).
+ */
+const SELLABLE_NOW_STATUS = ConsignmentStatus.LISTED;
+
+export function isConsignmentSellableNow(c: ConsignmentCustodyFacts): boolean {
+  return (
+    c.custodyAcceptedAt != null &&
+    c.custodyReleasedAt == null &&
+    c.status === SELLABLE_NOW_STATUS
+  );
+}
+
+/**
+ * Bentuk WHERE Prisma — TERJEMAHAN HARFIAH dari `isConsignmentSellableNow`, dan SATU-SATUNYA
+ * sumber bagi `consignmentSaleClaimWhere`. SENGAJA fungsi, bukan konstanta, dengan alasan yang
+ * sama seperti `inCustodyWhere`: objek literal yang di-spread ke beberapa query Prisma berbagi
+ * sub-objek yang SAMA, dan satu pemanggil yang memutasinya diam-diam mengubah pagar pemanggil lain.
+ */
+export function consignmentSellableNowWhere(): Prisma.ConsignmentWhereInput {
+  return {
+    status: SELLABLE_NOW_STATUS,
+    custodyAcceptedAt: { not: null },
+    custodyReleasedAt: null,
+  };
 }
 
 /* ───────────────── PEMILIKNYA: PERTANYAAN KEDUA, DAN SENGAJA TERPISAH ───────────────── */
@@ -268,22 +337,40 @@ export function inCustodyWhere(): Prisma.ConsignmentWhereInput {
  *
  * Pasangan `assertP2pSaleAvailable`. Bedanya: di sini TIDAK ADA paruh "fitur dimatikan". Titipan
  * tidak punya flag — ia punya kartu fisik, dan pertanyaannya hanya satu: apakah kartunya ada.
+ *
+ * ── PREDIKATNYA `isConsignmentSellableNow`, BUKAN `isInHoshiCustody` ────────────────────────────
+ *
+ * Ini SATU-SATUNYA perubahan yang menutup kebocoran "pembeli membayar kartu yang mustahil
+ * di-settle". Gerbang ini dan klaim `consignmentSaleClaimWhere` sekarang lahir dari predikat yang
+ * SAMA, jadi keadaan yang diloloskan di sini MUSTAHIL ditolak di sana. Baca alasan lengkapnya di
+ * blok komentar `isConsignmentSellableNow`.
  */
 export function assertConsignmentSaleAvailable(
   c: ConsignmentCustodyFacts,
   listingId: string,
 ): void {
-  if (isInHoshiCustody(c)) return;
+  if (isConsignmentSellableNow(c)) return;
   throw consignmentError({
     status: HttpStatus.CONFLICT,
     code: CONSIGNMENT_ERROR_CODE.NOT_IN_CUSTODY,
+    // TIGA pesan untuk TIGA sebab, karena PEMULIHANNYA bertiga berbeda. Kodenya tetap satu
+    // (`NOT_IN_CUSTODY`) dengan sengaja: bagi PEMBELI ketiganya berarti hal yang persis sama —
+    // tidak ada yang bisa dibeli dan NOL Rupiah diambil — dan menambah kode baru ke kontrak
+    // frontend hanya untuk membedakan sebab INTERNAL akan membuat UI bercabang tanpa guna.
     message:
       c.custodyAcceptedAt == null
         ? 'Kartu ini sedang tidak tersedia: serah-terima fisiknya belum tercatat di Hoshi, jadi ' +
           'belum boleh dijual. Tidak ada pembayaran yang dibuat dan tidak ada uang yang diambil.'
-        : 'Kartu ini sedang tidak tersedia: kartunya sudah tidak lagi berada di penyimpanan ' +
-          'Hoshi (ditarik pemiliknya, sudah dikirim, atau sedang bermasalah). Tidak ada ' +
-          'pembayaran yang dibuat dan tidak ada uang yang diambil.',
+        : c.custodyReleasedAt != null
+          ? 'Kartu ini sedang tidak tersedia: kartunya sudah tidak lagi berada di penyimpanan ' +
+            'Hoshi (ditarik pemiliknya, sudah dikirim, atau sedang bermasalah). Tidak ada ' +
+            'pembayaran yang dibuat dan tidak ada uang yang diambil.'
+          : // Kartunya ADA di rak, tapi titipannya TIDAK SEDANG DIPAJANG (mis. sudah ditarik dari
+            // pajangan, atau sudah terjual ke orang lain). Menerbitkan tagihan di sini berarti
+            // menerima Rupiah untuk penjualan yang klaim settlement-nya PASTI kalah.
+            'Kartu ini sedang tidak dijual: titipannya ada di penyimpanan Hoshi tapi tidak ' +
+            'sedang dipajang (ditarik dari pajangan oleh pemiliknya, atau sudah terjual). Tidak ' +
+            'ada pembayaran yang dibuat dan tidak ada uang yang diambil.',
     listingId,
     consignmentId: c.id,
   });
@@ -373,8 +460,30 @@ export function listClaimWhere(id: string): Prisma.ConsignmentWhereInput {
     custodyReleasedAt: null,
     // Tahu siapa yang dibayar. Lihat paragraf di atas — ini gerbang, bukan filter.
     consignorId: { not: null },
-    // Belum pernah punya listing. Relasi 1-1; `Listing.consignmentId` juga @unique di DB.
-    listing: { is: null },
+    // ── BELUM PUNYA LISTING, *ATAU* LISTING LAMANYA SUDAH CANCELLED ──────────────────────────
+    //
+    // Dulu di sini hanya ada `listing: { is: null }`, dan itu MENGUNCI kartu SELAMANYA. Urutan
+    // yang membuktikannya, dan ia jalur NORMAL bukan kasus tepi: pemilik menekan "minta kartu
+    // saya kembali" → `takeDown` menurunkan Listing ke CANCELLED dan Consignment kembali ke
+    // IN_CUSTODY (kartunya MASIH di rak — custody sengaja tidak dilepas) → pemilik berubah
+    // pikiran → admin menekan Pajang → predikat ini cocok NOL baris, karena baris Listing
+    // CANCELLED itu masih memegang `consignmentId` yang `@unique`. Tidak ada rute relist lain di
+    // repo ini, jadi satu-satunya "pemulihan" adalah menyuruh pemiliknya menarik kartunya sungguhan
+    // lalu menitipkannya lagi dari nol.
+    //
+    // HANYA CANCELLED yang boleh, dan batas itu ADALAH gerbangnya:
+    //   • SOLD     kartunya sudah MILIK PEMBELI. Menghidupkannya kembali berarti menjual kartu
+    //              yang sama kepada orang kedua — tepat risiko yang seluruh fitur ini tutup.
+    //   • ACTIVE   sedang tayang; tidak ada yang perlu dihidupkan, dan kalau titipannya IN_CUSTODY
+    //              sementara listing-nya ACTIVE, yang benar adalah MENOLAK (lihat
+    //              `isConsignmentSellableNow`) — bukan menimpanya diam-diam.
+    //
+    // `createListingFor` MENGHIDUPKAN baris CANCELLED itu (bukan membuat baris baru) di transaksi
+    // yang SAMA dengan klaim ini, dengan klaim atomiknya sendiri berpredikat `status: CANCELLED`.
+    OR: [
+      { listing: { is: null } },
+      { listing: { is: { status: ListingStatus.CANCELLED } } },
+    ],
   };
 }
 
@@ -382,16 +491,22 @@ export function listClaimWhere(id: string): Prisma.ConsignmentWhereInput {
  * Settlement: LISTED → SOLD, dan HANYA kalau kartunya MASIH di tangan Hoshi saat pembayaran
  * mendarat. Penarikan yang menang balapan di antara invoice dan pembayaran membuat klaim ini
  * cocok 0 baris → `failToRefund` → Rupiah pembeli utuh dan aman di-refund, kartu tidak bergerak.
+ *
+ * ── DITURUNKAN, BUKAN DISALIN ──────────────────────────────────────────────────────────────────
+ *
+ * Isinya ADALAH `consignmentSellableNowWhere()` ditambah `id`, dan itu bukan kerapian melainkan
+ * PERBAIKAN CACAT. Sebelumnya predikat ini menuliskan syaratnya SENDIRI sementara gerbang
+ * penerbitan tagihan memakai `isInHoshiCustody` yang LEBIH LONGGAR — dan selisih satu status
+ * (IN_CUSTODY) di antara keduanya berarti pembeli bisa MEMBAYAR kartu yang klaim settlement-nya
+ * pasti kalah: uang mendarat di treasury, seluruh transaksi rollback, refund manual.
+ *
+ * Sekarang keduanya lahir dari `isConsignmentSellableNow`. Melonggarkan salah satunya tanpa yang
+ * lain tidak lagi mungkin tanpa membongkar baris ini dengan sadar.
  */
 export function consignmentSaleClaimWhere(
   id: string,
 ): Prisma.ConsignmentWhereInput {
-  return {
-    id,
-    status: ConsignmentStatus.LISTED,
-    custodyAcceptedAt: { not: null },
-    custodyReleasedAt: null,
-  };
+  return { id, ...consignmentSellableNowWhere() };
 }
 
 /**

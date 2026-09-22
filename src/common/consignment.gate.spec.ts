@@ -1,4 +1,4 @@
-import { ConsignmentStatus } from '@prisma/client';
+import { ConsignmentStatus, ListingStatus } from '@prisma/client';
 import {
   CONSIGNMENT_EXITS,
   CONSIGNMENT_TERMINAL_STATUSES,
@@ -9,6 +9,7 @@ import {
   consignmentSaleClaimWhere,
   inCustodyWhere,
   isAwaitingConsignorClaim,
+  isConsignmentSellableNow,
   isConsignorLinked,
   isInHoshiCustody,
   isReturnAddressComplete,
@@ -136,7 +137,109 @@ describe('consignment.gate', () => {
     });
   });
 
+  /**
+   * ╔════════════════════════════════════════════════════════════════════════════════════════════╗
+   * ║ CACAT YANG DIJAGA BLOK INI: gerbang tagihan LONGGAR + klaim settlement KETAT = pembeli     ║
+   * ║ membayar kartu yang MUSTAHIL di-settle.                                                    ║
+   * ╚════════════════════════════════════════════════════════════════════════════════════════════╝
+   *
+   * Urutannya, kalau `isConsignmentSellableNow` dikembalikan jadi `isInHoshiCustody`:
+   *   titipan IN_CUSTODY + listing ACTIVE → gerbang MELOLOSKAN → tagihan terbit → pembeli bayar →
+   *   Rupiah mendarat di treasury → klaim listing ACTIVE→SOLD MENANG → klaim titipan LISTED→SOLD
+   *   cocok NOL baris → seluruh transaksi rollback. Uangnya di treasury, kartunya tidak bergerak.
+   */
+  describe('isConsignmentSellableNow — "boleh DITAGIHKAN sekarang?"', () => {
+    it('HANYA LISTED. IN_CUSTODY DITOLAK, walau kartunya terbukti ada di rak', () => {
+      // Inilah satu status yang memisahkan gerbang tagihan dari klaim settlement. Kartu yang
+      // duduk di rak tanpa dipajang TIDAK SEDANG DIJUAL kepada siapa pun.
+      expect(
+        isConsignmentSellableNow(facts({ status: ConsignmentStatus.LISTED })),
+      ).toBe(true);
+      expect(
+        isConsignmentSellableNow(
+          facts({ status: ConsignmentStatus.IN_CUSTODY }),
+        ),
+      ).toBe(false);
+    });
+
+    it('LEBIH KETAT dari isInHoshiCustody — dan tidak pernah lebih longgar', () => {
+      // Kalau suatu saat yang ini melonggar sampai menerima sesuatu yang ditolak
+      // `isInHoshiCustody`, artinya ada kartu yang boleh ditagihkan tapi tidak dalam pengawasan.
+      for (const status of Object.values(ConsignmentStatus)) {
+        for (const accepted of [ACCEPTED, null]) {
+          for (const released of [RELEASED, null]) {
+            const row = facts({
+              status,
+              custodyAcceptedAt: accepted,
+              custodyReleasedAt: released,
+            });
+            if (isConsignmentSellableNow(row)) {
+              expect(isInHoshiCustody(row)).toBe(true);
+            }
+          }
+        }
+      }
+    });
+
+    it('SATU SUMBER: klaim settlement DITURUNKAN dari predikat ini, bukan disalin', () => {
+      // Kembar SQL-nya harus menjawab himpunan yang SAMA untuk tiap status. Kalau keduanya
+      // menyimpang lagi, inilah test yang merah lebih dulu — sebelum ada Rupiah yang bergerak.
+      const where = consignmentSaleClaimWhere('c-1');
+      for (const status of Object.values(ConsignmentStatus)) {
+        const row = facts({ status });
+        const sqlSaysYes =
+          where.status === status &&
+          row.custodyAcceptedAt !== null &&
+          row.custodyReleasedAt === null;
+        expect(sqlSaysYes).toBe(isConsignmentSellableNow(row));
+      }
+    });
+
+    it('FAKTA, BUKAN FLAG — sama seperti dua predikat custody lainnya', () => {
+      expect(isConsignmentSellableNow.length).toBe(1);
+    });
+  });
+
   describe('assertConsignmentSaleAvailable — gerbang SEBELUM uang bergerak', () => {
+    /* ══ CACAT 1: gerbang tagihan WAJIB menolak IN_CUSTODY + listing ACTIVE ══ */
+    it('MENOLAK titipan IN_CUSTODY (kartunya di rak, tapi tidak sedang dipajang) — SEBELUM satu Rupiah pun diminta', () => {
+      // Ini keadaan yang BISA NYATA: listing titipan yang di-CANCEL lalu di-`Activate` lewat rute
+      // admin umum, atau titipan yang ditarik dari pajangan sementara baris listing-nya
+      // tertinggal ACTIVE. Dulu gerbang ini MELOLOSKANNYA (`isInHoshiCustody` menerima
+      // IN_CUSTODY), dan klaim settlement pasti menolaknya — SESUDAH pembeli membayar.
+      try {
+        assertConsignmentSaleAvailable(
+          facts({ status: ConsignmentStatus.IN_CUSTODY }),
+          'listing-1',
+        );
+        throw new Error('seharusnya melempar');
+      } catch (err) {
+        const body = (err as { response: Record<string, unknown> }).response;
+        expect(body.code).toBe('CONSIGNMENT_NOT_IN_CUSTODY');
+        // NO_EFFECT adalah SELURUH gunanya penolakan ini: NOL Rupiah diambil, jadi tidak ada
+        // utang refund yang lahir dan tidak ada pekerjaan manual bagi siapa pun.
+        expect(body.stage).toBe('NO_EFFECT');
+        expect(body.listingId).toBe('listing-1');
+        expect(body.consignmentId).toBe('c-1');
+        // Pesannya menyebut sebab yang BENAR: kartunya ADA, cuma tidak sedang dijual. Menyuruh
+        // operator "mencatat serah-terima" untuk kartu yang sudah di raknya tidak bisa berhasil.
+        expect(String(body.message)).toContain('sedang tidak dijual');
+        expect(String(body.message)).toContain('tidak sedang dipajang');
+        expect(String(body.message)).toContain('tidak ada uang yang diambil');
+      }
+    });
+
+    it('MENOLAK titipan SOLD — kartunya sudah milik pembeli pertama', () => {
+      // Stempel custody-nya masih "diterima + belum dilepas" (kartunya memang masih di rak,
+      // menunggu dikirim), jadi yang menolaknya HANYA status.
+      expect(() =>
+        assertConsignmentSaleAvailable(
+          facts({ status: ConsignmentStatus.SOLD }),
+          'listing-1',
+        ),
+      ).toThrow();
+    });
+
     it('lolos diam-diam untuk kartu yang memang ada di rak', () => {
       expect(() =>
         assertConsignmentSaleAvailable(
@@ -238,8 +341,41 @@ describe('consignment.gate', () => {
         custodyAcceptedAt: { not: null },
         custodyReleasedAt: null,
         consignorId: { not: null },
-        listing: { is: null },
+        OR: [
+          { listing: { is: null } },
+          { listing: { is: { status: ListingStatus.CANCELLED } } },
+        ],
       });
+    });
+
+    /* ══ PAJANG ULANG: CANCELLED boleh dihidupkan, SOLD TIDAK PERNAH ══ */
+
+    it('list: baris listing yang sudah CANCELLED TIDAK mengunci kartunya selamanya', () => {
+      // Jalur normal yang dulu buntu: pemilik minta kartunya kembali → listing CANCELLED,
+      // titipan kembali IN_CUSTODY (kartunya MASIH di rak) → pemilik berubah pikiran. Dengan
+      // `listing: { is: null }` sebagai satu-satunya syarat, predikat ini cocok NOL baris
+      // SELAMANYA, karena `Listing.consignmentId` @unique dan baris CANCELLED itu memegang
+      // slotnya. Tidak ada rute relist lain di repo.
+      const or = listClaimWhere('c-1').OR as { listing: unknown }[];
+      expect(or).toContainEqual({
+        listing: { is: { status: ListingStatus.CANCELLED } },
+      });
+    });
+
+    it('list: HANYA CANCELLED — SOLD dan ACTIVE tidak boleh ikut terbawa', () => {
+      // SOLD berarti kartunya sudah MILIK PEMBELI. Menghidupkan barisnya kembali = menjual kartu
+      // yang sama kepada orang kedua, yaitu persis risiko yang seluruh fitur ini tutup. ACTIVE
+      // berarti tidak ada yang perlu dihidupkan, dan menimpanya diam-diam menyembunyikan keadaan
+      // yang justru harus diperiksa manusia.
+      const or = listClaimWhere('c-1').OR as { listing: unknown }[];
+      expect(or).toHaveLength(2);
+      const allowedStatuses = or
+        .map((b) => (b.listing as { is: { status?: string } | null }).is)
+        .filter((is): is is { status?: string } => is !== null)
+        .map((is) => is.status);
+      expect(allowedStatuses).toEqual([ListingStatus.CANCELLED]);
+      expect(allowedStatuses).not.toContain(ListingStatus.SOLD);
+      expect(allowedStatuses).not.toContain(ListingStatus.ACTIVE);
     });
 
     it('list: menuntut PEMILIKNYA TERTAUT — kartu di rak tanpa pemilik tidak boleh dipajang', () => {

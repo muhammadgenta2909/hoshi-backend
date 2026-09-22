@@ -554,9 +554,18 @@ describe('ConsignmentService', () => {
             status: ConsignmentStatus.IN_CUSTODY,
             custodyAcceptedAt: { not: null },
             custodyReleasedAt: null,
-            listing: { is: null },
+            // Belum punya listing, ATAU listing lamanya sudah CANCELLED (lihat blok
+            // "memajang ULANG" di bawah). Yang dijaga di sini: baris yang SUDAH punya listing
+            // hidup tetap tidak bisa lahir dua kali.
+            OR: [
+              { listing: { is: null } },
+              { listing: { is: { status: 'CANCELLED' } } },
+            ],
           }) as unknown,
-          data: { status: ConsignmentStatus.LISTED },
+          data: {
+            status: ConsignmentStatus.LISTED,
+            withdrawRequestedAt: null,
+          },
         }),
       );
       expect(prisma.$transaction).toHaveBeenCalledTimes(1);
@@ -611,6 +620,158 @@ describe('ConsignmentService', () => {
       expect(prisma.listing.create).not.toHaveBeenCalled();
       // Titipannya TETAP tercatat dan TETAP bisa ditarik — yang ditunda hanya pemajangannya.
       expect(prisma.consignment.updateMany).not.toHaveBeenCalled();
+    });
+  });
+
+  /* ═══════════ MEMAJANG ULANG: "BERUBAH PIKIRAN" BUKAN JALAN BUNTU ═══════════ */
+
+  /**
+   * ╔══════════════════════════════════════════════════════════════════════════════════════════╗
+   * ║ KEGAGALAN YANG DIUJI DI SINI: kartu titipan yang DITARIK DARI PAJANGAN terkunci           ║
+   * ║ SELAMANYA — tidak bisa dipajang lagi lewat rute mana pun di repo ini.                     ║
+   * ╚══════════════════════════════════════════════════════════════════════════════════════════╝
+   *
+   * Urutannya jalur NORMAL, bukan kasus tepi: pemilik menekan "minta kartu saya kembali" dari
+   * HP-nya → `takeDown` menurunkan Listing ke CANCELLED dan titipan kembali ke IN_CUSTODY
+   * (kartunya MASIH di rak, custody sengaja tidak dilepas) → pemilik berubah pikiran atau sadar
+   * salah pencet → admin menekan Pajang.
+   *
+   * Dulu langkah terakhir itu ditolak SELAMANYA (`if (c.listing) throw`), karena baris Listing
+   * CANCELLED masih memegang `consignmentId` yang `@unique`. Satu-satunya "pemulihan" adalah
+   * menyuruh pemiliknya menarik kartunya sungguhan lalu menitipkannya lagi dari nol — untuk
+   * sesuatu yang tidak pernah ia lakukan salah.
+   */
+  describe('createListingFor — memajang ULANG kartu yang pernah ditarik dari pajangan', () => {
+    const dto = { image: '/consign/front.jpg' };
+
+    /** Titipan yang kembali ke rak, dengan baris listing lamanya yang sudah DIBATALKAN. */
+    const withCancelledListing = (over: Record<string, unknown> = {}) =>
+      rowWith({
+        status: ConsignmentStatus.IN_CUSTODY,
+        withdrawRequestedAt: new Date('2026-09-05T00:00:00.000Z'),
+        listing: {
+          id: 'listing-1',
+          status: 'CANCELLED',
+          image: '/lama.png',
+          category: 'Consignment',
+          set: 'Base',
+        },
+        ...over,
+      });
+
+    it('BISA dipajang ulang: baris CANCELLED DIHIDUPKAN KEMBALI, bukan baris baru yang dibuat', async () => {
+      prisma.consignment.findUnique.mockResolvedValue(withCancelledListing());
+
+      await expect(
+        service.createListingFor(ID, dto, admin),
+      ).resolves.toBeDefined();
+
+      // `Listing.consignmentId` @unique → baris baru MUSTAHIL. Dan itu kebetulan yang benar:
+      // riwayat satu kartu titipan tinggal di SATU baris listing, jadi order/offer/activity lama
+      // yang menunjuk id itu tidak mendadak menunjuk kartu yang "lain".
+      expect(prisma.listing.create).not.toHaveBeenCalled();
+      expect(prisma.listing.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          // KLAIM ATOMIK: predikatnya menyebut CANCELLED, jadi baris yang sudah dihidupkan
+          // permintaan lain sedetik lalu cocok NOL baris. `consignmentId` menjaga baris milik
+          // titipan LAIN tidak bisa tersentuh.
+          where: {
+            id: 'listing-1',
+            consignmentId: ID,
+            status: 'CANCELLED',
+          },
+          data: expect.objectContaining({
+            status: 'ACTIVE',
+            priceIdrx: 1_000_000,
+            sellerId: consignor.id,
+            // Jejak pembeli dari kehidupan sebelumnya DIBERSIHKAN — kartu yang sedang tayang
+            // tidak boleh membawa nama pembeli yang tidak pernah membelinya.
+            buyerId: null,
+            soldAt: null,
+          }) as unknown,
+        }),
+      );
+      // Titipannya ikut kembali ke LISTED, di transaksi yang SAMA — DAN permintaan penarikannya
+      // dicabut. Kalau `withdrawRequestedAt` tertinggal, kartunya tayang di marketplace sambil
+      // duduk SELAMANYA di `actionRequired` admin sebagai "pemilik minta kartunya kembali" —
+      // peringatan yang tindakannya mustahil dari status LISTED, jadi tidak akan pernah hilang.
+      expect(prisma.consignment.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: {
+            status: ConsignmentStatus.LISTED,
+            withdrawRequestedAt: null,
+          },
+        }),
+      );
+      expect(prisma.$transaction).toHaveBeenCalledTimes(1);
+    });
+
+    it('listing yang sudah SOLD TIDAK PERNAH bisa dihidupkan lagi — kartunya milik pembeli', async () => {
+      // Ini batas yang tidak boleh punya celah. Menghidupkan baris SOLD berarti menjual kartu
+      // yang sama kepada orang KEDUA — persis risiko yang seluruh fitur titipan dibangun untuk
+      // menutupnya, dan kali ini dengan kartu yang sudah dibayar orang lain.
+      prisma.consignment.findUnique.mockResolvedValue(
+        withCancelledListing({
+          listing: { id: 'listing-1', status: 'SOLD' },
+        }),
+      );
+
+      await expect(service.createListingFor(ID, dto, admin)).rejects.toThrow(
+        ConflictException,
+      );
+      // NOL tulisan: tidak ada baris yang dibuat, tidak ada yang dihidupkan, status titipan
+      // tidak berubah.
+      expect(prisma.listing.create).not.toHaveBeenCalled();
+      expect(prisma.listing.updateMany).not.toHaveBeenCalled();
+      expect(prisma.consignment.updateMany).not.toHaveBeenCalled();
+    });
+
+    it('listing yang masih ACTIVE juga ditolak — tidak ada yang perlu dihidupkan', async () => {
+      // Menimpanya diam-diam akan menyembunyikan keadaan yang justru harus diperiksa manusia
+      // (titipan IN_CUSTODY dengan listing ACTIVE adalah keadaan yang membuat pembeli bisa
+      // membayar kartu yang mustahil di-settle — lihat `isConsignmentSellableNow`).
+      prisma.consignment.findUnique.mockResolvedValue(
+        withCancelledListing({
+          listing: { id: 'listing-1', status: 'ACTIVE' },
+        }),
+      );
+
+      await expect(service.createListingFor(ID, dto, admin)).rejects.toThrow(
+        ConflictException,
+      );
+      expect(prisma.listing.updateMany).not.toHaveBeenCalled();
+      expect(prisma.consignment.updateMany).not.toHaveBeenCalled();
+    });
+
+    it('KLAIM MENGHIDUPKAN yang KALAH membatalkan seluruhnya — tidak ada setengah keadaan', async () => {
+      // Baris listing-nya berubah di antara pembacaan dan penulisan (permintaan lain menghidupkan
+      // lebih dulu, atau kartunya terjual). Klaim atomiknya cocok 0 baris → melempar di dalam
+      // transaksi → klaim titipan IN_CUSTODY→LISTED yang sudah menang ikut ter-rollback.
+      prisma.consignment.findUnique.mockResolvedValue(withCancelledListing());
+      prisma.listing.updateMany.mockResolvedValue({ count: 0 });
+
+      await expect(
+        service.createListingFor(ID, dto, admin),
+      ).rejects.toMatchObject({
+        response: expect.objectContaining({
+          code: 'CONSIGNMENT_BAD_TRANSITION',
+        }) as unknown,
+      });
+    });
+
+    it('predikat klaim titipan MENERIMA baris yang listing-nya CANCELLED — di situlah kuncinya dibuka', async () => {
+      prisma.consignment.findUnique.mockResolvedValue(withCancelledListing());
+
+      await service.createListingFor(ID, dto, admin);
+
+      const where = (
+        prisma.consignment.updateMany.mock.calls[0] as [
+          { where: { OR?: unknown[] } },
+        ]
+      )[0].where;
+      expect(where.OR).toContainEqual({
+        listing: { is: { status: 'CANCELLED' } },
+      });
     });
   });
 

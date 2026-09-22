@@ -304,12 +304,30 @@ export class CreateConsignmentDto {
     description:
       'Komisi Hoshi dalam basis poin (500 = 5%). DI-SNAPSHOT di sini dan TIDAK PERNAH dibaca ' +
       'ulang dari env saat payout: perjanjian bertanda tangan berbunyi 5%, dan perubahan env ' +
-      'tidak boleh mengubah apa yang dijanjikan untuk kartu yang sudah di tangan kita.',
+      'tidak boleh mengubah apa yang dijanjikan untuk kartu yang sudah di tangan kita. ' +
+      'Plafonnya 3.000 bps (30%) — angka di atas itu bukan kesepakatan, melainkan salah ketik.',
   })
   @IsOptional()
   @IsInt()
   @Min(0)
-  @Max(10_000)
+  // ╔══════════════════════════════════════════════════════════════════════════════════════════╗
+  // ║ PLAFON BISNIS, BUKAN PLAFON MATEMATIS. 3.000 bps = 30%, bukan 10.000 bps = 100%.         ║
+  // ╚══════════════════════════════════════════════════════════════════════════════════════════╝
+  //
+  // Nilai ini DI-SNAPSHOT dan dipakai apa adanya oleh `fulfilConsignment` berbulan-bulan
+  // kemudian, saat kartunya terjual. Plafon lama (10.000 = 100%) sah secara aritmetika dan
+  // MUSTAHIL secara bisnis: komisi Hoshi 5%, dan satu nol kelebihan saat intake (500 → 5000,
+  // 1000 → 10000) tidak akan tertangkap oleh siapa pun sampai uang pembeli sudah mendarat.
+  //
+  // Menolaknya DI DEPAN — pada detik operator mengetiknya, saat pemilik kartu masih berdiri di
+  // depan meja dan angkanya masih bisa dibetulkan — jauh lebih murah daripada menolaknya di
+  // settlement (yang memang sekarang juga menolak; lihat `ConsignmentPayoutEmpty`), karena di
+  // sana ongkosnya adalah satu refund manual + satu penjualan yang batal.
+  //
+  // 30% dipilih SENGAJA longgar terhadap kesepakatan khusus (konsinyasi bernilai kecil, titipan
+  // yang butuh restorasi/grading ulang) dan tetap KETAT terhadap salah ketik satu nol: 5% dan
+  // 10% lolos, 50% dan 100% ditolak.
+  @Max(3_000)
   commissionBps?: number;
 
   @ApiPropertyOptional({

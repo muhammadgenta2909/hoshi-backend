@@ -827,3 +827,264 @@ describe('AdminGuard — the recovery route is admin-only', () => {
     ).toEqual({ role: 'ADMIN' });
   });
 });
+
+/**
+ * ╔══════════════════════════════════════════════════════════════════════════════════════════════╗
+ * ║ LAYAR /admin/listings TIDAK BOLEH BISA MENYENTUH KARTU TITIPAN — ditolak DI TITIK TULISNYA. ║
+ * ╚══════════════════════════════════════════════════════════════════════════════════════════════╝
+ *
+ * Ketiga aksi di bawah SAH untuk stok Hoshi dan MERUSAK untuk titipan, masing-masing dengan cara
+ * yang tidak terlihat di layar itu:
+ *
+ *   setListingStatus  Listing→CANCELLED tapi `Consignment` TETAP LISTED. Order yang sudah terbit
+ *                     tetap bisa dibayar, klaim settlement (`status: ACTIVE`) cocok NOL baris →
+ *                     pembeli membayar dan tidak menerima apa pun.
+ *   deleteListing     baris listing lenyap → `Consignment` LISTED dengan `listing = null`, dan
+ *                     SEMUA jalan keluarnya buntu. Kartu FISIK MILIK ORANG LAIN terkunci di rak.
+ *   updateListing     `priceIdrx` berubah, `Consignment.askPriceIdr` tidak, NOL ConsignmentEvent.
+ *                     Payout dihitung dari harga yang pembeli bayar → pemilik dikredit dari angka
+ *                     yang tidak pernah ia setujui.
+ *
+ * Menyembunyikan tombolnya di frontend TIDAK CUKUP: rutenya tetap bisa dipanggil langsung, dan
+ * dashboard yang menyimpang dari backend adalah dashboard yang salah lebih dulu.
+ */
+describe('AdminService — aksi listing yang MERUSAK kartu titipan ditolak di backend', () => {
+  const LISTING_ID = 'listing-titipan-1';
+  const CONSIGNMENT_ID = 'cons-1';
+
+  const make = (over: Record<string, unknown> = {}) => {
+    const prisma = {
+      listing: {
+        findUnique: jest.fn().mockResolvedValue({
+          id: LISTING_ID,
+          status: 'ACTIVE',
+          source: 'HOSHI',
+          sellerId: 'user-pemilik',
+          // SATU KOLOM yang menentukan jenisnya. Lihat `listing-kind.ts`.
+          consignmentId: CONSIGNMENT_ID,
+          ...over,
+        }),
+        update: jest.fn(),
+        delete: jest.fn(),
+      },
+    };
+    const service = new AdminService(
+      prisma as unknown as PrismaService,
+      {} as unknown as JwtService,
+      {} as unknown as ConfigService,
+      {} as unknown as MarketplaceService,
+      {} as unknown as EscrowService,
+    );
+    return { service, prisma };
+  };
+
+  /** Bentuk body error = kontrak dengan frontend (`body.code`, `body.stage`). */
+  const bodyOf = (err: unknown): Record<string, unknown> =>
+    (err as { getResponse: () => Record<string, unknown> }).getResponse();
+
+  it('setListingStatus MENOLAK baris titipan dan MENYEBUT rute yang benar', async () => {
+    const { service, prisma } = make();
+
+    const err = await service
+      .setListingStatus(LISTING_ID, 'CANCELLED')
+      .then(() => null)
+      .catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(ConflictException);
+    const body = bodyOf(err);
+    expect(body.code).toBe('CONSIGNMENT_UNSUPPORTED_ACTION');
+    // Pesan yang cuma berkata "tidak boleh" mengirim operator mengedit Postgres. Rutenya disebut.
+    expect(String(body.message)).toContain('/admin/titipan');
+    expect(String(body.message)).toContain(`/admin/consignments/${CONSIGNMENT_ID}/withdraw`);
+    expect(String(body.message)).toContain('/admin/consignments/:id/listing');
+    // NOL tulisan: penolakannya terbit SEBELUM apa pun bergerak.
+    expect(prisma.listing.update).not.toHaveBeenCalled();
+  });
+
+  it('deleteListing MENOLAK baris titipan — menghapusnya mengunci kartu orang lain di rak', async () => {
+    const { service, prisma } = make();
+
+    const err = await service
+      .deleteListing(LISTING_ID)
+      .then(() => null)
+      .catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(ConflictException);
+    const body = bodyOf(err);
+    expect(body.code).toBe('CONSIGNMENT_UNSUPPORTED_ACTION');
+    expect(String(body.message)).toContain('/admin/titipan');
+    expect(String(body.message)).toContain('/release');
+    expect(prisma.listing.delete).not.toHaveBeenCalled();
+  });
+
+  it('updateListing MENOLAK perubahan harga pada baris titipan dan menyebut rute harga titipan', async () => {
+    const { service, prisma } = make();
+
+    const err = await service
+      .updateListing(LISTING_ID, { price: 1_000 } as never)
+      .then(() => null)
+      .catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(ConflictException);
+    const body = bodyOf(err);
+    expect(body.code).toBe('CONSIGNMENT_UNSUPPORTED_ACTION');
+    expect(String(body.message)).toContain(
+      `/admin/consignments/${CONSIGNMENT_ID}/price`,
+    );
+    // Alasannya ikut disebut: harga kesepakatan + jejak audit, bukan sekadar "tidak boleh".
+    expect(String(body.message)).toContain('askPriceIdr');
+    expect(prisma.listing.update).not.toHaveBeenCalled();
+  });
+
+  it('updateListing menolak expectedValue dan buyback juga — KETIGA field ekonomi, bukan hanya price', async () => {
+    for (const dto of [{ expectedValue: 5 }, { buyback: 5 }]) {
+      const { service, prisma } = make();
+      const err = await service
+        .updateListing(LISTING_ID, dto as never)
+        .then(() => null)
+        .catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(ConflictException);
+      expect(prisma.listing.update).not.toHaveBeenCalled();
+    }
+  });
+
+  it('gerbangnya BER-FIELD, bukan ber-baris: edit non-ekonomi pada baris titipan tetap lewat', async () => {
+    // Yang dijaga adalah ANGKA yang menentukan berapa Rupiah berpindah. Mengunci seluruh baris
+    // akan menghilangkan satu-satunya cara memperbaiki nama/foto yang salah ketik saat intake.
+    const { service, prisma } = make();
+    prisma.listing.update.mockResolvedValue({ id: LISTING_ID });
+
+    await service.updateListing(LISTING_ID, { name: 'Charizard' } as never);
+
+    expect(prisma.listing.update).toHaveBeenCalled();
+  });
+
+  it('baris NON-titipan tidak terpengaruh sama sekali', async () => {
+    const { service, prisma } = make({ consignmentId: null, sellerId: null });
+    prisma.listing.update.mockResolvedValue({ id: LISTING_ID });
+
+    await service.setListingStatus(LISTING_ID, 'CANCELLED');
+    await service.updateListing(LISTING_ID, { price: 1_000 } as never);
+
+    expect(prisma.listing.update).toHaveBeenCalledTimes(2);
+  });
+});
+
+/**
+ * ╔══════════════════════════════════════════════════════════════════════════════════════════════╗
+ * ║ LAYAR ADMIN PENGIRIMAN HARUS BISA MENYEBUT KARTU SIAPA YANG SEDANG DIPEGANG OPERATOR.       ║
+ * ╚══════════════════════════════════════════════════════════════════════════════════════════════╝
+ *
+ * Backend SENGAJA menulis `source = 'CONSIGNMENT'` pada baris redemption supaya "operator perlu
+ * tahu kartu SIAPA yang dipegangnya". Di layar, nilai itu dulu jatuh ke peta label yang tidak
+ * punya kuncinya → React merender STRING KOSONG, dan baris yang paling perlu peringatan justru
+ * tampil paling polos. Sisi frontend-nya kini ditegakkan KOMPILATOR (peta labelnya
+ * `satisfies Record<RedemptionSource, …>` + helper yang menolak label kosong), jadi yang diuji di
+ * sini adalah sisi backend-nya: labelnya lewat APA ADANYA, dan barisnya membawa NAMA PEMILIKNYA.
+ *
+ * `source` adalah LABEL, bukan gerbang rail — jadi `consignment` di bawah dibaca dari
+ * `Listing.consignment` (FAKTA), bukan dari `source` (yang pada baris warisan bisa salah).
+ */
+describe('AdminService.listRedemptions — baris titipan membawa identitas pemiliknya', () => {
+  const REDEMPTION_ID = 'red-titipan-1';
+  const LISTING_ID = 'listing-titipan-1';
+
+  const make = (
+    redemption: Record<string, unknown>,
+    listingRows: Record<string, unknown>[],
+  ) => {
+    const prisma = {
+      cardRedemption: { findMany: jest.fn().mockResolvedValue([redemption]) },
+      paymentOrder: { findMany: jest.fn().mockResolvedValue([]) },
+      listing: { findMany: jest.fn().mockResolvedValue(listingRows) },
+    };
+    const service = new AdminService(
+      prisma as unknown as PrismaService,
+      {} as unknown as JwtService,
+      {} as unknown as ConfigService,
+      {} as unknown as MarketplaceService,
+      {} as unknown as EscrowService,
+    );
+    return { service, prisma };
+  };
+
+  const consignedListingRow = {
+    id: LISTING_ID,
+    consignment: {
+      id: 'cons-1',
+      status: 'SOLD',
+      consignorNameAtIntake: 'Budi Santoso',
+      askPriceIdr: 1_000_000,
+    },
+  };
+
+  const redemptionRow = {
+    id: REDEMPTION_ID,
+    listingId: LISTING_ID,
+    status: RedemptionStatus.PACKING,
+    source: 'CONSIGNMENT',
+  };
+
+  it("meneruskan source 'CONSIGNMENT' APA ADANYA — tidak diperhalus jadi 'HOSHI'", async () => {
+    const { service } = make(redemptionRow, [consignedListingRow]);
+
+    const [row] = await service.listRedemptions();
+
+    expect(row.source).toBe('CONSIGNMENT');
+  });
+
+  it('membawa id titipan + NAMA pemiliknya, supaya operator tahu slab siapa yang diambil dari rak', async () => {
+    const { service } = make(redemptionRow, [consignedListingRow]);
+
+    const [row] = await service.listRedemptions();
+
+    expect(row.consignment).toEqual({
+      id: 'cons-1',
+      status: 'SOLD',
+      // SNAPSHOT saat serah-terima — tetap benar meski nama akunnya berubah kemudian.
+      consignorName: 'Budi Santoso',
+      askPriceIdr: 1_000_000,
+    });
+  });
+
+  it('baris NON-titipan mengembalikan consignment: null (bukan undefined yang ambigu)', async () => {
+    const { service } = make(
+      { ...redemptionRow, source: 'HOSHI' },
+      // Query-nya berpredikat `consignmentId: { not: null }`, jadi baris stok Hoshi tidak ikut.
+      [],
+    );
+
+    const [row] = await service.listRedemptions();
+
+    expect(row.consignment).toBeNull();
+  });
+
+  it('SATU query untuk seluruh halaman, dan hanya untuk baris ber-listingId (bukan N+1)', async () => {
+    const { service, prisma } = make(redemptionRow, [consignedListingRow]);
+
+    await service.listRedemptions();
+
+    expect(prisma.listing.findMany).toHaveBeenCalledTimes(1);
+    const arg = (
+      prisma.listing.findMany.mock.calls[0] as [
+        { where: Record<string, unknown> },
+      ]
+    )[0];
+    expect(arg.where).toMatchObject({
+      id: { in: [LISTING_ID] },
+      consignmentId: { not: null },
+    });
+  });
+
+  it('baris rail CC (listingId null) tidak memicu query listing sama sekali', async () => {
+    const { service, prisma } = make(
+      { ...redemptionRow, listingId: null, source: 'PACK' },
+      [],
+    );
+
+    const [row] = await service.listRedemptions();
+
+    expect(prisma.listing.findMany).not.toHaveBeenCalled();
+    expect(row.consignment).toBeNull();
+  });
+});

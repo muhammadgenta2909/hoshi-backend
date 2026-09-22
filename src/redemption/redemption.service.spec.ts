@@ -465,3 +465,89 @@ describe('RedemptionService.cancel (B1)', () => {
     expect(foreign.prisma.cardRedemption.updateMany).not.toHaveBeenCalled();
   });
 });
+
+/**
+ * ╔══════════════════════════════════════════════════════════════════════════════════════════════╗
+ * ║ RESI HARUS SAMPAI KE PEMBELI — `GET /redemptions/me` yang membawanya.                       ║
+ * ╚══════════════════════════════════════════════════════════════════════════════════════════════╝
+ *
+ * Bug-nya BUKAN di database dan BUKAN di frontend. Admin mengisi resi dan menandai SHIPPED; resinya
+ * TERSIMPAN di kolom `trackingIds`. Frontend `/withdraw` dan `/withdraw/history` SUDAH merender
+ * baris "Resi: …". Yang putus ada di tengah: `CardRedemptionDto` tidak membawa kolom itu, jadi
+ * nilainya selalu `undefined` dan barisnya tidak pernah muncul.
+ *
+ * Pada saat yang sama kartunya sudah hilang dari Vault (status SHIPPED). Jadi sesudah membayar dua
+ * kali — kartu + ongkir — pembeli melihat kartunya lenyap dan tidak punya SATU PUN cara melacak
+ * paketnya. (Sisi Vault-nya ditutup terpisah: `SHIPPED` tidak lagi menyembunyikan kartu.)
+ *
+ * KEDUANYA KOLOM BIASA di baris `CardRedemption` — BUKAN hasil panggilan ke CollectorCrypt. Jadi
+ * `listMine` TIDAK BOLEH menuntut sesi CC, token, header, atau flag apa pun untuk mengembalikannya.
+ */
+describe('RedemptionService.listMine — resi ikut terbawa (kolom biasa, bukan panggilan CC)', () => {
+  const USER_ID = 'user-1';
+
+  const row = (over: Record<string, unknown> = {}) => ({
+    id: 'red-1',
+    userId: USER_ID,
+    nftAddress: 'hoshi-listing:listing-1',
+    listingId: 'listing-1',
+    cardName: 'Charizard',
+    cardImage: null,
+    cardSet: 'Base',
+    recipientName: 'Budi',
+    city: 'Jakarta',
+    country: 'ID',
+    status: RedemptionStatus.SHIPPED,
+    trackingIds: ['JNE-0012345678'],
+    trackingUrls: ['https://jne.co.id/track/JNE-0012345678'],
+    createdAt: new Date('2026-09-20T00:00:00.000Z'),
+    ...over,
+  });
+
+  const make = (rows: Record<string, unknown>[]) => {
+    const prisma = {
+      cardRedemption: { findMany: jest.fn().mockResolvedValue(rows) },
+    };
+    const ccShipping = {};
+    const service = new RedemptionService(
+      prisma as unknown as PrismaService,
+      // Stub KOSONG dengan sengaja: kalau jalur ini diam-diam mulai memanggil CollectorCrypt,
+      // test ini meledak keras alih-alih lulus sambil menyeret rail yang salah.
+      ccShipping as unknown as CcShippingService,
+      {} as unknown as PaymentsService,
+    );
+    return { service, prisma };
+  };
+
+  it('membawa trackingIds dan trackingUrls APA ADANYA dari baris', async () => {
+    const { service } = make([row()]);
+
+    const [out] = await service.listMine(USER_ID);
+
+    expect(out.trackingIds).toEqual(['JNE-0012345678']);
+    expect(out.trackingUrls).toEqual([
+      'https://jne.co.id/track/JNE-0012345678',
+    ]);
+  });
+
+  it('baris tanpa resi mengembalikan array KOSONG, bukan undefined', async () => {
+    // Array kosong adalah jawaban yang jujur ("resinya memang belum ada"); `undefined` tidak bisa
+    // dibedakan dari "field-nya hilang lagi" dan itulah bug yang sedang ditutup.
+    const { service } = make([row({ trackingIds: [], trackingUrls: [] })]);
+
+    const [out] = await service.listMine(USER_ID);
+
+    expect(out.trackingIds).toEqual([]);
+    expect(out.trackingUrls).toEqual([]);
+  });
+
+  it('nol panggilan CollectorCrypt dan nol header sesi yang dituntut', async () => {
+    const { service, prisma } = make([row()]);
+
+    await service.listMine(USER_ID);
+
+    // Satu query, ke tabelnya sendiri. Tidak ada argumen kredensial di tanda tangan `listMine`.
+    expect(prisma.cardRedemption.findMany).toHaveBeenCalledTimes(1);
+    expect(service.listMine.length).toBe(1);
+  });
+});

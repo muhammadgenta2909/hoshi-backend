@@ -59,6 +59,26 @@ export type CardRedemptionDto = {
   city: string;
   country: string;
   status: RedemptionStatus;
+  /**
+   * ╔════════════════════════════════════════════════════════════════════════════════════════╗
+   * ║ RESI — SATU-SATUNYA cara pembeli bisa melihat paketnya sesudah kartunya keluar Vault.  ║
+   * ╚════════════════════════════════════════════════════════════════════════════════════════╝
+   *
+   * KOLOM BIASA di baris `CardRedemption`, dibaca APA ADANYA — BUKAN hasil panggilan ke
+   * CollectorCrypt, jadi ia tidak menuntut sesi CC, token, header, maupun flag apa pun.
+   *
+   *   RAIL DOMESTIK  diisi ADMIN saat menandai SHIPPED (PATCH /admin/redemptions/:id).
+   *   RAIL CC        diisi poll shipment CC (`refreshStatus`).
+   *
+   * Dulu kolom ini ADA di database dan TIDAK PERNAH dibawa DTO ini, jadi `GET /redemptions/me`
+   * selalu mengembalikannya undefined sementara frontend sudah siap merender baris "Resi: …".
+   * Akibatnya: pembeli membayar dua kali (kartu + ongkir), kartunya hilang dari Vault begitu
+   * berstatus SHIPPED, dan ia tidak punya satu pun cara melacak paketnya. Array KOSONG =
+   * resinya memang belum ada; itu jawaban yang jujur, bukan ketiadaan data.
+   */
+  trackingIds: string[];
+  /** Link lacak, sejajar indeksnya dengan `trackingIds`. Kosong = kurirnya tak punya link. */
+  trackingUrls: string[];
   createdAt: Date;
 };
 
@@ -207,6 +227,10 @@ function toDto(r: CardRedemption): CardRedemptionDto {
     city: r.city,
     country: r.country,
     status: r.status,
+    // Dibaca LANGSUNG dari baris. `?? []` menjaga pemanggil test/legacy yang mengoper objek
+    // parsial tanpa kedua kolom ini — di database keduanya `String[]` yang default kosong.
+    trackingIds: r.trackingIds ?? [],
+    trackingUrls: r.trackingUrls ?? [],
     createdAt: r.createdAt,
   };
 }
