@@ -14,7 +14,11 @@ import {
   MaxLength,
   Min,
   MinLength,
+  Validate,
   ValidateNested,
+  ValidatorConstraint,
+  type ValidationArguments,
+  type ValidatorConstraintInterface,
 } from 'class-validator';
 import { Type } from 'class-transformer';
 import {
@@ -28,10 +32,78 @@ const IDR_MAX = 2_000_000_000;
 /** Panjang minimal catatan manusia yang WAJIB beralasan (sejalan dengan OPERATOR_NOTE_MIN admin). */
 const NOTE_MIN = 10;
 
+/* ══════════════════════════════════════════════════════════════════════════════════════════════
+   RUJUKAN GAMBAR — KENAPA INI BUKAN @MaxLength(2000)
+
+   Versi pertama DTO ini memakai `@MaxLength(2000)` untuk `url` foto dan `image` listing. Angka
+   2000 masuk akal untuk sebuah URL, dan justru itu masalahnya: di lingkungan ini, yang dikirim
+   belum tentu URL.
+
+   Rute unggah gambar punya FALLBACK YANG DISENGAJA. Kalau `CLOUDINARY_URL` tidak terpasang,
+   `POST /admin/upload` di produksi mengembalikan DATA URL base64 (admin.service.ts, dibatasi 2MB
+   per gambar) supaya unggahan tetap jalan tanpa kredensial apa pun. Gambar 2MB menjadi ~2,7 juta
+   karakter base64 — 1350 kali di atas batas 2000.
+
+   Akibat nyatanya bukan "validasi ketat", melainkan INTAKE YANG MATI DI LAPANGAN: operator berdiri
+   di ruang tamu pemilik kartu, memotret kartunya, lalu menerima 400 "url must be shorter than or
+   equal to 2000 characters" dan TIDAK BISA mencatat serah-terimanya sama sekali. Kartunya tidak
+   pernah sampai ke rak.
+
+   YANG MEMBUATNYA PALING SULIT DIDIAGNOSIS: seluruh sisa sistem memang dibangun untuk menampung
+   data URL. `main.ts` menaikkan batas body ke 12mb dengan komentar yang menyebut fallback ini, dan
+   `CreateListingDto.image` (jalur listing Hoshi biasa) sama sekali TIDAK punya `@MaxLength`. Jadi
+   di droplet tanpa Cloudinary, listing Hoshi tetap jalan dan HANYA titipan yang tumbang — persis
+   pola kegagalan yang paling lama dikira "bug titipan" padahal soal lingkungan.
+
+   Karena itu batasnya dua cabang, bukan dibuang:
+     • `data:image/...`  → panjangnya dijaga DUA pagar yang sudah ada: guard 2MB di rute unggah dan
+                           limit body 12mb. Menambah pagar ketiga di sini hanya melahirkan angka
+                           keempat yang bisa berbeda sendiri.
+     • selain itu        → tetap maksimum 2000 karakter, seperti URL yang waras.
+
+   `data:` non-gambar (mis. `data:text/html`) DITOLAK: nilai ini berakhir di atribut `src`, dan
+   satu-satunya alasan ia boleh panjang adalah karena ia gambar.
+   ══════════════════════════════════════════════════════════════════════════════════════════════ */
+
+const IMAGE_REF_URL_MAX = 2000;
+
+function isImageRef(v: unknown): boolean {
+  if (typeof v !== 'string' || v.length === 0) return false;
+  // Setiap `data:` diadili sebagai data URL, TIDAK PERNAH jatuh ke cabang panjang di bawah.
+  // Kalau tidak, `data:text/html;base64,…` yang pendek lolos hanya karena ia pendek — dan
+  // panjang bukan alasan sesuatu boleh masuk ke atribut `src`.
+  if (v.startsWith('data:')) return v.startsWith('data:image/');
+  return v.length <= IMAGE_REF_URL_MAX;
+}
+
+const IMAGE_REF_MESSAGE =
+  `harus berupa URL (maks ${IMAGE_REF_URL_MAX} karakter) atau data URL gambar ` +
+  '(diawali "data:image/"; panjangnya dijaga batas unggah 2MB dan limit body server)';
+
+/** Dipakai untuk setiap field yang menampung rujukan gambar di jalur titipan. Lihat blok di atas. */
+function IsImageRef(): PropertyDecorator {
+  return Validate(ImageRefConstraint);
+}
+
+@ValidatorConstraint({ name: 'isImageRef', async: false })
+class ImageRefConstraint implements ValidatorConstraintInterface {
+  validate(value: unknown): boolean {
+    return isImageRef(value);
+  }
+  defaultMessage(args: ValidationArguments): string {
+    return `${args.property} ${IMAGE_REF_MESSAGE}`;
+  }
+}
+
 export class ConsignmentPhotoInput {
-  @ApiProperty({ example: 'https://cdn.hoshi/intake/abc-front.jpg' })
+  @ApiProperty({
+    example: 'https://cdn.hoshi/intake/abc-front.jpg',
+    description:
+      'URL gambar, ATAU data URL base64 (yang dikembalikan rute unggah kalau CLOUDINARY_URL ' +
+      'tidak terpasang). Lihat blok RUJUKAN GAMBAR di kepala berkas ini.',
+  })
   @IsString()
-  @MaxLength(2000)
+  @IsImageRef()
   url!: string;
 
   @ApiProperty({ enum: ConsignmentPhotoKind })
@@ -292,15 +364,19 @@ export class AcceptCustodyDto {
  * `Listing` tapi tidak dicatat saat intake (rarity/era/element/category/gambar) diisi di sini.
  */
 export class CreateConsignmentListingDto {
-  @ApiProperty({ example: '/uploads/consign/abc-front.jpg' })
+  @ApiProperty({
+    example: '/uploads/consign/abc-front.jpg',
+    description:
+      'URL gambar, ATAU data URL base64 — sama dengan foto intake. Lihat blok RUJUKAN GAMBAR.',
+  })
   @IsString()
-  @MaxLength(2000)
+  @IsImageRef()
   image!: string;
 
   @ApiPropertyOptional()
   @IsOptional()
   @IsString()
-  @MaxLength(2000)
+  @IsImageRef()
   imageBack?: string;
 
   @ApiPropertyOptional({
