@@ -840,7 +840,27 @@ export class PaymentsService {
       networkChainId: this.requiredConfig('IDRX_NETWORK_CHAIN_ID'),
       returnUrl: listingReturnUrl,
       expiryPeriod: expiryMinutes,
-      productDetails: `Hoshi CC ${listing.name}`.slice(0, 255),
+      /* ── KALIMAT YANG DIBACA PEMBELI SAMBIL MEMASUKKAN PIN ────────────────────────────────
+         Dulu baris ini selalu berbunyi "Hoshi CC …", peninggalan dari masa satu-satunya kartu
+         yang bisa dibeli memang milik CollectorCrypt. Sekarang tidak: kartu TITIPAN adalah milik
+         seorang kolektor Indonesia yang fisiknya ada di rak Hoshi, dan tidak punya hubungan apa
+         pun dengan CollectorCrypt.
+
+         Ini bukan sekadar label yang kurang rapi. Keterangan inilah satu-satunya kalimat yang
+         pembeli baca di halaman pembayaran, dan ia IKUT TERCETAK di mutasi rekening/e-wallet-nya
+         — jadi ia bertahan jauh setelah transaksinya selesai. Di skema titipan, yang sedang
+         dijual Hoshi adalah kepercayaan; menyebut barang orang lain dengan nama pihak ketiga
+         yang tidak terlibat merusak persis itu.
+
+         Dibaca dari `kind` yang SUDAH dihitung di atas dari KOLOM (`listingKindOf`), bukan
+         ditebak ulang dari bentuk barisnya. */
+      productDetails: `Hoshi ${
+        kind === 'CONSIGNMENT'
+          ? 'Titipan'
+          : kind === 'HOSHI_STOCK'
+            ? 'Stok'
+            : 'CC'
+      } ${listing.name}`.slice(0, 255),
       // HOSTED (paymentMethod/channelId dikosongkan) → halaman Duitku penuh (QRIS+e-wallet+VA).
     });
     const data = mint.data;

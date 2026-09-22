@@ -3450,6 +3450,46 @@ describe('ConsignmentService', () => {
       expect(allEventNotes()[0]).toMatch(/reserve Rp 20000000/);
     });
 
+    /* ══════════════════════════════════════════════════════════════════════════════════════
+       MENURUNKAN HARGA TIDAK BOLEH MENGARANG RIWAYAT PASAR.
+
+       `createListingFor` menyamakan `expectedValueIdrx` dengan harga saat kartu pertama
+       dipajang — memang tidak ada taksiran pasar independen untuk kartu titipan; yang kita
+       punya hanya harga yang disepakati.
+
+       Kalau `updatePrice` hanya menurunkan `priceIdrx`, keduanya berpisah, dan serializer
+       marketplace MENGARANG riwayat dari selisih itu: panah merah "-40% 30D" untuk kartu yang
+       tidak pernah diperdagangkan sekali pun, plus lompatan ke puncak sortir "Best Value"
+       semata-mata karena harganya pernah diturunkan. Kartu orang lain tidak boleh diberi
+       riwayat pasar palsu demi tampak menarik.
+       ══════════════════════════════════════════════════════════════════════════════════════ */
+    it('menurunkan harga ikut menurunkan taksiran — tidak ada "-40% 30D" yang dikarang', async () => {
+      prisma.consignment.findUnique.mockResolvedValue(
+        rowWith({
+          askPriceIdr: 20_000_000,
+          listing: { id: 'listing-1', status: 'ACTIVE' },
+        }),
+      );
+
+      await service.updatePrice(
+        ID,
+        {
+          askPriceIdr: 12_000_000,
+          note: 'Pemilik minta turun; sudah disetujui lewat telepon.',
+        },
+        admin,
+      );
+
+      expect(prisma.listing.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: {
+            priceIdrx: 12_000_000,
+            expectedValueIdrx: 12_000_000,
+          },
+        }),
+      );
+    });
+
     it('di ATAS reserve: tidak ada peringatan sama sekali', async () => {
       prisma.consignment.findUnique.mockResolvedValue(
         rowWith({ reservePriceIdr: 20_000_000 }),

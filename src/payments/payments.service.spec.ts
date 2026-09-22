@@ -1920,6 +1920,34 @@ describe('PaymentsService', () => {
       expect(prisma.paymentOrder.create).not.toHaveBeenCalled();
     });
 
+    /* ══════════════════════════════════════════════════════════════════════════════════════
+       KETERANGAN YANG DIBACA PEMBELI SAMBIL MEMASUKKAN PIN.
+
+       `productDetails` dulu selalu berbunyi "Hoshi CC …", peninggalan dari masa satu-satunya
+       kartu yang bisa dibeli memang milik CollectorCrypt. Kartu TITIPAN tidak punya hubungan
+       apa pun dengan mereka: ia milik seorang kolektor Indonesia, fisiknya di rak Hoshi.
+
+       Ini bukan label yang sekadar kurang rapi. Kalimat ini satu-satunya yang pembeli baca di
+       halaman pembayaran, dan ia IKUT TERCETAK di mutasi rekening/e-wallet-nya — jadi ia
+       bertahan jauh sesudah transaksinya selesai. Di skema titipan, yang dijual Hoshi adalah
+       kepercayaan.
+       ══════════════════════════════════════════════════════════════════════════════════════ */
+    it('createListingOrder: keterangan pembayaran menyebut "Titipan", BUKAN "CC"', async () => {
+      prisma.listing.findUnique.mockResolvedValue(consignedListing);
+      prisma.consignment.findUnique.mockResolvedValue(liveConsignment);
+
+      await service.createListingOrder(consignedListing.id, user);
+
+      expect(idrx.mintRequest).toHaveBeenCalledTimes(1);
+      const arg = idrx.mintRequest.mock.calls[0][0] as {
+        productDetails: string;
+      };
+      expect(arg.productDetails).toContain('Titipan');
+      expect(arg.productDetails).toContain(consignedListing.name);
+      // Yang benar-benar dijaga: nama pihak ketiga yang tidak terlibat tidak boleh muncul.
+      expect(arg.productDetails).not.toContain('CC');
+    });
+
     it('fulfilConsignment: pembacaan kustodi memakai predikat yang SAMA — IN_CUSTODY tidak pernah menyentuh klaim SOLD', async () => {
       // Pagar kedua untuk cacat yang sama, di sisi settlement. Kalau pembacaan di sini lebih
       // longgar dari klaimnya, urutannya jadi: klaim listing ACTIVE→SOLD MENANG lebih dulu, lalu

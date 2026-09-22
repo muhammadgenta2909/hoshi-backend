@@ -1413,9 +1413,27 @@ export class ConsignmentService {
         // Harga listing hanya diubah selama ia masih ACTIVE. Kalau sudah SOLD, basis payout
         // memang bukan harga listing melainkan yang BENAR-BENAR dibayar pembeli — lihat
         // `fulfilConsignment`.
+        /* ── `expectedValueIdrx` IKUT DIUBAH, DAN INI BUKAN KERAPIAN ──────────────────────────
+           `createListingFor` menyamakan keduanya saat kartu titipan pertama kali dipajang
+           (`expectedValueIdrx: dto.expectedValueIdrx ?? price`) — memang tidak ada taksiran
+           pasar independen untuk kartu titipan; yang kita punya hanya harga yang disepakati.
+
+           Kalau hanya `priceIdrx` yang turun, keduanya berpisah, dan serializer marketplace
+           MENGARANG riwayat dari selisih itu: `readPriceHistory(null, [expectedValue, price])`
+           menghasilkan "-40% 30D" lengkap dengan panah merah untuk kartu yang TIDAK PERNAH
+           diperdagangkan sekali pun dan tidak punya riwayat 30 hari apa pun. Sortir "Best Value"
+           ikut terbawa: kartu itu melompat ke puncak daftar penawaran terbaik semata-mata karena
+           harganya pernah diturunkan.
+
+           Kartu orang lain tidak boleh diberi riwayat pasar palsu demi tampak menarik. Kalau
+           suatu saat taksiran pasar sungguhan memang ada, ia harus masuk sebagai field tersendiri
+           yang DIISI MANUSIA — bukan sebagai sisa dari harga yang lupa ikut berubah. */
         await tx.listing.updateMany({
           where: { id: c.listing.id, status: ListingStatus.ACTIVE },
-          data: { priceIdrx: dto.askPriceIdr },
+          data: {
+            priceIdrx: dto.askPriceIdr,
+            expectedValueIdrx: dto.askPriceIdr,
+          },
         });
       }
       await this.writeEvent(tx, {
