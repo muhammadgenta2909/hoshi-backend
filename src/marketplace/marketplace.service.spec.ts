@@ -1548,6 +1548,73 @@ describe('MarketplaceService', () => {
         const arg = prisma.listing.findMany.mock.calls[0][0];
         expect(arg.where.NOT).toBeUndefined();
       });
+    });
+
+    /* ══════════════════════════════════════════════════════════════════════════════════════
+       DERETAN "RELATED" DI HALAMAN DETAIL ADALAH ETALASE JUGA.
+
+       `list()` menyembunyikan listing user yang kartunya tidak pernah masuk escrow, karena
+       setiap Rupiah yang mendarat untuknya PASTI berakhir jadi refund manual. `detail()`
+       dulu menarik deretan "related"-nya tanpa klausa itu — jadi baris yang sengaja
+       disembunyikan dari feed justru dipajang di bawah halaman kartu lain, pembeli
+       mengkliknya, sampai di halaman yang tombol belinya aktif, dan ditolak server SESUDAH
+       ia menekannya.
+
+       Lubang seperti ini lahir dari MENYALIN syarat alih-alih memanggil helper yang sama.
+       Test di bawah menekan pada helper-nya, bukan pada bentuk objeknya saja.
+       ══════════════════════════════════════════════════════════════════════════════════════ */
+    describe('deretan "related" di halaman detail', () => {
+      const rowDetail = { ...userCard, id: 'listing-dilihat', offerRecords: [] };
+
+      it('ARMED: memakai penyaring yang SAMA dengan feed', async () => {
+        armP2p();
+        prisma.listing.findUnique.mockResolvedValue(rowDetail);
+        prisma.listing.findMany.mockResolvedValue([]);
+
+        await service.detail('listing-dilihat');
+
+        expect(prisma.listing.findMany).toHaveBeenCalledWith(
+          expect.objectContaining({
+            where: expect.objectContaining({
+              status: ListingStatus.ACTIVE,
+              id: { not: 'listing-dilihat' },
+              NOT: {
+                sellerId: { not: null },
+                consignmentId: null,
+                OR: [{ ccNftAddress: null }, { escrowedAt: null }],
+              },
+            }),
+          }),
+        );
+      });
+
+      /* Yang benar-benar dijaga: feed dan related tidak boleh MENJAWAB BERBEDA. Kalau suatu
+         saat predikatnya berubah, test ini ikut merah tanpa perlu diperbarui — ia
+         membandingkan keduanya, bukan mencocokkan salinan bentuk yang ditulis tangan. */
+      it('ARMED: klausa NOT-nya identik dengan yang dipakai feed', async () => {
+        armP2p();
+        prisma.listing.findMany.mockResolvedValue([]);
+        await service.list({});
+        const notFeed = prisma.listing.findMany.mock.calls[0][0].where.NOT;
+
+        prisma.listing.findMany.mockClear();
+        prisma.listing.findUnique.mockResolvedValue(rowDetail);
+        await service.detail('listing-dilihat');
+        const notRelated = prisma.listing.findMany.mock.calls[0][0].where.NOT;
+
+        expect(notRelated).toEqual(notFeed);
+      });
+
+      it('UNARMED: related TIDAK difilter — perilaku lama tidak berubah', async () => {
+        prisma.listing.findUnique.mockResolvedValue(rowDetail);
+        prisma.listing.findMany.mockResolvedValue([]);
+
+        await service.detail('listing-dilihat');
+
+        const arg = prisma.listing.findMany.mock.calls[0][0];
+        expect(arg.where.NOT).toBeUndefined();
+        expect(arg.where.id).toEqual({ not: 'listing-dilihat' });
+      });
 
       it('ARMED: DTO menandai listing tanpa escrow needsEscrowDeposit=true (pemilik disuruh relist)', async () => {
         armP2p();

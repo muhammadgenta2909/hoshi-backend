@@ -317,8 +317,25 @@ export class MarketplaceService {
       include: { nft: true, offerRecords: { orderBy: { createdAt: 'desc' } } },
     });
     if (!row) throw new NotFoundException('Listing not found.');
+    /* ── DERETAN "RELATED" ADALAH ETALASE JUGA, JADI IA MEMAKAI PENYARING YANG SAMA ──────────
+       Sebelumnya blok ini menarik baris ACTIVE apa adanya, tanpa klausa NOT yang dipasang
+       `list()` saat P2P ARMED. Akibatnya deretan di bawah halaman detail menampilkan justru
+       baris yang SENGAJA disembunyikan dari feed: listing user yang kartunya tidak pernah masuk
+       escrow. Pembeli mengkliknya, sampai di halaman yang tombol belinya aktif, lalu ditolak
+       server SESUDAH ia menekannya — padahal seluruh alasan baris itu disembunyikan adalah
+       supaya tidak ada yang pernah sampai ke sana.
+
+       Satu predikat, dua permukaan. Kalau `list()` berubah, blok ini ikut berubah karena
+       keduanya memanggil helper yang sama — menyalin syaratnya ke sini akan melahirkan
+       etalase kedua yang perlahan berbeda dari yang pertama. */
+    const relatedWhere: Prisma.ListingWhereInput = {
+      status: ListingStatus.ACTIVE,
+      id: { not: id },
+    };
+    if (this.p2pMode() === 'ARMED')
+      relatedWhere.NOT = unescrowedUserListingWhere();
     const related = await this.prisma.listing.findMany({
-      where: { status: ListingStatus.ACTIVE, id: { not: id } },
+      where: relatedWhere,
       include: { nft: true },
       orderBy: { listedAt: 'desc' },
       take: 4,
