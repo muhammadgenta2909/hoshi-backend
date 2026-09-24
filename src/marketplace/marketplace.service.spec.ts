@@ -556,7 +556,55 @@ describe('MarketplaceService', () => {
       expect(prisma.listing.create).not.toHaveBeenCalled();
     });
 
-    it('refuses a grader outside PSA/CGC/BGS instead of rounding it to the nearest one', async () => {
+    // Kartu ber-grading TAG (Technical Authentication & Grading) — grader KEDUA yang sungguh
+    // beredar di pasar Indonesia menurut pemilik produk. Sebelum enum `Grader` memuat TAG, slab
+    // seperti ini ikut tertolak bersama SGC di test berikutnya. Test ini memaku sisi POSITIF dari
+    // perubahan itu: daftarnya bertambah, dan yang masuk daftar benar-benar tersimpan APA ADANYA
+    // (bukan dibulatkan ke PSA).
+    it('accepts TAG — a grader that IS in the enum — and stores it verbatim', async () => {
+      prisma.ccPackPurchase.findFirst.mockResolvedValue({
+        nftAddress: 'CCAsset123',
+        status: CcPackStatus.OPENED,
+      });
+      prisma.listing.findUnique.mockResolvedValue(null);
+      prisma.listing.create.mockResolvedValue(listing);
+      ccFacts.ensureFacts.mockResolvedValue({
+        itemName: '2001 #16 Zubat TAG 9 Neo Destiny',
+        gradeCompany: 'TAG',
+        gradeScore: 9,
+        gradeLabel: 'MINT 9',
+        gradeCert: 'A1234567',
+        set: 'Neo Destiny',
+        category: 'Pokemon',
+        language: 'English',
+        year: 2001,
+        vault: 'OmniVault',
+        serial: '16/105',
+      });
+
+      // Klien tetap mengirim "PSA 9" lewat `fromPackDto` — jawaban CC yang harus menang.
+      await service.create(fromPackDto, puller);
+
+      expect(prisma.listing.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          // `as unknown` = idiom berkas ini untuk membungkam `no-unsafe-assignment`
+          // pada matcher jest yang bertipe `any` (lihat pemakaian yang sama di bawah).
+          data: expect.objectContaining({
+            grade: 'TAG 9',
+            grader: Grader.TAG,
+            gradeScore: 9,
+            certificate: 'A1234567',
+          }) as unknown,
+        }),
+      );
+    });
+
+    // PAGAR INI TIDAK BOLEH MELEMAH SAAT DAFTARNYA BERTAMBAH. Menambahkan TAG ke enum menambah
+    // SATU nama ke daftar yang diterima — ia TIDAK mengubah aturannya: grader di luar daftar
+    // tetap DITOLAK, bukan dibulatkan ke tetangga terdekat. SGC dipakai di sini justru karena ia
+    // grader SUNGGUHAN yang (masih) di luar enum: slab SGC yang dilabeli PSA adalah kebohongan
+    // yang persis sama dengan default karangan "PSA 10".
+    it('refuses a grader outside the Grader enum instead of rounding it to the nearest one', async () => {
       prisma.ccPackPurchase.findFirst.mockResolvedValue({
         nftAddress: 'CCAsset123',
         status: CcPackStatus.OPENED,

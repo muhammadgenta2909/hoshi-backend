@@ -41,13 +41,17 @@ const trimmed = (v: string | null | undefined): string | null => {
 
 /**
  * gradingCompany CC → enum `Grader` kita. null = perusahaan grading di luar
- * PSA/CGC/Beckett (mis. SGC): JANGAN dipaksa masuk ke salah satu enum — memberi
- * label "PSA" pada slab SGC adalah data palsu, bukan pembulatan.
+ * PSA/TAG/CGC/Beckett (mis. SGC): JANGAN dipaksa masuk ke salah satu enum —
+ * memberi label "PSA" pada slab SGC adalah data palsu, bukan pembulatan.
  */
 export function mapGrader(company: string | null | undefined): Grader | null {
   switch ((company ?? '').trim().toUpperCase()) {
     case 'PSA':
       return Grader.PSA;
+    // TAG (Technical Authentication & Grading). Dipetakan sejak enum `Grader`
+    // memuatnya: sebelum itu slab TAG di katalog CC ikut ter-SKIP seperti SGC.
+    case 'TAG':
+      return Grader.TAG;
     case 'CGC':
       return Grader.CGC;
     case 'BECKETT':

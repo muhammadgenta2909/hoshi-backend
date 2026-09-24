@@ -1,0 +1,64 @@
+-- ╔══════════════════════════════════════════════════════════════════════════════════════════════╗
+-- ║ TAG masuk enum `Grader`, TEPAT SETELAH PSA.                                                 ║
+-- ╚══════════════════════════════════════════════════════════════════════════════════════════════╝
+--
+-- KENAPA: Hoshi menerima kartu fisik milik kolektor Indonesia (skema TITIPAN) dan mencatat apa
+-- yang tertera di slab-nya. Pemilik produk menyatakan kartu ber-grading di pasar ini praktis ada
+-- DUA: PSA dan TAG. Selama TAG tidak ada di enum, operator yang memegang slab TAG cuma punya dua
+-- pilihan — memilih grader yang SALAH, atau menandainya "mentah" (grader NULL). Dua-duanya
+-- menuliskan FAKTA PALSU tentang kartu MILIK ORANG LAIN ke buku besar yang sengaja append-only,
+-- dan yang kedua bahkan mengunci kartunya di rak (kartu tanpa grader ditolak `createListingFor`).
+--
+-- ── KENAPA `AFTER 'PSA'`, BUKAN sekadar append ──────────────────────────────────────────────
+-- Postgres mengurutkan nilai enum menurut `enumsortorder` di `pg_enum`, jadi `ORDER BY grader`
+-- dan setiap perbandingan `<`/`>` mengikuti posisi yang ditulis di sini — bukan abjad, bukan
+-- urutan penambahan. `AFTER 'PSA'` menempatkan TAG di sebelah PSA persis seperti yang diminta,
+-- dan itu juga urutan yang dideklarasikan `enum Grader` di schema.prisma. Keduanya harus tetap
+-- sama; menggeser salah satunya saja membuat urutan API berbeda dari urutan database.
+--
+-- ╔══════════════════════════════════════════════════════════════════════════════════════════════╗
+-- ║ APAKAH `ALTER TYPE ... ADD VALUE` AMAN DI DALAM TRANSAKSI? — INI PERTANYAAN HIDUP-MATI.     ║
+-- ╚══════════════════════════════════════════════════════════════════════════════════════════════╝
+--
+-- Di droplet produksi, migrasi DIRANTAI SEBELUM server dalam satu perintah container
+-- (`npm run prisma:deploy && node dist/main`, lihat Dockerfile). Satu migrasi gagal = container
+-- TIDAK PERNAH menyala = SELURUH api.hoshimarket.xyz mati — bukan sekadar rilisnya batal. Dan
+-- Prisma membungkus tiap berkas migrasi dalam SATU transaksi. Jadi pertanyaannya wajib dijawab,
+-- bukan ditebak.
+--
+--   (1) SEJAK PostgreSQL 12, bentuk ini SAH di dalam transaction block. Catatan rilis PG 12:
+--       "Previously, ALTER TYPE ... ADD VALUE could not be called in a transaction block, unless
+--        it was part of the same transaction that created the enumerated type. Now it can be
+--        called in a later transaction, so long as the new enumerated value is not referenced
+--        until after it is committed."
+--       (https://www.postgresql.org/docs/release/12.0/ — commit 212fab992)
+--
+--   (2) SYARAT SATU-SATUNYA yang tersisa: nilai barunya TIDAK BOLEH DIPAKAI sebelum transaksinya
+--       commit. Dokumentasi ALTER TYPE: "If ALTER TYPE ... ADD VALUE is executed inside a
+--       transaction block, the new value cannot be used until after the transaction has been
+--       committed." (https://www.postgresql.org/docs/current/sql-altertype.html)
+--       Migrasi ini MEMATUHINYA secara harfiah: ia HANYA menambah label. Tidak ada UPDATE/INSERT
+--       yang menulis 'TAG', tidak ada CHECK/DEFAULT/index yang menyebut 'TAG', tidak ada query
+--       yang membandingkannya. Itu sebabnya berkas ini sengaja berisi SATU pernyataan saja —
+--       menambahkan "sedikit" DML ber-'TAG' di bawahnya akan MEMATIKAN SITUS.
+--
+--   (3) BUKTI EMPIRIS DI DATABASE INI SENDIRI, bukan cuma di dokumentasi. Bentuk yang sama
+--       (ADD VALUE IF NOT EXISTS + penempatan BEFORE/AFTER) SUDAH pernah lewat `migrate deploy`
+--       di rantai yang sama:
+--         · 20260803000000_add_listing_pending_escrow →
+--             ALTER TYPE "ListingStatus" ADD VALUE IF NOT EXISTS 'PENDING_ESCROW' BEFORE 'ACTIVE';
+--         · 20260820000000_redemption_real_shipping → SEPULUH ADD VALUE IF NOT EXISTS sekaligus.
+--       Keduanya hidup di produksi. Jadi versi Postgres yang dipakai Hoshi sudah terbukti ≥ 12.
+--
+--   (4) `IF NOT EXISTS` = IDEMPOTEN. Kalau 'TAG' ternyata sudah ada (mis. migrasi ini sempat
+--       separuh jalan, atau dijalankan ulang di database yang sudah ter-patch manual), Postgres
+--       hanya menerbitkan NOTICE dan melanjutkan — BUKAN error. Tanpa ini, satu percobaan ulang
+--       akan menjatuhkan container. Catat konsekuensinya: kalau 'TAG' sudah ada di posisi LAIN,
+--       klausa `AFTER 'PSA'` DIABAIKAN diam-diam (nilainya tidak dipindahkan) — urutan yang
+--       terlanjur salah harus dibetulkan lewat migrasi tersendiri, bukan dengan menunggu ini.
+--
+-- CATATAN KINERJA (kecil, tapi supaya tidak mengejutkan nanti): dokumentasi Postgres menyebut
+-- perbandingan yang melibatkan nilai enum yang disisipkan di TENGAH daftar (lewat BEFORE/AFTER)
+-- kadang lebih lambat daripada yang disisipkan di ujung. Pada tabel sebesar ini efeknya tidak
+-- terukur, dan urutan yang BENAR di UI lebih berharga daripada mikrodetik itu.
+ALTER TYPE "Grader" ADD VALUE IF NOT EXISTS 'TAG' AFTER 'PSA';

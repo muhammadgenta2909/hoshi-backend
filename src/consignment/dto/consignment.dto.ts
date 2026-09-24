@@ -227,7 +227,7 @@ export class CreateConsignmentDto {
 
   @ApiPropertyOptional({
     description:
-      'Nomor sertifikat PSA/CGC/BGS. Ini identitas TERKUAT yang tersedia dan bisa dicek di ' +
+      'Nomor sertifikat PSA/TAG/CGC/BGS. Ini identitas TERKUAT yang tersedia dan bisa dicek di ' +
       'SITUS GRADER-nya sendiri — bukti yang tidak bersandar pada "kata Hoshi".',
   })
   @IsOptional()
@@ -848,7 +848,9 @@ export class CorrectConsignmentLabelDto {
    * IN_CUSTODY berupa RELEASE ("dikembalikan" — padahal tidak) atau LOST ("hilang" — padahal
    * tidak). Dua-duanya FAKTA PALSU yang ditulis ke buku besar yang sengaja append-only.
    *
-   * STRING KOSONG = KOSONGKAN (kartunya ternyata mentah). Nilai lain WAJIB PSA/CGC/BGS.
+   * STRING KOSONG = KOSONGKAN (kartunya ternyata mentah). Nilai lain WAJIB salah satu nilai enum
+   * `Grader` (PSA/TAG/CGC/BGS) — daftarnya diturunkan dari enum-nya sendiri di `@IsIn` di bawah,
+   * jadi menambah grader baru cukup lewat migrasi + schema.prisma, TANPA menyentuh validasi ini.
    *
    * TIGA SYARAT, ditegakkan di service (lihat `correctLabel`):
    *   (a) ikut memicu pra-cek bentrok nomor sertifikat — kunci anti-dobel-titip adalah PASANGAN
@@ -862,7 +864,7 @@ export class CorrectConsignmentLabelDto {
   @ApiPropertyOptional({
     enum: Grader,
     description:
-      'Grader kartu (PSA/CGC/BGS). String kosong = kosongkan (kartunya ternyata MENTAH). ' +
+      'Grader kartu (PSA/TAG/CGC/BGS). String kosong = kosongkan (kartunya ternyata MENTAH). ' +
       'Ikut diperiksa terhadap kunci anti-dobel-titip (grader, certNumber) dan DITOLAK kalau ' +
       'titipannya sudah terjual.',
   })

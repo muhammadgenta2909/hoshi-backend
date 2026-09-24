@@ -779,13 +779,13 @@ export class MarketplaceService {
 
     const grade = listableGrade(facts);
     if (!grade) {
-      // Dua sebab: perusahaan grading di luar PSA/CGC/Beckett (mis. SGC — enum
+      // Dua sebab: perusahaan grading di luar PSA/TAG/CGC/Beckett (mis. SGC — enum
       // Grader kita belum memuatnya), atau angka grade tak terbaca. Keduanya
       // TIDAK boleh ditambal dengan grader terdekat: slab SGC yang dilabeli PSA
       // adalah kebohongan yang persis sama dengan default "PSA 10".
       throw new UnprocessableEntityException(
         facts.gradeCompany
-          ? `Grade "${facts.gradeLabel ?? facts.gradeCompany}" dari ${facts.gradeCompany} belum didukung marketplace Hoshi (baru PSA, CGC, dan Beckett).`
+          ? `Grade "${facts.gradeLabel ?? facts.gradeCompany}" dari ${facts.gradeCompany} belum didukung marketplace Hoshi (baru PSA, TAG, CGC, dan Beckett).`
           : 'CollectorCrypt tidak mencantumkan grade untuk kartu ini, jadi kartunya belum bisa dipajang.',
       );
     }

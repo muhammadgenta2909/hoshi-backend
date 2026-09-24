@@ -146,8 +146,8 @@ const CERT_WITHOUT_GRADER_MESSAGE =
   'Nomor sertifikat terisi tapi GRADER kosong. Keduanya satu paket: kunci anti-dobel-titip ' +
   'adalah pasangan (grader, certNumber), dan di Postgres grader NULL membuat kunci itu TIDAK ' +
   'PERNAH bentrok — satu slab fisik bisa punya dua titipan hidup sekaligus tanpa ada yang ' +
-  'berbunyi. Pilih grader-nya (PSA/CGC/BGS) sesuai yang tertera di slab, ATAU kosongkan nomor ' +
-  'sertifikatnya kalau kartunya memang MENTAH.';
+  'berbunyi. Pilih grader-nya (PSA/TAG/CGC/BGS) sesuai yang tertera di slab, ATAU kosongkan ' +
+  'nomor sertifikatnya kalau kartunya memang MENTAH.';
 
 /** "cardName: \"Charizad VMAX\" → \"Charizard VMAX\"" — untuk baris audit dan log. */
 function describeChange(ch: LabelChange): string {
@@ -1144,7 +1144,7 @@ export class ConsignmentService {
     // menjelaskan apa pun.
     const consignorId = requireLinkedConsignorId(c);
     // ── BATAS SLICE 1 YANG DISENGAJA: kartu MENTAH belum bisa dipajang. ───────────────────
-    // `Listing.grader` adalah enum NOT NULL berisi PSA/CGC/BGS saja. Untuk kartu tanpa grading
+    // `Listing.grader` adalah enum NOT NULL berisi PSA/TAG/CGC/BGS saja. Untuk kartu tanpa grading
     // tidak ada nilai yang JUJUR di sana, dan mengarang salah satunya berarti MEMBERI LABEL PALSU
     // PADA KARTU ORANG LAIN — tepat hal yang seluruh fitur ini dibangun untuk tidak dilakukan.
     // Intake, custody, bukti, dan penarikan kembali SEMUANYA sudah bekerja untuk kartu mentah;
@@ -1156,9 +1156,9 @@ export class ConsignmentService {
         code: CONSIGNMENT_ERROR_CODE.UNSUPPORTED_ACTION,
         message:
           'Kartu titipan TANPA grading belum bisa dipajang di fase ini: kolom grader pada ' +
-          'listing hanya mengenal PSA/CGC/BGS, dan mengisinya dengan salah satu dari itu berarti ' +
-          'memberi label palsu pada kartu orang lain. Titipannya tetap tercatat dan tetap bisa ' +
-          'ditarik kembali kapan saja.',
+          'listing hanya mengenal PSA/TAG/CGC/BGS, dan mengisinya dengan salah satu dari itu ' +
+          'berarti memberi label palsu pada kartu orang lain. Titipannya tetap tercatat dan ' +
+          'tetap bisa ditarik kembali kapan saja.',
         consignmentId: id,
       });
     }
@@ -2873,7 +2873,8 @@ export class ConsignmentService {
        RELEASE atau LOST — dua-duanya FAKTA PALSU di buku besar yang sengaja append-only.
 
        String kosong = kartunya ternyata MENTAH (kolomnya dikosongkan). Nilai lain sudah disaring
-       `@IsIn` di DTO, jadi di sini ia pasti salah satu dari PSA/CGC/BGS. */
+       `@IsIn` di DTO — dan daftarnya diturunkan dari `Object.values(Grader)`, bukan diketik
+       ulang — jadi di sini ia pasti salah satu nilai enum `Grader` (PSA/TAG/CGC/BGS). */
     let graderChange: LabelChange | null = null;
     if (dto.grader !== undefined) {
       provided++;
@@ -2921,7 +2922,7 @@ export class ConsignmentService {
     }
 
     /* ══ MENGOSONGKAN GRADER SELAGI KARTUNYA TAYANG: DITOLAK, DAN BUKAN KARENA TIPE DATA ══
-       `Listing.grader` adalah enum NOT NULL berisi PSA/CGC/BGS saja — tidak ada nilai yang JUJUR
+       `Listing.grader` adalah enum NOT NULL berisi PSA/TAG/CGC/BGS saja — tidak ada yang JUJUR
        di sana untuk kartu mentah (alasan yang sama yang membuat `createListingFor` menolak kartu
        tanpa grading). Jadi "kartunya ternyata mentah" TIDAK BISA dicerminkan ke baris listing
        yang sedang tayang, dan membiarkan koreksinya lewat akan meninggalkan pajangan publik yang
@@ -2934,9 +2935,9 @@ export class ConsignmentService {
     ) {
       throw new ConflictException(
         `Titipan ${id} SEDANG TAYANG (listing ${c.listing.id}), jadi grader-nya tidak bisa ` +
-          'dikosongkan sekarang: kolom grader pada listing hanya mengenal PSA/CGC/BGS dan tidak ' +
-          'punya nilai yang jujur untuk kartu MENTAH. Turunkan dulu pajangannya, baru koreksi ' +
-          'labelnya — kartunya tetap di rak Hoshi selama itu.',
+          'dikosongkan sekarang: kolom grader pada listing hanya mengenal PSA/TAG/CGC/BGS dan ' +
+          'tidak punya nilai yang jujur untuk kartu MENTAH. Turunkan dulu pajangannya, baru ' +
+          'koreksi labelnya — kartunya tetap di rak Hoshi selama itu.',
       );
     }
 

@@ -51,7 +51,7 @@ export interface CcSyncResult {
   created: number;
   updated: number;
   skipped: {
-    /** gradingCompany di luar PSA/CGC/Beckett → tidak muat di enum Grader kita. */
+    /** gradingCompany di luar PSA/TAG/CGC/Beckett → tidak muat di enum Grader kita. */
     grader: number;
     /** Tanpa listing aktif / harga tidak valid / overflow IDRX Int32. */
     price: number;
@@ -75,8 +75,9 @@ export interface CcSyncResult {
  *
  * Keputusan mapping (kompromi enum/format kita vs data mereka — komentari di sini,
  * bukan tersebar):
- * - Grader: PSA→PSA, CGC→CGC, Beckett→BGS. Selain itu SKIP (enum Grader kita cuma
- *   tiga; menambah nilai enum = migrasi + UI. Mayoritas kartu Pokemon CC ber-PSA.)
+ * - Grader: PSA→PSA, TAG→TAG, CGC→CGC, Beckett→BGS. Selain itu SKIP (enum Grader
+ *   kita cuma empat; menambah nilai enum = migrasi + UI. Mayoritas kartu Pokemon CC
+ *   ber-PSA, dan TAG ikut sejak pemilik produk menyebutnya grader kedua di pasar ini.)
  *   Logikanya tinggal di cc-card-facts.ts, dipakai bersama jalur kartu hasil pull —
  *   satu kartu tidak boleh punya dua jawaban grade tergantung halaman yang membuka.
  * - Rarity: KOSONG. CC tidak punya konsep rarity untuk kartu tunggal; dulu di sini

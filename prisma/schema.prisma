@@ -46,8 +46,17 @@ enum ListingStatus {
 }
 
 // Lembaga grading pada slab kartu (badge di UI + filter Grade & Grader).
+//
+// URUTANNYA DISENGAJA, dan ia bukan sekadar selera: Postgres mengurutkan nilai enum menurut
+// `enumsortorder` di `pg_enum`, jadi `ORDER BY grader` mengikuti urutan DI SINI — bukan abjad.
+// TAG duduk TEPAT SETELAH PSA karena keduanya yang sungguh beredar di pasar Indonesia (kata
+// pemilik produk), sehingga dua grader yang paling sering ditemui operator berdampingan di
+// dropdown dan di filter. Migration `20260926000000_grader_add_tag` memakai `AFTER 'PSA'` supaya
+// urutan di database PERSIS sama dengan urutan di file ini; kalau salah satunya digeser, yang
+// satu lagi HARUS ikut digeser lewat migrasi tersendiri.
 enum Grader {
   PSA
+  TAG
   CGC
   BGS
 }
@@ -1510,7 +1519,7 @@ model Consignment {
   language   String?
   tcg        String?
   grader     Grader? // null = mentah / belum di-grade
-  /// Nomor sertifikat PSA/CGC/BGS — bisa dicek di SITUS GRADER-nya sendiri, bukan di situs kami.
+  /// Nomor sertifikat PSA/TAG/CGC/BGS — dicek di SITUS GRADER-nya sendiri, bukan di situs kami.
   /// Ini bukti yang TIDAK bersandar pada "kata Hoshi", dan itulah gunanya.
   certNumber String?
   gradeLabel String? // "PSA 10"
