@@ -1,6 +1,6 @@
 /* Harness ini SENGAJA berbicara dengan DB palsu bertipe longgar: yang diuji adalah PREDIKAT dan
    PERGERAKAN BARIS, bukan tipe Prisma. Pelonggaran dibatasi ke file test ini saja. */
-/* eslint-disable @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-argument, @typescript-eslint/no-unsafe-return, @typescript-eslint/no-explicit-any, @typescript-eslint/require-await */
+/* eslint-disable @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-argument, @typescript-eslint/no-unsafe-return, @typescript-eslint/require-await */
 import { Logger } from '@nestjs/common';
 import { ListingStatus, PaymentStatus, RedemptionStatus } from '@prisma/client';
 import type { AuthUser } from '../auth/jwt.strategy';
@@ -124,7 +124,7 @@ function matches(row: Row, where: Record<string, any> | undefined): boolean {
         continue;
       }
       if ('not' in want) {
-        const n = (want as any).not;
+        const n = want.not;
         if (n === null) {
           if (row[key] === null || row[key] === undefined) return false;
         } else if (row[key] === n) {
@@ -133,7 +133,7 @@ function matches(row: Row, where: Record<string, any> | undefined): boolean {
         continue;
       }
       if ('gt' in want) {
-        if (!(row[key] > (want as any).gt)) return false;
+        if (!(row[key] > want.gt)) return false;
         continue;
       }
       // Relasi bersarang (mis. { nft: { assetAddress: x } }) — cukup untuk harness ini.
@@ -208,7 +208,12 @@ function fakePrisma(world: World): PrismaService {
         return { ...world.redemption };
       },
       create: async ({ data }: any) => {
-        const row = { id: 'red-new', trackingIds: [], trackingUrls: [], ...data };
+        const row = {
+          id: 'red-new',
+          trackingIds: [],
+          trackingUrls: [],
+          ...data,
+        };
         world.created.push(row);
         world.redemption = row;
         return row;
@@ -226,9 +231,7 @@ function fakePrisma(world: World): PrismaService {
       findFirst: async ({ where }: any) =>
         world.order && matches(world.order, where) ? { ...world.order } : null,
       findMany: async ({ where }: any) =>
-        world.order && matches(world.order, where)
-          ? [{ ...world.order }]
-          : [],
+        world.order && matches(world.order, where) ? [{ ...world.order }] : [],
       count: async () => (world.order ? 1 : 0),
       create: async ({ data }: any) => {
         world.order = { id: ORDER_ROW_ID, ...data };
@@ -380,16 +383,20 @@ const redemptions = (world: World) =>
   new RedemptionService(
     fakePrisma(world),
     {} as unknown as CcShippingService,
-    payments(world) as unknown as PaymentsService,
+    payments(world),
   );
 
 const admin = (world: World) =>
   new AdminService(
     fakePrisma(world),
-    {} as any,
-    {} as any,
-    {} as any,
-    {} as any,
+    {} as any, // jwt
+    // config — HARUS punya `get`, bukan `{}`. Layar ongkir admin membacanya untuk menjawab
+    // "apakah lapis tarif kurir (Biteship) sedang dipasang?", dan jawabannya mengubah ARTI
+    // seluruh tabel tarif di layar itu. Mengembalikan undefined = tidak dipasang, yaitu persis
+    // dunia yang diasumsikan test-test di berkas ini: tarif datang dari tabel, bukan dari API.
+    { get: () => undefined } as any,
+    {} as any, // marketplace
+    {} as any, // escrow
   );
 
 /** Listing stok Hoshi yang SUDAH dibeli user — bentuk yang sah untuk jalur domestik. */
@@ -517,9 +524,9 @@ describe('identitas kartu stok Hoshi', () => {
   it('TIDAK MUNGKIN bentrok dengan alamat NFT base58 Solana', () => {
     const BASE58 = /^[1-9A-HJ-NP-Za-km-z]+$/;
     expect(BASE58.test(HOSHI_LISTING_REF_PREFIX)).toBe(false);
-    expect(isHoshiListingRef('6dKq1s9TvQZ8H2oXk3WcNbY5ePfR7uAJmL4tGhVnDzXy')).toBe(
-      false,
-    );
+    expect(
+      isHoshiListingRef('6dKq1s9TvQZ8H2oXk3WcNbY5ePfR7uAJmL4tGhVnDzXy'),
+    ).toBe(false);
   });
 
   it('rail dibaca dari listingId, BUKAN dari source', () => {
@@ -639,7 +646,11 @@ describe('POST /redemptions — jalur DOMESTIK (listingId)', () => {
     const world = baseWorld();
     for (const body of [
       { shippingAddressId: ADDR_ID },
-      { nftAddress: 'NftAddr', listingId: LISTING_ID, shippingAddressId: ADDR_ID },
+      {
+        nftAddress: 'NftAddr',
+        listingId: LISTING_ID,
+        shippingAddressId: ADDR_ID,
+      },
     ]) {
       await expect(
         redemptions(world).request(body as any, USER),
@@ -675,7 +686,9 @@ describe('POST /redemptions — jalur DOMESTIK (listingId)', () => {
   /** Anti-dobel: satu kartu fisik, satu permintaan aktif — dicek GLOBAL (bukan per-user). */
   it('menolak permintaan kedua selagi ada baris domestik yang masih aktif', async () => {
     const world = baseWorld({
-      redemption: domesticRow(RedemptionStatus.PACKING, { userId: 'user-lain' }),
+      redemption: domesticRow(RedemptionStatus.PACKING, {
+        userId: 'user-lain',
+      }),
     });
     await expect(
       redemptions(world).request(
@@ -769,7 +782,9 @@ describe('POST /redemptions — kartu TITIPAN (rail domestik)', () => {
         custodyReleasedAt: new Date('2026-09-10T00:00:00.000Z'),
       },
     ]) {
-      const world = baseWorld({ listing: consignedListingRow({ consignment }) });
+      const world = baseWorld({
+        listing: consignedListingRow({ consignment }),
+      });
       await expect(
         redemptions(world).request(
           { listingId: LISTING_ID, shippingAddressId: ADDR_ID },
@@ -845,7 +860,9 @@ describe('dua rail tidak bisa tertukar', () => {
         USER,
         'cca_token',
       ),
-    ).rejects.toMatchObject({ response: { code: 'REDEMPTION_CARD_NOT_YOURS' } });
+    ).rejects.toMatchObject({
+      response: { code: 'REDEMPTION_CARD_NOT_YOURS' },
+    });
     expect(world.order).toBeNull();
   });
 
@@ -888,7 +905,7 @@ describe('dua rail tidak bisa tertukar', () => {
     const err = await payments(world)
       .createDomesticShippingOrder(RED_ID, USER)
       .catch((e) => e);
-    const body = (err as any).response;
+    const body = err.response;
     expect([SHIPPING_STAGE.NO_EFFECT, SHIPPING_STAGE.PRE_FUND]).toContain(
       body.stage,
     );
@@ -981,7 +998,7 @@ describe('ongkir domestik LUNAS → PACKING (bukan READY_TO_FUND)', () => {
 /* ══════════════════════════ 8. PEMENUHAN ADMIN ══════════════════════════ */
 
 describe('antrean admin — pemenuhan domestik', () => {
-/**
+  /**
    * ╔══════════════════════════════════════════════════════════════════════════════════════════╗
    * ║ PAKET TITIPAN DISERAHKAN KE KURIR = CUSTODY ATAS BARANG ORANG LAIN SELESAI.             ║
    * ╚══════════════════════════════════════════════════════════════════════════════════════════╝
@@ -1020,7 +1037,6 @@ describe('antrean admin — pemenuhan domestik', () => {
     expect(world.redemption!.status).toBe(RedemptionStatus.SHIPPED);
     expect(world.consignment).toBeNull();
   });
-
 
   it('PACKING → SHIPPED menerima resi kurir', async () => {
     const world = baseWorld({
@@ -1213,7 +1229,10 @@ describe('B2 — REQUESTED → PACKING/SHIPPED menolak baris domestik yang ongki
       RED_ID,
       RedemptionStatus.PACKING,
       undefined,
-      { absorbShippingFee: true, note: 'promo grand opening, disetujui pemilik produk' },
+      {
+        absorbShippingFee: true,
+        note: 'promo grand opening, disetujui pemilik produk',
+      },
     );
     expect(world.redemption!.status).toBe(RedemptionStatus.PACKING);
     expect(world.redemption!.note).toContain('ONGKIR DITANGGUNG HOSHI');
@@ -1477,7 +1496,11 @@ describe('resolusi tarif ongkir domestik', () => {
   it('memakai baris DB aktif lebih dulu', async () => {
     const world = baseWorld({
       rates: [
-        { scope: DOMESTIC_RATE_SCOPE_NATIONWIDE, priceIdr: 37_000, active: true },
+        {
+          scope: DOMESTIC_RATE_SCOPE_NATIONWIDE,
+          priceIdr: 37_000,
+          active: true,
+        },
       ],
     });
     await expect(
@@ -1545,7 +1568,7 @@ describe('resolusi tarif ongkir domestik', () => {
   it.each([0, -1, 19_999, IDRX_MAX_MINT_IDR + 1, 25_000.5])(
     'menolak tarif tak masuk akal: %s',
     (bad) => {
-      expect(() => assertSaneRate(bad as number)).toThrow();
+      expect(() => assertSaneRate(bad)).toThrow();
     },
   );
 
@@ -1593,7 +1616,6 @@ describe('resolusi tarif ongkir domestik', () => {
     expect(world.rates).toHaveLength(0);
   });
 });
-
 
 /* ══════════════════════ 10b. TIER ONGKIR PER-WILAYAH ══════════════════════
    Yang dijaga blok ini, dan kenapa masing-masing penting:
@@ -1727,7 +1749,11 @@ describe('tier ongkir per-wilayah', () => {
   it('harga KHUSUS SATU PROVINSI menang atas tier-nya', async () => {
     const world = baseWorld({ rates: [...twoTiers] });
     await admin(world).setDomesticShippingRate(
-      { scope: 'STATE:DKI Jakarta', priceIdr: 15_000 + 5_000, label: 'Jakarta saja' },
+      {
+        scope: 'STATE:DKI Jakarta',
+        priceIdr: 15_000 + 5_000,
+        label: 'Jakarta saja',
+      },
       ADMIN,
     );
     await expect(
@@ -1749,7 +1775,13 @@ describe('tier ongkir per-wilayah', () => {
   });
 
   it('ejaan Inggris dari dropdown geo DAN singkatan ketikan bebas sama-sama kena tier Jawa', async () => {
-    for (const state of ['West Java', 'Jabar', 'Central Java', 'Jogja', 'Yogyakarta']) {
+    for (const state of [
+      'West Java',
+      'Jabar',
+      'Central Java',
+      'Jogja',
+      'Yogyakarta',
+    ]) {
       await expect(
         resolveDomesticShippingIdr({
           prisma: fakePrisma(baseWorld()),
@@ -1795,7 +1827,9 @@ describe('tier ongkir per-wilayah', () => {
         country: 'Singapore',
       }),
     });
-    await expect(payments(world).quoteDomesticShipping(RED_ID, USER)).rejects.toMatchObject({
+    await expect(
+      payments(world).quoteDomesticShipping(RED_ID, USER),
+    ).rejects.toMatchObject({
       response: { code: DOMESTIC_ERROR_CODE.ADDRESS_UNSUPPORTED },
     });
     // NOL efek samping: barisnya tidak bergerak dan tidak ada order yang lahir.
@@ -1808,8 +1842,20 @@ describe('tier ongkir per-wilayah', () => {
   it('provinsi yang terdaftar di DUA tier → dipakai yang TERMAHAL (tidak pernah menagih kurang)', () => {
     const picked = pickTier(
       [
-        { scope: 'TIER:A', priceIdr: 20_000, provinces: ['bali'], fallback: false, label: null },
-        { scope: 'TIER:B', priceIdr: 60_000, provinces: ['bali'], fallback: false, label: null },
+        {
+          scope: 'TIER:A',
+          priceIdr: 20_000,
+          provinces: ['bali'],
+          fallback: false,
+          label: null,
+        },
+        {
+          scope: 'TIER:B',
+          priceIdr: 60_000,
+          provinces: ['bali'],
+          fallback: false,
+          label: null,
+        },
       ],
       'bali',
     );
@@ -1820,8 +1866,20 @@ describe('tier ongkir per-wilayah', () => {
   it('dua tier sama-sama fallback → dipakai yang TERMAHAL', () => {
     const picked = pickTier(
       [
-        { scope: 'TIER:A', priceIdr: 20_000, provinces: [], fallback: true, label: null },
-        { scope: 'TIER:B', priceIdr: 70_000, provinces: [], fallback: true, label: null },
+        {
+          scope: 'TIER:A',
+          priceIdr: 20_000,
+          provinces: [],
+          fallback: true,
+          label: null,
+        },
+        {
+          scope: 'TIER:B',
+          priceIdr: 70_000,
+          provinces: [],
+          fallback: true,
+          label: null,
+        },
       ],
       'entah',
     );
@@ -1836,7 +1894,9 @@ describe('tier ongkir per-wilayah', () => {
       ADMIN,
     );
     expect(world.rates.filter((r: any) => r.fallback === true)).toHaveLength(1);
-    expect(world.rates.find((r: any) => r.fallback === true)!.scope).toBe(DOMESTIC_TIER_JAWA);
+    expect(world.rates.find((r: any) => r.fallback === true)!.scope).toBe(
+      DOMESTIC_TIER_JAWA,
+    );
   });
 
   it('MENGAKTIFKAN kembali baris yang sudah penampung tetap membersihkan penampung lain', async () => {
@@ -1867,13 +1927,22 @@ describe('tier ongkir per-wilayah', () => {
     );
     const row = world.rates.find((r: any) => r.scope === DOMESTIC_TIER_JAWA)!;
     expect(row.priceIdr).toBe(24_000);
-    expect(row.provinces).toEqual(['jakarta', 'dki jakarta', 'jawa barat', 'west java']);
+    expect(row.provinces).toEqual([
+      'jakarta',
+      'dki jakarta',
+      'jawa barat',
+      'west java',
+    ]);
   });
 
   it('provinsi yang ditulis admin DINORMALKAN, jadi "DKI Jakarta" cocok dengan alamat apa adanya', async () => {
     const world = baseWorld();
     await admin(world).setDomesticShippingRate(
-      { scope: DOMESTIC_TIER_JAWA, priceIdr: 21_000, provinces: ['  DKI   Jakarta ', 'DKI Jakarta'] },
+      {
+        scope: DOMESTIC_TIER_JAWA,
+        priceIdr: 21_000,
+        provinces: ['  DKI   Jakarta ', 'DKI Jakarta'],
+      },
       ADMIN,
     );
     const row = world.rates.find((r: any) => r.scope === DOMESTIC_TIER_JAWA)!;
@@ -1894,7 +1963,9 @@ describe('tier ongkir per-wilayah', () => {
       { scope: 'TIER:X', priceIdr: 30_000, provinces: ['', '   ', 'bali'] },
       ADMIN,
     );
-    expect(world.rates.find((r: any) => r.scope === 'TIER:X')!.provinces).toEqual(['bali']);
+    expect(
+      world.rates.find((r: any) => r.scope === 'TIER:X')!.provinces,
+    ).toEqual(['bali']);
   });
 
   /* ─────────────────── LANTAI IDRX & PENAMPUNG ─────────────────── */
@@ -1979,7 +2050,8 @@ describe('tarif kurir NYATA di jalur penagihan (lapis 0, ujung ke ujung)', () =>
   };
   /** CONFIG harness + env Biteship, supaya lapis 0 benar-benar menyala di test ini. */
   const CONFIG_BITESHIP = {
-    get: (k: string) => BITESHIP_ENV[k] ?? (CONFIG.get(k) as string | undefined),
+    get: (k: string) =>
+      BITESHIP_ENV[k] ?? (CONFIG.get(k) as string | undefined),
   } as any;
 
   /**
@@ -2045,7 +2117,10 @@ describe('tarif kurir NYATA di jalur penagihan (lapis 0, ujung ke ujung)', () =>
     expect(idrx.mintRequest).toHaveBeenCalledWith(
       expect.objectContaining({ toBeMinted: String(quote.priceIdr) }),
     );
-    expect(world.order).toMatchObject({ priceIdr: quote.priceIdr, priceUsdc: 0 });
+    expect(world.order).toMatchObject({
+      priceIdr: quote.priceIdr,
+      priceUsdc: 0,
+    });
   });
 
   /**
@@ -2351,8 +2426,8 @@ describe('B4 — GET/PUT tarif ongkir menyajikan kontrak yang lengkap', () => {
     };
     await admin(world).setDomesticShippingRate(body, ADMIN);
     await admin(world).setDomesticShippingRate(body, ADMIN);
-    expect(world.rates.filter((r) => r.scope === DOMESTIC_TIER_JAWA)).toHaveLength(
-      1,
-    );
+    expect(
+      world.rates.filter((r) => r.scope === DOMESTIC_TIER_JAWA),
+    ).toHaveLength(1);
   });
 });

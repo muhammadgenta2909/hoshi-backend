@@ -31,10 +31,7 @@ import {
   EscrowService,
   EscrowTransferIndeterminateError,
 } from '../escrow/escrow.service';
-import {
-  p2pModeOf,
-  unescrowedUserListingWhere,
-} from '../marketplace/p2p.gate';
+import { p2pModeOf, unescrowedUserListingWhere } from '../marketplace/p2p.gate';
 // SATU definisi "baris listing ini titipan atau bukan?" — lihat `financeSummary`.
 import {
   isConsignedListing,
@@ -43,6 +40,9 @@ import {
 } from '../common/listing-kind';
 // Penolakan BER-RUTE untuk aksi listing yang memang tidak berlaku bagi kartu TITIPAN.
 import { consignmentUnsupported } from '../common/consignment.gate';
+// Dibaca HANYA untuk menjawab "apakah lapis tarif kurir sedang hidup?" di layar ongkir admin —
+// jawabannya mengubah ARTI seluruh tabel di layar itu, jadi ia tidak boleh ditebak.
+import { readBiteshipConfig } from '../payments/biteship-rate-env';
 import { PrismaService } from '../prisma/prisma.service';
 import {
   recordShippingRefundDebts,
@@ -397,9 +397,31 @@ export class AdminService {
         },
         satuProvinsi: { scope: 'STATE:papua', label: 'Papua', priceIdr: 95000 },
       },
+      /* ── KALIMAT INI WAJIB MENYEBUT LAPIS 0 KETIKA IA HIDUP ──────────────────────────────
+         Versi lamanya menyatakan `STATE:<provinsi>` sebagai yang PALING SPESIFIK. Itu benar
+         sampai tarif kurir nyata (Biteship) dipasang — sejak itu API duduk di ATAS seluruh
+         tabel ini, termasuk di atas harga satu-provinsi yang diketik operator sendiri.
+
+         Membiarkan kalimat lamanya berarti layar ini menyuruh orang mengetik angka lalu
+         diam-diam tidak memakainya: operator menulis `STATE:papua = 95.000` karena ia tahu
+         tarif sungguhan ke sana, menekan simpan, dan pembeli tetap ditagih angka dari API.
+         Tidak ada error, tidak ada tanda — cuma angka yang tidak pernah terpakai.
+
+         Karena itu kalimatnya DINAMIS: ia membaca konfigurasi yang benar-benar termuat di
+         proses ini, bukan mendaftar kemungkinan. Layar yang menyatakan keadaan sekarang jauh
+         lebih berguna daripada layar yang menyatakan aturan umum. */
       resolution:
-        'Urutan yang dipakai jalur bayar, dari paling spesifik: (1) baris AKTIF ber-scope ' +
-        "'STATE:<provinsi>'; (2) baris AKTIF yang `provinces`-nya memuat provinsi tujuan; " +
+        (readBiteshipConfig((k) => this.config.get<string>(k))
+          ? 'TARIF KURIR NYATA SUDAH DIPASANG (Biteship, per kode pos) dan ketika ia MENJAWAB, ' +
+            'jawabannya menang atas SELURUH tabel di bawah — termasuk harga satu-provinsi yang ' +
+            'kamu ketik sendiri. "Dipasang" bukan berarti "pasti menjawab": kunci yang saldonya ' +
+            'habis, kuota yang lewat, atau API yang sedang mati semuanya membuat panggilannya ' +
+            'gagal, dan saat itu tabel di bawah inilah yang dipakai — jadi tetap isi. Urutan ' +
+            'sesudahnya, dari paling spesifik: '
+          : 'Tarif kurir nyata (Biteship) TIDAK aktif — isi BITESHIP_API_KEY untuk menyalakannya. ' +
+            'Selama mati, urutan yang dipakai jalur bayar adalah, dari paling spesifik: ') +
+        "(1) baris AKTIF ber-scope 'STATE:<provinsi>'; " +
+        '(2) baris AKTIF yang `provinces`-nya memuat provinsi tujuan; ' +
         '(3) baris AKTIF ber-fallback=true (provinsi tak dikenal / alamat tanpa provinsi); ' +
         "(4) baris AKTIF ber-scope '*'; (5) env HOSHI_DOMESTIC_SHIPPING_FLAT_IDR; (6) tier " +
         'PENAMPUNG di kode (src/payments/domestic-shipping-rate.ts). Set baris di sini untuk ' +
@@ -410,7 +432,7 @@ export class AdminService {
         'tier PENAMPUNG.',
       /** PUT-nya UPSERT per `scope` → memanggilnya dua kali dengan body sama TIDAK menggandakan apa pun. */
       idempotency:
-        "PUT /admin/shipping/domestic-rates adalah UPSERT dengan kunci `scope`: mengirim body " +
+        'PUT /admin/shipping/domestic-rates adalah UPSERT dengan kunci `scope`: mengirim body ' +
         'yang sama dua kali menghasilkan baris yang sama (aman di-retry). Field yang TIDAK ' +
         'disebut tidak diubah — sebuah PUT yang cuma membetulkan harga tidak mengosongkan ' +
         'daftar provinsi tier itu.',
@@ -536,7 +558,9 @@ export class AdminService {
         ? undefined
         : [
             ...new Set(
-              input.provinces.map((p) => normalizeRegionKey(p)).filter((p) => p.length > 0),
+              input.provinces
+                .map((p) => normalizeRegionKey(p))
+                .filter((p) => p.length > 0),
             ),
           ];
 
@@ -593,7 +617,12 @@ export class AdminService {
     // PERINGATAN KONFIGURASI — dihitung SESUDAH tulisannya, dari keadaan yang sebenarnya.
     const after = await this.prisma.domesticShippingRate.findMany({
       where: { active: true },
-      select: { scope: true, priceIdr: true, fallback: true, placeholder: true },
+      select: {
+        scope: true,
+        priceIdr: true,
+        fallback: true,
+        placeholder: true,
+      },
     });
     const warnings: string[] = [];
     const fallbacks = after.filter((r) => r.fallback);
@@ -665,8 +694,9 @@ export class AdminService {
     // KARTU SIAPA yang dipegang operator. `source='CONSIGNMENT'` sudah mengatakan "ini barang
     // orang lain", tapi tidak menyebut SIAPA — dan operator yang harus mengambil satu slab dari
     // rak butuh nama pemiliknya, bukan sekadar kategori. SATU query untuk seluruh halaman.
-    const consignmentByListing =
-      await this.consignmentRefsForListings(rows.map((r) => r.listingId));
+    const consignmentByListing = await this.consignmentRefsForListings(
+      rows.map((r) => r.listingId),
+    );
 
     return rows.map((r) => {
       const domestic = isDomesticRedemption(r);
@@ -681,9 +711,7 @@ export class AdminService {
       // pagar ongkir. Inilah yang dulu tidak ada: dashboard menggambar tombolnya sendiri.
       const allNext = REDEMPTION_ADMIN_TRANSITIONS[r.status] ?? [];
       const ongkirBlocks =
-        domestic &&
-        r.status === RedemptionStatus.REQUESTED &&
-        !ongkir.paid;
+        domestic && r.status === RedemptionStatus.REQUESTED && !ongkir.paid;
       const blockedNextStatuses = ongkirBlocks
         ? allNext.filter((s) => DOMESTIC_FULFILMENT_TARGETS.includes(s))
         : [];
@@ -922,7 +950,8 @@ export class AdminService {
     const extra: { refundSafe?: boolean } =
       status === RedemptionStatus.RECLAIM_DUE ? { refundSafe: false } : {};
     // RESI DOMESTIK. Ditulis hanya kalau diberikan; tidak pernah menimpa dengan array kosong.
-    const trackingData: { trackingIds?: string[]; trackingUrls?: string[] } = {};
+    const trackingData: { trackingIds?: string[]; trackingUrls?: string[] } =
+      {};
     if (domestic && tracking?.trackingIds?.length) {
       trackingData.trackingIds = tracking.trackingIds;
     }
@@ -952,7 +981,8 @@ export class AdminService {
       row.status === RedemptionStatus.REQUESTED &&
       DOMESTIC_FULFILMENT_TARGETS.includes(status)
     ) {
-      const ongkir = (await this.summarizeOngkir([id])).get(id) ?? ongkirNone(true);
+      const ongkir =
+        (await this.summarizeOngkir([id])).get(id) ?? ongkirNone(true);
 
       if (!ongkir.paid) {
         const inFlightNote = ongkir.inFlight
@@ -1054,7 +1084,10 @@ export class AdminService {
         if (listing?.consignmentId) {
           const closed = await this.prisma.$transaction(async (tx) => {
             const c = await tx.consignment.updateMany({
-              where: { id: listing.consignmentId as string, custodyReleasedAt: null },
+              where: {
+                id: listing.consignmentId as string,
+                custodyReleasedAt: null,
+              },
               data: {
                 status: 'RELEASED',
                 custodyReleasedAt: new Date(),
@@ -1119,9 +1152,7 @@ export class AdminService {
     // Keadaan ongkir dibaca ULANG SESUDAH pembukuan di atas, supaya respons PATCH memperlihatkan
     // baris seperti apa adanya SEKARANG (mis. order yang barusan jadi REFUND_DUE) — dashboard
     // bisa memperbarui barisnya tanpa memanggil GET lagi.
-    const rail = domestic
-      ? ('HOSHI_DOMESTIC' as const)
-      : ('CC_VAULT' as const);
+    const rail = domestic ? ('HOSHI_DOMESTIC' as const) : ('CC_VAULT' as const);
     const ongkirAfter: AdminRedemptionOngkir = domestic
       ? ((await this.summarizeOngkir([id])).get(id) ?? ongkirNone(true))
       : ongkirNone(false);
@@ -1144,7 +1175,11 @@ export class AdminService {
       ongkir: ongkirAfter,
       allowedNextStatuses: REDEMPTION_ADMIN_TRANSITIONS[updated.status] ?? [],
       blockedNextStatuses: [] as RedemptionStatus[],
-      actionRequired: redemptionActionRequired(updated.status, rail, ongkirAfter),
+      actionRequired: redemptionActionRequired(
+        updated.status,
+        rail,
+        ongkirAfter,
+      ),
     };
   }
 
@@ -1726,47 +1761,47 @@ export class AdminService {
       sellers,
       pendingWdAgg,
     ] = await Promise.all([
-        // Reseller = Hoshi jual kartu KATALOG CC (source COLLECTORCRYPT, tanpa penjual user).
-        this.prisma.listing.aggregate({
-          where: {
-            status: ListingStatus.SOLD,
-            sellerId: null,
-            source: ListingSource.COLLECTORCRYPT,
-          },
-          _sum: { priceIdrx: true },
-          _count: true,
-        }),
-        // Inventaris Hoshi = Hoshi jual kartu SENDIRI (source HOSHI, tanpa penjual user).
-        // Seluruh omzet = pendapatan Hoshi (bukan modal CC, bukan titipan penjual).
-        this.prisma.listing.aggregate({
-          where: {
-            status: ListingStatus.SOLD,
-            sellerId: null,
-            source: ListingSource.HOSHI,
-          },
-          _sum: { priceIdrx: true },
-          _count: true,
-        }),
-        // P2P = listing milik USER. `nonConsignedListingWhere()` WAJIB ada di sini: tanpa itu,
-        // setiap kartu TITIPAN (yang juga ber-sellerId) ikut terhitung sebagai P2P. Lihat
-        // paragraf "EMPAT EMBER" di atas.
-        this.prisma.listing.aggregate({
-          where: {
-            status: ListingStatus.SOLD,
-            sellerId: { not: null },
-            ...nonConsignedListingWhere(),
-          },
-          _sum: { priceIdrx: true },
-          _count: true,
-        }),
-        // TITIPAN = kartu ORANG LAIN yang fisiknya di rak Hoshi. Yang menjadi PENDAPATAN HOSHI
-        // di sini BUKAN omzetnya melainkan KOMISINYA; sisanya utang ke pemilik kartu dan sudah
-        // masuk `liabilitiesIdr` lewat saldo penjual. Dibaca dari kolom yang DITULIS settlement.
-        this.prisma.consignment.aggregate({
-          where: { commissionIdrx: { not: null } },
-          _sum: { commissionIdrx: true, payoutIdrx: true },
-          _count: true,
-        }),
+      // Reseller = Hoshi jual kartu KATALOG CC (source COLLECTORCRYPT, tanpa penjual user).
+      this.prisma.listing.aggregate({
+        where: {
+          status: ListingStatus.SOLD,
+          sellerId: null,
+          source: ListingSource.COLLECTORCRYPT,
+        },
+        _sum: { priceIdrx: true },
+        _count: true,
+      }),
+      // Inventaris Hoshi = Hoshi jual kartu SENDIRI (source HOSHI, tanpa penjual user).
+      // Seluruh omzet = pendapatan Hoshi (bukan modal CC, bukan titipan penjual).
+      this.prisma.listing.aggregate({
+        where: {
+          status: ListingStatus.SOLD,
+          sellerId: null,
+          source: ListingSource.HOSHI,
+        },
+        _sum: { priceIdrx: true },
+        _count: true,
+      }),
+      // P2P = listing milik USER. `nonConsignedListingWhere()` WAJIB ada di sini: tanpa itu,
+      // setiap kartu TITIPAN (yang juga ber-sellerId) ikut terhitung sebagai P2P. Lihat
+      // paragraf "EMPAT EMBER" di atas.
+      this.prisma.listing.aggregate({
+        where: {
+          status: ListingStatus.SOLD,
+          sellerId: { not: null },
+          ...nonConsignedListingWhere(),
+        },
+        _sum: { priceIdrx: true },
+        _count: true,
+      }),
+      // TITIPAN = kartu ORANG LAIN yang fisiknya di rak Hoshi. Yang menjadi PENDAPATAN HOSHI
+      // di sini BUKAN omzetnya melainkan KOMISINYA; sisanya utang ke pemilik kartu dan sudah
+      // masuk `liabilitiesIdr` lewat saldo penjual. Dibaca dari kolom yang DITULIS settlement.
+      this.prisma.consignment.aggregate({
+        where: { commissionIdrx: { not: null } },
+        _sum: { commissionIdrx: true, payoutIdrx: true },
+        _count: true,
+      }),
       this.prisma.user.findMany({
         where: { balanceIdrx: { gt: 0 } },
         select: {
@@ -1792,10 +1827,7 @@ export class AdminService {
       label: u.displayName ?? shortWalletLabel(u.walletAddress),
       balanceIdr: Number(u.balanceIdrx),
     }));
-    const liabilitiesIdr = sellerBalances.reduce(
-      (s, u) => s + u.balanceIdr,
-      0,
-    );
+    const liabilitiesIdr = sellerBalances.reduce((s, u) => s + u.balanceIdr, 0);
     const pendingWithdrawalsIdr = Number(pendingWdAgg._sum.amountIdr ?? 0n);
     return {
       reseller: {
@@ -2202,9 +2234,9 @@ export class AdminService {
     sellable: boolean,
     admin: { id: string; walletAddress: string },
   ) {
-    const unique = [...new Set((ids ?? []).map((v) => (v ?? '').trim()))].filter(
-      (v) => v.length > 0,
-    );
+    const unique = [
+      ...new Set((ids ?? []).map((v) => (v ?? '').trim())),
+    ].filter((v) => v.length > 0);
     if (unique.length === 0) {
       throw new BadRequestException(
         'Sebutkan minimal satu id listing. Rute ini SENGAJA tidak punya mode "semua baris".',
@@ -2279,13 +2311,12 @@ export class AdminService {
       alreadyCorrect,
       /** Id yang TIDAK memenuhi pagar bentuk (tidak ada, katalog CC, listing user, atau bukan ACTIVE). */
       skipped,
-      warning:
-        sellable
-          ? 'Baris yang diubah kini BISA DIBELI pembeli. Flag ini satu-satunya yang menahan ' +
-            'baris seed/placeholder agar tidak bisa dibeli — jangan pernah menaikkannya untuk ' +
-            'baris yang kartunya tidak benar-benar ada di rak Hoshi.'
-          : 'Baris yang diubah kini TIDAK bisa dibeli. Order yang sudah PENDING untuk baris itu ' +
-            'akan gagal di settlement dan perlu di-refund manual — cek /admin/transactions.',
+      warning: sellable
+        ? 'Baris yang diubah kini BISA DIBELI pembeli. Flag ini satu-satunya yang menahan ' +
+          'baris seed/placeholder agar tidak bisa dibeli — jangan pernah menaikkannya untuk ' +
+          'baris yang kartunya tidak benar-benar ada di rak Hoshi.'
+        : 'Baris yang diubah kini TIDAK bisa dibeli. Order yang sudah PENDING untuk baris itu ' +
+          'akan gagal di settlement dan perlu di-refund manual — cek /admin/transactions.',
     };
   }
 
@@ -2912,7 +2943,8 @@ export class AdminService {
    * Dua-duanya didukung supaya tidak tergantung format yang ditampilkan dashboard.
    */
   // Cache instance cloudinary (atau null kalau gagal load). undefined = belum dicoba.
-  private cld: (typeof import('cloudinary'))['v2'] | null | undefined = undefined;
+  private cld: (typeof import('cloudinary'))['v2'] | null | undefined =
+    undefined;
 
   /** Load cloudinary LAZY + DEFENSIF. require di sini bisa THROW kalau CLOUDINARY_URL salah format —
    *  ditangkap → return null (cloudinary dianggap tak tersedia), backend TETAP jalan. */
@@ -3295,40 +3327,45 @@ export class AdminService {
       seller: { select: { id: true, displayName: true, walletAddress: true } },
     } as const;
 
-    const [heldRows, strandedRows, unescrowedRows, unescrowedCount, recoveries] =
-      await Promise.all([
-        this.prisma.listing.findMany({
-          where: escrowHeldWhere(),
-          select: listingSelect,
-          orderBy: { escrowedAt: 'desc' },
-          take,
-        }),
-        this.prisma.listing.findMany({
-          where: escrowStrandedWhere(),
-          select: listingSelect,
-          orderBy: { escrowedAt: 'desc' },
-          take,
-        }),
-        this.prisma.listing.findMany({
-          where: {
-            status: ListingStatus.ACTIVE,
-            ...unescrowedUserListingWhere(),
-          },
-          select: listingSelect,
-          orderBy: { listedAt: 'desc' },
-          take,
-        }),
-        this.prisma.listing.count({
-          where: {
-            status: ListingStatus.ACTIVE,
-            ...unescrowedUserListingWhere(),
-          },
-        }),
-        this.prisma.escrowRecovery.findMany({
-          orderBy: { createdAt: 'desc' },
-          take: 20,
-        }),
-      ]);
+    const [
+      heldRows,
+      strandedRows,
+      unescrowedRows,
+      unescrowedCount,
+      recoveries,
+    ] = await Promise.all([
+      this.prisma.listing.findMany({
+        where: escrowHeldWhere(),
+        select: listingSelect,
+        orderBy: { escrowedAt: 'desc' },
+        take,
+      }),
+      this.prisma.listing.findMany({
+        where: escrowStrandedWhere(),
+        select: listingSelect,
+        orderBy: { escrowedAt: 'desc' },
+        take,
+      }),
+      this.prisma.listing.findMany({
+        where: {
+          status: ListingStatus.ACTIVE,
+          ...unescrowedUserListingWhere(),
+        },
+        select: listingSelect,
+        orderBy: { listedAt: 'desc' },
+        take,
+      }),
+      this.prisma.listing.count({
+        where: {
+          status: ListingStatus.ACTIVE,
+          ...unescrowedUserListingWhere(),
+        },
+      }),
+      this.prisma.escrowRecovery.findMany({
+        orderBy: { createdAt: 'desc' },
+        take: 20,
+      }),
+    ]);
 
     const shape = (r: (typeof heldRows)[number]) => ({
       listingId: r.id,
