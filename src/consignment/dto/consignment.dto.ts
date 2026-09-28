@@ -1007,3 +1007,45 @@ export class LinkConsignorDto {
   @MaxLength(1000)
   note!: string;
 }
+
+/**
+ * ╔════════════════════════════════════════════════════════════════════════════════════════════╗
+ * ║ GANTI GAMBAR KARTU YANG SUDAH TAYANG.                                                      ║
+ * ╚════════════════════════════════════════════════════════════════════════════════════════════╝
+ *
+ * Ada karena `POST :id/listing` hanya menerima titipan berstatus IN_CUSTODY. Begitu kartunya
+ * tayang, tidak ada satu pun rute yang bisa menyentuh gambarnya lagi — termasuk rute admin
+ * umum, yang memang sengaja menolak baris titipan. Akibatnya foto yang terlanjur salah pilih
+ * (atau bagian belakang yang lupa dipasang) terkunci di halaman pembeli selamanya.
+ *
+ * TIDAK MEMINTA ALASAN, dan itu disengaja — berbeda dari `:id/price` dan `:id/label`. Keduanya
+ * mengubah ISI KESEPAKATAN: harga ditandatangani pemiliknya, label adalah identitas kartunya.
+ * Rute ini hanya memilih ULANG sisi mana dari kartu yang sama yang dipajang. Foto intake-nya
+ * append-only dan tidak disentuh, dan URL yang lama tetap tercatat di baris auditnya — jadi
+ * tidak ada apa pun yang hilang dan tidak ada apa pun yang perlu dipertanggungjawabkan.
+ */
+export class UpdateConsignmentListingImagesDto {
+  @ApiPropertyOptional({
+    example: '/uploads/consign/abc-front.jpg',
+    description: 'Gambar depan baru. Tidak disebut = tidak diubah.',
+  })
+  @IsOptional()
+  @IsString()
+  @IsImageRef()
+  image?: string;
+
+  @ApiPropertyOptional({
+    example: '/uploads/consign/abc-back.jpg',
+    description:
+      'Gambar belakang baru. Kirim `null` untuk MENGHAPUS gambar belakang (kontrol balik ' +
+      'kartu hilang dari halaman pembeli). Tidak disebut = tidak diubah.',
+    nullable: true,
+  })
+  // `@IsOptional()` class-validator melewati validasi untuk undefined DAN null — jadi `null`
+  // sampai ke service apa adanya, dan service-lah yang membedakan "tidak disebut" (undefined =
+  // jangan diubah) dari "disebut null" (hapus gambar belakangnya).
+  @IsOptional()
+  @IsString()
+  @IsImageRef()
+  imageBack?: string | null;
+}

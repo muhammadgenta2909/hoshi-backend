@@ -22,6 +22,7 @@ import {
   CorrectConsignmentLabelDto,
   CreateConsignmentDto,
   CreateConsignmentListingDto,
+  UpdateConsignmentListingImagesDto,
   IssueClaimCodeDto,
   LinkConsignorDto,
   MarkConsignmentLostDto,
@@ -220,6 +221,29 @@ export class ConsignmentAdminController {
     @CurrentUser() admin: AuthUser,
   ) {
     return this.service.updatePrice(id, dto, admin);
+  }
+
+  /**
+   * SATU-SATUNYA cara memperbaiki gambar kartu yang SUDAH tayang.
+   *
+   * `POST :id/listing` berpagar IN_CUSTODY jadi ia tertutup sesudah kartunya dipajang, dan rute
+   * listing admin umum sengaja menolak baris titipan. Tanpa rute ini, foto yang salah pilih
+   * terkunci di halaman pembeli selamanya.
+   */
+  @Patch(':id/listing-images')
+  @ApiOperation({
+    summary:
+      'Ganti gambar depan/belakang listing titipan yang sedang tayang. Hanya listing ACTIVE ' +
+      '(baris SOLD adalah snapshot apa yang dilihat pembeli saat membayar). `imageBack: null` ' +
+      'menghapus gambar belakangnya. Tidak meminta alasan: foto serah terima tidak disentuh dan ' +
+      'URL lama tercatat di baris audit LISTING_IMAGE.',
+  })
+  updateListingImages(
+    @Param('id') id: string,
+    @Body() dto: UpdateConsignmentListingImagesDto,
+    @CurrentUser() admin: AuthUser,
+  ) {
+    return this.service.updateListingImages(id, dto, admin);
   }
 
   /**

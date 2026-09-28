@@ -3538,4 +3538,228 @@ describe('ConsignmentService', () => {
       );
     });
   });
+
+  /* ══════════════ GAMBAR KARTU YANG SUDAH TAYANG — SATU-SATUNYA JALAN PERBAIKAN ═════════════ */
+
+  /**
+   * ╔════════════════════════════════════════════════════════════════════════════════════════╗
+   * ║ KENAPA RUTE INI ADA SAMA SEKALI.                                                       ║
+   * ╚════════════════════════════════════════════════════════════════════════════════════════╝
+   *
+   * `createListingFor` berpagar `status IN_CUSTODY`, jadi ia TERTUTUP begitu kartunya tayang;
+   * dan rute listing admin umum sengaja menolak baris titipan. Sebelum rute ini, foto yang
+   * terlanjur salah pilih terkunci di halaman pembeli SELAMANYA — dan bagian belakang yang lupa
+   * dipasang tidak akan pernah bisa dipasang, sehingga kontrol "balik kartu" di halaman detail
+   * tidak pernah muncul untuk satu pun kartu titipan.
+   */
+  describe('updateListingImages — memperbaiki gambar tanpa menyentuh bukti', () => {
+    const LISTED = (over: Record<string, unknown> = {}) =>
+      rowWith({
+        status: ConsignmentStatus.LISTED,
+        listing: {
+          id: 'listing-1',
+          status: 'ACTIVE',
+          image: '/lama-depan.png',
+          imageBack: null,
+          ...over,
+        },
+      });
+
+    it('memasang gambar belakang yang tadinya kosong — inilah keluhan aslinya', async () => {
+      prisma.consignment.findUnique.mockResolvedValue(LISTED());
+
+      await service.updateListingImages(
+        ID,
+        { imageBack: '/baru-belakang.png' },
+        admin,
+      );
+
+      expect(prisma.listing.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: { image: '/lama-depan.png', imageBack: '/baru-belakang.png' },
+        }),
+      );
+    });
+
+    it('gerbangnya menyebut consignmentId DAN nilai gambar yang lama sekaligus', async () => {
+      prisma.consignment.findUnique.mockResolvedValue(LISTED());
+
+      await service.updateListingImages(ID, { image: '/baru.png' }, admin);
+
+      // Keempatnya: kepemilikan baris (id + consignmentId) dan gerbang optimistic (image +
+      // imageBack). Tanpa dua yang terakhir, penekanan dari layar yang basi akan diam-diam
+      // menimpa pilihan operator lain alih-alih gagal dengan jujur.
+      expect(prisma.listing.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: {
+            id: 'listing-1',
+            consignmentId: ID,
+            status: 'ACTIVE',
+            image: '/lama-depan.png',
+            imageBack: null,
+          },
+        }),
+      );
+    });
+
+    it('kalah gerbang (sudah diganti operator lain) → CONFLICT, dan TIDAK ada baris audit', async () => {
+      prisma.consignment.findUnique.mockResolvedValue(LISTED());
+      prisma.listing.updateMany.mockResolvedValue({ count: 0 });
+
+      await expect(
+        service.updateListingImages(ID, { image: '/baru.png' }, admin),
+      ).rejects.toThrow(ConflictException);
+
+      // Baris audit yang menyebut perubahan yang TIDAK terjadi lebih buruk daripada tidak ada
+      // baris audit sama sekali: ia satu-satunya catatan yang akan dibaca orang nanti.
+      expect(prisma.consignmentEvent.create).not.toHaveBeenCalled();
+    });
+
+    it('listing yang sudah TERJUAL ditolak — ia catatan apa yang dilihat pembeli saat membayar', async () => {
+      prisma.consignment.findUnique.mockResolvedValue(
+        LISTED({ status: 'SOLD' }),
+      );
+
+      await expect(
+        service.updateListingImages(ID, { image: '/baru.png' }, admin),
+      ).rejects.toThrow(/bukan ACTIVE/);
+      expect(prisma.listing.updateMany).not.toHaveBeenCalled();
+    });
+
+    it('titipan yang belum pernah dipajang ditolak — belum ada gambar yang tayang', async () => {
+      prisma.consignment.findUnique.mockResolvedValue(rowWith());
+
+      await expect(
+        service.updateListingImages(ID, { image: '/baru.png' }, admin),
+      ).rejects.toThrow(/belum punya baris listing/);
+    });
+
+    it('body kosong ditolak SEBELUM baris titipannya dibaca', async () => {
+      await expect(service.updateListingImages(ID, {}, admin)).rejects.toThrow(
+        BadRequestException,
+      );
+      expect(prisma.consignment.findUnique).not.toHaveBeenCalled();
+    });
+
+    it('mengirim nilai yang sama persis ditolak — tidak ada audit untuk perubahan nihil', async () => {
+      prisma.consignment.findUnique.mockResolvedValue(LISTED());
+
+      await expect(
+        service.updateListingImages(ID, { image: '/lama-depan.png' }, admin),
+      ).rejects.toThrow(/Tidak ada yang berubah/);
+      expect(prisma.listing.updateMany).not.toHaveBeenCalled();
+    });
+
+    /**
+     * "TIDAK DISEBUT" HARUS BERARTI JANGAN DISENTUH.
+     *
+     * Yang dijaga test ini: `nextBack` dihitung dari `wantsBack`, bukan langsung dari
+     * `dto.imageBack ?? null`. Menyederhanakannya jadi yang kedua membuat SETIAP perbaikan
+     * gambar depan diam-diam menghapus gambar belakang yang baik-baik saja — dan tombol balik
+     * kartu hilang dari halaman pembeli tanpa ada yang pernah memintanya. (Terbukti: mutasi itu
+     * memerahkan test ini.)
+     */
+    it('mengganti depan saja TIDAK menghapus belakang yang sudah ada', async () => {
+      prisma.consignment.findUnique.mockResolvedValue(
+        LISTED({ imageBack: '/belakang-yang-baik.png' }),
+      );
+
+      await service.updateListingImages(
+        ID,
+        { image: '/baru-depan.png' },
+        admin,
+      );
+
+      expect(prisma.listing.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: {
+            image: '/baru-depan.png',
+            imageBack: '/belakang-yang-baik.png',
+          },
+        }),
+      );
+    });
+
+    /**
+     * INI YANG MEMBEDAKAN `'imageBack' in dto` DARI `dto.imageBack != null` — dan hanya test
+     * ini yang membedakannya. Dengan `!= null`, "hapus gambar belakangnya" terbaca sebagai
+     * "tidak ada yang dikirim" dan ditolak 400, sehingga gambar belakang yang salah tidak akan
+     * pernah bisa dilepas dari halaman pembeli.
+     */
+    it('`imageBack: null` yang DISEBUT memang menghapusnya', async () => {
+      prisma.consignment.findUnique.mockResolvedValue(
+        LISTED({ imageBack: '/belakang.png' }),
+      );
+
+      await service.updateListingImages(ID, { imageBack: null }, admin);
+
+      expect(prisma.listing.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: { image: '/lama-depan.png', imageBack: null },
+        }),
+      );
+    });
+
+    it('baris audit menyebut sisi yang BERUBAH saja, dengan URL lama dan barunya', async () => {
+      prisma.consignment.findUnique.mockResolvedValue(
+        LISTED({ imageBack: '/belakang-tetap.png' }),
+      );
+
+      await service.updateListingImages(
+        ID,
+        { image: '/baru-depan.png' },
+        admin,
+      );
+
+      const row = (
+        prisma.consignmentEvent.create.mock.calls as [
+          { data: { kind: string; note: string } },
+        ][]
+      )[0][0].data;
+      expect(row.kind).toBe('LISTING_IMAGE');
+      expect(row.note).toContain('/lama-depan.png');
+      expect(row.note).toContain('/baru-depan.png');
+      // Sisi yang tidak disentuh tidak boleh ikut disebut: baris audit yang melebih-lebihkan
+      // apa yang berubah akan dibaca sebagai bukti bahwa ia berubah.
+      expect(row.note).not.toContain('Belakang:');
+    });
+
+    it('URL base64 yang sangat panjang dipotong di baris audit, tidak ditelan bulat-bulat', async () => {
+      prisma.consignment.findUnique.mockResolvedValue(LISTED());
+      const huge = `data:image/png;base64,${'A'.repeat(5000)}`;
+
+      await service.updateListingImages(ID, { image: huge }, admin);
+
+      const { note } = (
+        prisma.consignmentEvent.create.mock.calls as [
+          { data: { note: string } },
+        ][]
+      )[0][0].data;
+      expect(note.length).toBeLessThan(600);
+      // Yang ditulis ke baris listing tetap UTUH — yang dipotong hanya catatannya.
+      expect(prisma.listing.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ image: huge }) as unknown,
+        }),
+      );
+    });
+
+    it('penulisan listing dan baris auditnya berada di SATU transaksi', async () => {
+      prisma.consignment.findUnique.mockResolvedValue(LISTED());
+
+      await service.updateListingImages(ID, { image: '/baru.png' }, admin);
+
+      expect(prisma.$transaction).toHaveBeenCalledTimes(1);
+    });
+
+    it('foto serah terima tidak disentuh sama sekali', async () => {
+      prisma.consignment.findUnique.mockResolvedValue(LISTED());
+
+      await service.updateListingImages(ID, { image: '/baru.png' }, admin);
+
+      // Bukti itu append-only. Rute ini hanya MEMILIH salah satunya untuk dipajang.
+      expect(prisma.consignmentPhoto.createMany).not.toHaveBeenCalled();
+      expect(prisma.consignment.updateMany).not.toHaveBeenCalled();
+    });
+  });
 });

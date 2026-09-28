@@ -84,6 +84,7 @@ import type {
   LinkConsignorDto,
   MarkConsignmentLostDto,
   ReleaseConsignmentDto,
+  UpdateConsignmentListingImagesDto,
   UpdateConsignmentPriceDto,
   WithdrawConsignmentDto,
 } from './dto/consignment.dto';
@@ -3100,6 +3101,127 @@ export class ConsignmentService {
       listingUpdated,
       ...(await this.byId(id)),
     };
+  }
+
+  /**
+   * ╔════════════════════════════════════════════════════════════════════════════════════════╗
+   * ║ GANTI GAMBAR KARTU YANG SUDAH TAYANG — SATU-SATUNYA JALAN MASUK.                       ║
+   * ╚════════════════════════════════════════════════════════════════════════════════════════╝
+   *
+   * Sebelum ini tidak ada jalan sama sekali. `createListingFor` berpagar `status IN_CUSTODY`,
+   * jadi ia tertutup begitu kartunya tayang; dan rute listing admin umum sengaja menolak baris
+   * titipan. Hasilnya: foto yang terlanjur salah pilih terkunci di halaman pembeli SELAMANYA,
+   * dan bagian belakang yang lupa dipasang tidak akan pernah bisa dipasang.
+   *
+   * ── KENAPA HANYA ACTIVE ──
+   * Baris listing yang SOLD adalah snapshot APA YANG DIBELI pembeli — alasan yang sama yang
+   * membuat `correctLabel` menolak mengubah grader sesudah ada yang membayar. Gambar termasuk
+   * di dalamnya: orang membayar untuk kartu yang DILIHATNYA. Menimpanya sesudah pembayaran
+   * berarti menghapus satu-satunya bukti tentang apa yang dijanjikan kepadanya.
+   *
+   * ── KENAPA TIDAK MEMINTA ALASAN ──
+   * Lihat blok di DTO-nya. Singkatnya: tidak ada yang dimusnahkan. Foto intake append-only dan
+   * tidak disentuh rute ini, dan URL lamanya tercatat utuh di baris audit.
+   */
+  async updateListingImages(
+    id: string,
+    dto: UpdateConsignmentListingImagesDto,
+    admin: AuthUser,
+  ) {
+    // `imageBack` dibedakan lewat `in`, BUKAN lewat `!= null`: "tidak disebut" (jangan diubah)
+    // dan "disebut null" (hapus) adalah dua perintah yang berbeda, dan `!= null` menyatukannya.
+    const wantsBack = 'imageBack' in dto;
+    if (dto.image === undefined && !wantsBack) {
+      throw new BadRequestException(
+        'Tidak ada gambar yang dikirim. Sebut `image`, `imageBack`, atau keduanya.',
+      );
+    }
+
+    const c = await this.requireConsignment(id);
+    const listing = c.listing;
+    if (!listing) {
+      throw consignmentError({
+        status: HttpStatus.CONFLICT,
+        code: CONSIGNMENT_ERROR_CODE.BAD_TRANSITION,
+        message:
+          `Titipan ${id} belum punya baris listing, jadi belum ada gambar yang tayang untuk ` +
+          'diganti. Gambarnya dipilih saat memajang kartunya.',
+        consignmentId: id,
+      });
+    }
+    if (listing.status !== ListingStatus.ACTIVE) {
+      throw consignmentError({
+        status: HttpStatus.CONFLICT,
+        code: CONSIGNMENT_ERROR_CODE.BAD_TRANSITION,
+        message:
+          `Listing ${listing.id} berstatus ${listing.status}, bukan ACTIVE — gambarnya tidak ` +
+          'bisa diganti lagi. Baris listing yang sudah terjual adalah catatan tentang APA YANG ' +
+          'DILIHAT pembeli saat ia membayar, dan itu tidak boleh ditulis ulang sesudahnya.',
+        consignmentId: id,
+      });
+    }
+
+    const nextImage = dto.image ?? listing.image;
+    const nextBack = wantsBack ? (dto.imageBack ?? null) : listing.imageBack;
+    if (nextImage === listing.image && nextBack === listing.imageBack) {
+      throw new BadRequestException(
+        'Tidak ada yang berubah: gambar yang dikirim sama persis dengan yang sedang tayang. ' +
+          'Tidak ada baris audit yang dibuat untuk perubahan yang tidak terjadi.',
+      );
+    }
+
+    // Potongan pendek supaya baris audit tetap terbaca kalau yang dikirim data URL base64
+    // sepanjang ratusan kilobyte — yang memang diizinkan `@IsImageRef`.
+    const brief = (v: string | null): string =>
+      v == null ? '(kosong)' : v.length > 120 ? `${v.slice(0, 117)}…` : v;
+
+    await this.prisma.$transaction(async (tx) => {
+      const upd = await tx.listing.updateMany({
+        // Keempat syarat ikut disebut. `consignmentId` supaya rute ini tidak bisa menyentuh
+        // listing milik siapa pun selain titipan ini; `image`/`imageBack` menjadikannya gerbang
+        // optimistic — operator lain yang menggantinya lebih dulu membuat penulisan ini GAGAL,
+        // bukan diam-diam menimpa pilihannya.
+        where: {
+          id: listing.id,
+          consignmentId: id,
+          status: ListingStatus.ACTIVE,
+          image: listing.image,
+          imageBack: listing.imageBack,
+        },
+        data: { image: nextImage, imageBack: nextBack },
+      });
+      if (upd.count !== 1) {
+        throw consignmentError({
+          status: HttpStatus.CONFLICT,
+          code: CONSIGNMENT_ERROR_CODE.BAD_TRANSITION,
+          message:
+            'Gambar listing ini sudah berubah sejak layar dimuat (mungkin operator lain ' +
+            'menggantinya lebih dulu, atau kartunya barusan terjual). TIDAK ADA yang ditulis — ' +
+            'muat ulang halamannya dan lihat gambar yang tayang sekarang.',
+          consignmentId: id,
+        });
+      }
+
+      await this.writeEvent(tx, {
+        consignmentId: id,
+        kind: 'LISTING_IMAGE',
+        actor: admin,
+        note:
+          `Gambar listing ${listing.id} diganti. ` +
+          (nextImage !== listing.image
+            ? `Depan: ${brief(listing.image)} → ${brief(nextImage)}. `
+            : '') +
+          (nextBack !== listing.imageBack
+            ? `Belakang: ${brief(listing.imageBack)} → ${brief(nextBack)}. `
+            : '') +
+          'Foto serah terima tidak disentuh.',
+      });
+    });
+
+    this.logger.warn(
+      `GAMBAR LISTING titipan ${id} diganti oleh admin ${admin.id} (listing ${listing.id}).`,
+    );
+    return this.byId(id);
   }
 
   /* ══════════════════════════════ 7. PEMBACAAN ══════════════════════════════ */
