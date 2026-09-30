@@ -181,6 +181,10 @@ function fakePrisma(world: World): PrismaService {
           : null,
     },
     cardRedemption: {
+      // Meniru `listing.count` di atas. `matches` sudah menangani `{ not: null }`, jadi test
+      // benar-benar mengevaluasi pagar rail-nya — bukan sekadar merekam bentuk `where`.
+      count: async ({ where }: any) =>
+        world.redemption && matches(world.redemption, where) ? 1 : 0,
       findUnique: async ({ where }: any) =>
         world.redemption && world.redemption.id === where.id
           ? { ...world.redemption }
@@ -2429,5 +2433,131 @@ describe('B4 — GET/PUT tarif ongkir menyajikan kontrak yang lengkap', () => {
     expect(
       world.rates.filter((r) => r.scope === DOMESTIC_TIER_JAWA),
     ).toHaveLength(1);
+  });
+});
+/* ══════════ PAKET BERBAYAR YANG BELUM BERANGKAT — ANGKA YANG MEMANGGIL ADMIN ══════════ */
+
+/**
+ * ╔════════════════════════════════════════════════════════════════════════════════════════════╗
+ * ║ LUBANG YANG DITUTUP ANGKA INI.                                                             ║
+ * ╚════════════════════════════════════════════════════════════════════════════════════════════╝
+ *
+ * Sesudah pembeli melunasi ongkir, barisnya berpindah SENDIRI ke PACKING — lalu tidak ada apa pun
+ * yang menyentuhnya lagi. Tidak ada email, tidak ada penjadwal, dan `redemptionActionRequired`
+ * tidak punya cabang untuk PACKING. Satu-satunya tanda adalah spanduk hijau di /admin/redemptions,
+ * yang hanya terlihat kalau ada orang yang memang membuka halaman itu — dan tab bawaannya bukan
+ * PACKING. Jadi keadaan yang mungkin terjadi: dua pembayaran Rupiah sudah mendarat, kartu MILIK
+ * ORANG LAIN masih di rak, dan tidak ada satu pun hal yang rusak, error, atau berbunyi.
+ *
+ * Yang diuji di sini bukan angkanya, melainkan PAGARNYA: apa yang ikut dihitung dan apa yang tidak.
+ * Salah pagar di sini berarti lencana yang berbohong ke dua arah — memanggil admin untuk paket
+ * yang tidak ada, atau diam untuk paket yang sudah dibayar.
+ */
+describe('pendingPackCount — paket yang ongkirnya beres dan belum dikemas', () => {
+  it('baris DOMESTIK di PACKING dihitung sebagai pekerjaan', async () => {
+    const world = baseWorld({ redemption: domesticRow(RedemptionStatus.PACKING) });
+
+    await expect(admin(world).pendingPackCount()).resolves.toEqual({
+      pendingPack: 1,
+    });
+  });
+
+  /**
+   * PAGAR RAIL — satu-satunya test yang memisahkan "sudah dibayar" dari baris CollectorCrypt.
+   *
+   * PACKING di rail CC adalah keadaan yang SAH dan benar-benar tercapai: transisi admin
+   * REQUESTED→PACKING tidak berpagar rail. Tapi di rail itu NOL Rupiah pernah masuk, dan
+   * menghitungnya berarti mengirim admin mengemas paket yang pembelinya belum bayar apa pun.
+   */
+  it('baris rail CC di PACKING (listingId null) TIDAK PERNAH dihitung', async () => {
+    const world = baseWorld({
+      redemption: domesticRow(RedemptionStatus.PACKING, {
+        listingId: null,
+        source: 'PACK',
+      }),
+    });
+
+    await expect(admin(world).pendingPackCount()).resolves.toEqual({
+      pendingPack: 0,
+    });
+  });
+
+  /**
+   * Ini yang mengunci keputusan "saring dengan RAIL, bukan dengan keadaan bayar".
+   *
+   * `absorbShippingFee` memindahkan baris domestik ke PACKING tanpa order ongkir sama sekali —
+   * ongkirnya ditanggung Hoshi. Paket itu justru yang PALING wajib berangkat: uangnya sudah
+   * dikeluarkan Hoshi sendiri. Menambahkan syarat "ongkirnya lunas" akan menyembunyikannya.
+   */
+  it('baris DOMESTIK yang ongkirnya DITANGGUNG HOSHI (nol order) tetap dihitung', async () => {
+    const world = baseWorld({
+      redemption: domesticRow(RedemptionStatus.PACKING, { paymentOrderId: null }),
+      order: null,
+    });
+
+    await expect(admin(world).pendingPackCount()).resolves.toEqual({
+      pendingPack: 1,
+    });
+  });
+
+  /**
+   * Lencananya tentang PAKET YANG MENUNGGU DIKEMAS, bukan tentang uang yang sudah masuk. Baris
+   * REQUESTED yang ongkirnya sudah lunas belum berpindah ke PACKING, dan menghitungnya akan
+   * membuat angka lencana tidak cocok dengan jumlah baris yang benar-benar bisa dikerjakan.
+   */
+  it('baris DOMESTIK berstatus REQUESTED tidak dihitung, walau ongkirnya sudah lunas', async () => {
+    const world = baseWorld({
+      redemption: domesticRow(RedemptionStatus.REQUESTED),
+      order: shippingOrder(PaymentStatus.FULFILLED),
+    });
+
+    await expect(admin(world).pendingPackCount()).resolves.toEqual({
+      pendingPack: 0,
+    });
+  });
+
+  it.each([
+    RedemptionStatus.SHIPPED,
+    RedemptionStatus.DELIVERED,
+    RedemptionStatus.CANCELED,
+  ])('baris DOMESTIK yang sudah %s tidak dihitung lagi', async (status) => {
+    const world = baseWorld({ redemption: domesticRow(status) });
+
+    await expect(admin(world).pendingPackCount()).resolves.toEqual({
+      pendingPack: 0,
+    });
+  });
+
+  /**
+   * ╔════════════════════════════════════════════════════════════════════════════════════════╗
+   * ║ PAGAR REGRESI: `redemptionActionRequired` SENGAJA TIDAK DISENTUH.                      ║
+   * ╚════════════════════════════════════════════════════════════════════════════════════════╝
+   *
+   * Menambah cabang PACKING ke sana terlihat seperti perbaikan yang sama, dan bukan. Spanduk
+   * amber di /admin/redemptions hari ini HANYA berisi uang-berisiko (ganti rugi tertunggak,
+   * pembayaran menggantung, ongkir belum lunas), daftarnya dipotong delapan baris tanpa prioritas,
+   * dan halamannya sendiri sudah punya spanduk hijau untuk paket siap kemas. Menambahkan kalimat
+   * rutin ke sana akan mendobel pesannya DAN bisa mendorong baris ganti rugi — uang pembeli yang
+   * wajib dikembalikan — keluar dari layar.
+   *
+   * Kedua test ini yang mengunci keputusan itu supaya tidak "diperbaiki" belakangan tanpa sadar.
+   */
+  it('baris DOMESTIK di PACKING tidak menambah kalimat apa pun ke spanduk amber', async () => {
+    const world = baseWorld({ redemption: domesticRow(RedemptionStatus.PACKING) });
+
+    const [row] = await admin(world).listRedemptions();
+    expect(row.actionRequired).toEqual([]);
+  });
+
+  it('baris rail CC di PACKING juga tidak menambah kalimat ke spanduk amber', async () => {
+    const world = baseWorld({
+      redemption: domesticRow(RedemptionStatus.PACKING, {
+        listingId: null,
+        source: 'PACK',
+      }),
+    });
+
+    const [row] = await admin(world).listRedemptions();
+    expect(row.actionRequired).toEqual([]);
   });
 });

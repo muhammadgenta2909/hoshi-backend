@@ -135,6 +135,36 @@ export function isDomesticRedemption(row: RedemptionRailShape): boolean {
 }
 
 /**
+ * ╔════════════════════════════════════════════════════════════════════════════════════════════╗
+ * ║ PAKET YANG SUDAH DIBAYAR DAN BELUM BERANGKAT — SEBAGAI FILTER PRISMA.                      ║
+ * ╚════════════════════════════════════════════════════════════════════════════════════════════╝
+ *
+ * Cermin `isDomesticRedemption` untuk dipakai di `where` Prisma, dan ditaruh TEPAT di sebelahnya
+ * supaya keduanya tidak bisa menyimpang. Query tidak bisa memanggil fungsi TypeScript, jadi tanpa
+ * satu definisi bernama di sini aturan rail akan disalin ulang di service — dan orang berikutnya
+ * yang mengubah aturannya hanya akan menemukan salah satu salinannya.
+ *
+ * Tiga keputusan yang mahal kalau dilupakan:
+ *
+ * 1. `listingId: { not: null }` ADALAH rail-nya, bukan sekadar penyaring. `source` berbentuk bebas
+ *    dan baris warisan bisa berbunyi 'HOSHI' untuk jalur CollectorCrypt; kolom `listingId` tidak
+ *    bisa berbohong karena ia hanya terisi saat baris domestik lahir.
+ *
+ * 2. SENGAJA TIDAK ADA syarat keadaan-bayar. `absorbShippingFee` memindahkan baris domestik ke
+ *    PACKING TANPA order ongkir sama sekali (ongkirnya ditanggung Hoshi) — dan justru paket itulah
+ *    yang paling wajib berangkat. Menyaring dengan "ongkirnya lunas" akan menyembunyikannya.
+ *
+ * 3. PACKING di rail CollectorCrypt adalah keadaan yang SAH dan benar-benar tercapai hari ini
+ *    (`REDEMPTION_ADMIN_TRANSITIONS` mengizinkan REQUESTED→PACKING untuk rail mana pun). Jadi
+ *    pagar rail di sini bukan kehati-hatian berlebihan: tanpa itu, baris yang NOL rupiahnya pernah
+ *    masuk akan ikut terhitung sebagai "paket berbayar menunggu dikemas".
+ */
+export const DOMESTIC_PENDING_PACK_WHERE = {
+  status: RedemptionStatus.PACKING,
+  listingId: { not: null },
+} as const;
+
+/**
  * Status yang BOLEH dilalui sebuah baris jalur DOMESTIK. Semuanya status yang SUDAH ADA di jalur
  * record-only — jalur ini SENGAJA tidak menambah satu pun nilai enum baru, supaya invariant
  * keterjangkauan-jalan-keluar (`redemption-exit-reachability.spec.ts`) tetap utuh tanpa driver

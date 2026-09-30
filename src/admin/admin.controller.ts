@@ -354,6 +354,26 @@ export class AdminController {
     return this.admin.listRedemptions();
   }
 
+  /**
+   * Angka RINGAN untuk lencana sidebar admin — dipanggil ulang tiap 15 detik dari SETIAP halaman
+   * /admin/*, jadi ia sengaja cuma satu `count` dan bukan `GET admin/stats` (8 count + aggregate).
+   * Presedennya `GET admin/support/unread-count`, yang sudah di-poll dari layout yang sama.
+   */
+  @Get('redemptions/pending-count')
+  @ApiBearerAuth()
+  @UseGuards(AdminGuard)
+  @ApiOperation({
+    summary:
+      'Berapa paket yang ongkirnya sudah beres dan belum dikemas (status PACKING). HANYA rail ' +
+      'DOMESTIK: pagarnya `listingId` non-null, karena baris CollectorCrypt juga BOLEH duduk di ' +
+      'PACKING namun nol Rupiah pernah masuk ke sana. TIDAK menyaring keadaan bayar — jalur ' +
+      '"ongkir ditanggung Hoshi" (absorbShippingFee) menaruh baris domestik di PACKING tanpa ' +
+      'order ongkir sama sekali, dan justru paket itu yang paling wajib berangkat.',
+  })
+  redemptionsPendingCount() {
+    return this.admin.pendingPackCount();
+  }
+
   @Patch('redemptions/:id/status')
   @ApiBearerAuth()
   @UseGuards(AdminGuard)

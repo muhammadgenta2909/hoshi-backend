@@ -68,7 +68,10 @@ import {
 } from '../payments/idrx-mint-bounds';
 import { appendBoundedNote, NOTE_MAX } from '../common/append-note';
 import { isHoshiSellableStock } from '../common/hoshi-stock';
-import { isDomesticRedemption } from '../common/hoshi-domestic-shipping';
+import {
+  DOMESTIC_PENDING_PACK_WHERE,
+  isDomesticRedemption,
+} from '../common/hoshi-domestic-shipping';
 import { AdminCreateListingDto } from './dto/admin-create-listing.dto';
 import { AdminUpdateListingDto } from './dto/admin-update-listing.dto';
 import { CreateContactMessageDto } from './dto/contact-message.dto';
@@ -740,6 +743,36 @@ export class AdminService {
         actionRequired: redemptionActionRequired(r.status, rail, ongkir),
       };
     });
+  }
+
+  /**
+   * ╔════════════════════════════════════════════════════════════════════════════════════════╗
+   * ║ BERAPA PAKET YANG UANGNYA SUDAH BERES DAN KARTUNYA MASIH DI RAK.                       ║
+   * ╚════════════════════════════════════════════════════════════════════════════════════════╝
+   *
+   * Ini ANGKA PEKERJAAN, bukan statistik. Setiap hitungannya adalah satu kartu fisik — sering
+   * kartu MILIK ORANG LAIN yang dititipkan ke Hoshi — yang pembelinya sudah membayar dua kali
+   * (harga kartu, lalu ongkir) dan sekarang menunggu ada manusia yang mengemasnya.
+   *
+   * Lubang yang ditutupnya: sesudah ongkir lunas, baris berpindah sendiri ke PACKING dan setelah
+   * itu TIDAK ADA apa pun yang bergerak lagi. Tidak ada email, tidak ada penjadwal, dan satu-
+   * satunya tanda adalah spanduk hijau di satu halaman yang harus dibuka dengan sengaja. Angka
+   * ini ada supaya pekerjaan itu ikut ke mana pun admin membuka layar admin.
+   *
+   * DIHITUNG DARI DATABASE, bukan dari `listRedemptions()`. Rute itu `take: 200` tanpa `where`,
+   * dan baris CANCELED/DELIVERED ikut memenuhi jendelanya — jadi paket yang PALING LAMA
+   * tertunggak justru yang pertama jatuh keluar, dan angkanya akan terbaca "tidak ada pekerjaan"
+   * tepat ketika pekerjaannya menumpuk. Hanya `count` yang jujur di sini.
+   *
+   * Tipe kembaliannya DITULIS EKSPLISIT (bukan dibiarkan disimpulkan): serializer bertipe inferred
+   * membuat field yang hilang lolos dari tsc dan baru meledak di layar.
+   */
+  async pendingPackCount(): Promise<{ pendingPack: number }> {
+    return {
+      pendingPack: await this.prisma.cardRedemption.count({
+        where: DOMESTIC_PENDING_PACK_WHERE,
+      }),
+    };
   }
 
   /**
