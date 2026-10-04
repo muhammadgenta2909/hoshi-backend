@@ -8,6 +8,7 @@ import {
   chargeableIdrFor,
   chargeablePriceRangeSentence,
   isChargeablePrice,
+  minimumMintedFor,
 } from './idrx-mint-bounds';
 
 /* ══════════════════════════════════════════════════════════════════════════════════════════════
@@ -178,5 +179,36 @@ describe('batas harga yang bisa ditagihkan', () => {
     expect(isChargeablePrice(19_860)).toBe(true);
     expect(chargeableIdrFor(19_859)).toBeLessThan(IDRX_MIN_MINT_IDR);
     expect(isChargeablePrice(19_859)).toBe(false);
+  });
+});
+
+/**
+ * LANTAI IDRX YANG DICETAK. Angka-angkanya diambil dari dokumentasi IDRX sendiri (halaman Fees dan
+ * contoh catatan Transaction History: tagihan Rp 20.000 → `toBeMinted: "19860"`, biaya 140), bukan
+ * dihitung dengan rumus yang sama dengan yang diuji — kalau keduanya pakai rumus yang sama, test
+ * ini hanya membuktikan bahwa rumus itu sama dengan dirinya sendiri.
+ */
+describe('minimumMintedFor — lantai sesudah biaya QRIS dipotong', () => {
+  it('tagihan Rp 20.000 → lantai Rp 19.860 (contoh persis di dokumentasi IDRX)', () => {
+    expect(minimumMintedFor(20_000)).toBe(19_860);
+  });
+
+  it('tagihan Rp 100.000 → lantai Rp 99.300 (contoh "Alex" di halaman Fees IDRX)', () => {
+    expect(minimumMintedFor(100_000)).toBe(99_300);
+  });
+
+  it('ongkir Rp 25.000 (tanpa gandaan fee) → lantai Rp 24.825', () => {
+    expect(minimumMintedFor(25_000)).toBe(24_825);
+  });
+
+  it('biaya yang tidak bulat dibulatkan KE ATAS, jadi lantainya tidak pernah lebih ketat dari biaya sebenarnya', () => {
+    // 20.143 × 0,7% = 141,001 → biaya maksimal yang mungkin dipotong 142 → lantai 20.001.
+    expect(minimumMintedFor(20_143)).toBe(20_001);
+  });
+
+  it('kartu termurah yang bisa ditagih: treasury tetap menerima harga kartunya penuh', () => {
+    expect(minimumMintedFor(chargeableIdrFor(CHARGEABLE_PRICE_MIN_IDRX))).toBe(
+      CHARGEABLE_PRICE_MIN_IDRX,
+    );
   });
 });

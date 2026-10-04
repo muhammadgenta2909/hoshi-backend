@@ -2945,6 +2945,49 @@ describe('PaymentsService', () => {
       expect(gacha.purchase).not.toHaveBeenCalled();
     });
 
+    /**
+     * ╔══════════════════════════════════════════════════════════════════════════════════════╗
+     * ║ QRIS MEMOTONG BIAYANYA DARI IDRX YANG DICETAK — DAN ITU BUKAN PENYIMPANGAN.          ║
+     * ╚══════════════════════════════════════════════════════════════════════════════════════╝
+     *
+     * Dulu pin ini menuntut `toBeMinted >= priceIdr`. Dokumentasi IDRX (Fees + contoh catatan
+     * History) menyatakan biaya QRIS 0,7% dipotong DARI IDRX yang dicetak, dan `toBeMinted`
+     * adalah angka SESUDAH potongan. Jadi SETIAP pembayaran QRIS yang berhasil dicap menyimpang,
+     * jatuh ke REFUND_DUE, dan barangnya tidak pernah diserahkan. Tidak satu pun test lama
+     * menangkapnya karena semua catatan buatan test menulis `toBeMinted` = tagihan penuh.
+     *
+     * Angka di bawah DITULIS TANGAN, bukan dihitung dengan `minimumMintedFor`: 805.600 × 0,7% =
+     * 5.639,2 → biaya 5.640 → 799.960. Kalau dihitung dengan fungsi yang sedang diuji, test ini
+     * akan ikut salah bersamanya.
+     */
+    it('QRIS: catatan SESUDAH potongan biaya (799.960 dari 805.600) → DIPENUHI, bukan utang', async () => {
+      prisma.paymentOrder.findUnique.mockResolvedValue(baseOrder);
+      idrx.findMintByMerchantOrderId.mockResolvedValue({
+        ...paidMintedRecord,
+        toBeMinted: '799960',
+      });
+
+      const outcome = await service.verifyAndFulfil(MERCHANT_ORDER_ID);
+
+      expect(outcome).toBe('FULFILLED');
+      expect(debtWrites()).toEqual([]);
+      expect(gacha.purchase).toHaveBeenCalledTimes(1);
+    });
+
+    it('satu rupiah di bawah lantai QRIS (799.959) → TETAP utang: itu kurang lebih dari biayanya sendiri', async () => {
+      const r = await runBothPaths({
+        ...paidMintedRecord,
+        toBeMinted: '799959',
+      });
+
+      expect(r.normalOutcome).toBe('REFUND_DUE');
+      expect(r.expiryOutcome).toBe('REFUND_DUE');
+      expect(String(r.normalDebts[0].data.error)).toContain('799959');
+      expect(String(r.normalDebts[0].data.error)).toContain('799960');
+      expect(r.normalDebts[0].data.refundSafe).toBe(false);
+      expect(gacha.purchase).not.toHaveBeenCalled();
+    });
+
     it('nominal yang di-mint JAUH di bawah tagihan → KEDUANYA utang, error menyebut nominalnya', async () => {
       const r = await runBothPaths({ ...paidMintedRecord, toBeMinted: 1_000 });
 

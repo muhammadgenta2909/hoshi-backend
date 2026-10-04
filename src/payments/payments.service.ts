@@ -71,6 +71,7 @@ import {
   BPS_DENOMINATOR,
   IDRX_MAX_MINT_IDR,
   IDRX_MIN_MINT_IDR,
+  minimumMintedFor,
   QRIS_FEE_BPS,
 } from './idrx-mint-bounds';
 import { CreatePackOrderDto } from './dto/create-pack-order.dto';
@@ -3905,14 +3906,19 @@ export class PaymentsService {
       };
     }
 
-    // Nominal: pin bila ada. Kita men-set toBeMinted = priceIdr saat request, jadi nilai yang
-    // lebih kecil berarti sesuatu yang serius menyimpang.
+    // Nominal: pin bila ada. Kita men-set toBeMinted = priceIdr saat request — tapi QRIS MEMOTONG
+    // biayanya dari IDRX yang dicetak, jadi lantainya `minimumMintedFor(priceIdr)`, BUKAN priceIdr.
+    // Dulu `minted < priceIdr`: SETIAP pembayaran QRIS yang berhasil jatuh ke REFUND_DUE. Yang di
+    // bawah lantai ini kurang lebih dari biaya QRIS itu sendiri — itu baru penyimpangan sungguhan.
     if (record.toBeMinted != null) {
       const minted = Number(record.toBeMinted);
-      if (!Number.isFinite(minted) || minted < order.priceIdr) {
+      const floor = minimumMintedFor(order.priceIdr);
+      if (!Number.isFinite(minted) || minted < floor) {
         return {
           refund: true,
-          reason: `nominal yang di-mint (${String(record.toBeMinted)}) di bawah tagihan Rp ${order.priceIdr}`,
+          reason:
+            `nominal yang di-mint (${String(record.toBeMinted)}) di bawah tagihan Rp ${order.priceIdr} ` +
+            `(lantai sesudah biaya QRIS: Rp ${floor})`,
         };
       }
     }

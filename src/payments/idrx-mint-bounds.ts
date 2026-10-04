@@ -46,6 +46,32 @@ function applyBpsCeil(value: number, bps: number): number {
 export const chargeableIdrFor = (priceIdrx: number): number =>
   applyBpsCeil(priceIdrx, BPS_DENOMINATOR + QRIS_FEE_BPS);
 
+/**
+ * ╔════════════════════════════════════════════════════════════════════════════════════════════╗
+ * ║ IDRX TERENDAH YANG SAH TERCETAK UNTUK SEBUAH TAGIHAN — BUKAN TAGIHANNYA SENDIRI.           ║
+ * ╚════════════════════════════════════════════════════════════════════════════════════════════╝
+ *
+ * Kita mengirim `toBeMinted = tagihan` saat mint-request, dan pemeriksa catatan IDRX dulu
+ * menuntut `toBeMinted >= tagihan`. Untuk QRIS itu MUSTAHIL dipenuhi: menurut dokumentasi IDRX
+ * (halaman Fees dan Callback), biaya QRIS 0,7% DIPOTONG DARI IDRX YANG DICETAK, dan `toBeMinted`
+ * di catatannya adalah angka SESUDAH potongan. Contoh di dokumentasinya sendiri persis kasus kita:
+ * tagihan Rp 20.000, `toBeMinted: "19860"`, baris biaya "Payment Method Fee" 140.
+ *
+ * Akibatnya dulu: SETIAP pembayaran QRIS yang berhasil dicap PIN MENYIMPANG → REFUND_DUE. Kartu
+ * tidak diserahkan, uang pembeli tertahan, dan tidak ada kode yang mengembalikannya.
+ *
+ * Kanal lain (VA, OVO, DANA) MENAMBAHKAN biayanya di atas tagihan, jadi untuk mereka
+ * `toBeMinted === tagihan`. QRIS satu-satunya yang memotong, jadi potongan QRIS-lah lantainya.
+ * Biaya dibulatkan KE ATAS: itu lantai paling longgar yang masih jujur, dan masih menolak setiap
+ * catatan yang kurang lebih dari biaya QRIS itu sendiri.
+ *
+ * Catatan jujur soal uangnya: karena fee digandakan dulu ke atas (`chargeableIdrFor`) lalu
+ * dipotong dari angka yang SUDAH digandakan, yang mendarat di treasury bisa sedikit DI BAWAH
+ * harga kartu — sekitar Rp 49 per Rp 1 juta. Itu bukan penyimpangan yang patut dijadikan utang.
+ */
+export const minimumMintedFor = (chargedIdr: number): number =>
+  chargedIdr - applyBpsCeil(chargedIdr, QRIS_FEE_BPS);
+
 /* ══════════════════════════════════════════════════════════════════════════════════════════════
    RENTANG HARGA KARTU YANG BENAR-BENAR BISA DITAGIHKAN
 
