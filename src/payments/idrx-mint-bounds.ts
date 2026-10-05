@@ -11,8 +11,26 @@
 /** Minimum satu mint IDRX. Nominal di bawah ini ditolak gateway. */
 export const IDRX_MIN_MINT_IDR = 20_000;
 
-/** Maksimum satu mint IDRX. */
-export const IDRX_MAX_MINT_IDR = 1_000_000_000;
+/**
+ * ╔═══ MAKSIMUM SATU TAGIHAN YANG BENAR-BENAR BISA DIBAYAR PEMBELI: Rp 10 JUTA, BUKAN Rp 1 MILIAR ═══╗
+ *
+ * Gateway IDRX menerima mint sampai Rp 1 miliar, tapi itu batas KESELURUHAN. Batas per kanalnya
+ * (docs.idrx.co, halaman Fees): QRIS Rp 10 juta, Virtual Account Rp 100 juta. Dan VA TIDAK BISA
+ * dipakai pembeli Hoshi sama sekali: IDRX hanya menerima transfer VA dari rekening atas nama
+ * PEMILIK akun IDRX (Mandiri/BRI malah harus dari rekening bank yang sama), sementara Hoshi
+ * memakai satu akun IDRX untuk semua pembeli. Transfer yang namanya tidak cocok ditolak bank,
+ * atau kalau sempat masuk, baru dikembalikan dalam 14 hari kerja.
+ *
+ * Jadi satu-satunya kanal yang bisa dipakai pembeli adalah QRIS, dan batas QRIS-lah batas kita.
+ * Dulu angkanya Rp 1 miliar: kartu Rp 50 juta lolos semua pemeriksaan, tayang, tagihannya terbit,
+ * lalu tidak ada satu cara bayar pun yang bisa menyelesaikannya. Itu lebih buruk daripada
+ * menolaknya sejak formulir titipan, karena penitip sudah dijanjikan kartunya akan dijual.
+ *
+ * Kalau IDRX menaikkan batas QRIS akun Hoshi, atau Hoshi mendaftarkan pembeli sebagai anggota
+ * IDRX (Onboarding API + `memberId`, sehingga VA terikat ke rekening pembeli sendiri), angka ini
+ * yang diubah. Semua batas turunannya (rentang harga titipan, harga kartu, tarif ongkir) ikut.
+ */
+export const IDRX_MAX_MINT_IDR = 10_000_000;
 
 export const BPS_DENOMINATOR = 10_000;
 
@@ -116,5 +134,6 @@ export const isChargeablePrice = (priceIdrx: number): boolean =>
 /** Kalimat yang menyebut ANGKANYA — layar dan pesan error tidak boleh menyuruh orang menebak. */
 export const chargeablePriceRangeSentence = (): string =>
   `Harga harus antara Rp ${CHARGEABLE_PRICE_MIN_IDRX.toLocaleString('id-ID')} dan ` +
-  `Rp ${CHARGEABLE_PRICE_MAX_IDRX.toLocaleString('id-ID')} (batas penerbitan tagihan IDRX, ` +
-  'sudah memperhitungkan biaya layanan pembayaran ~0,7% yang ditambahkan di atas harga).';
+  `Rp ${CHARGEABLE_PRICE_MAX_IDRX.toLocaleString('id-ID')}. Batas atasnya batas QRIS, satu-satunya ` +
+  'cara bayar yang bisa dipakai pembeli: maksimal Rp 10 juta per pembayaran, sudah termasuk biaya ' +
+  'layanan ~0,7% yang ditambahkan di atas harga. Kartu di atas itu belum bisa dijual lewat Hoshi.';

@@ -3378,7 +3378,7 @@ describe('ConsignmentService', () => {
     it('kartu DIPAJANG → pemiliknya diberi tahu, dengan harga yang benar-benar dipajang', async () => {
       await service.createListingFor(
         ID,
-        { image: '/x.png', priceIdrx: 24_000_000 },
+        { image: '/x.png', priceIdrx: 2_400_000 },
         admin,
       );
 
@@ -3388,7 +3388,7 @@ describe('ConsignmentService', () => {
           consignorId: consignor.id,
           cardName: 'Charizard',
         }),
-        { priceIdr: 24_000_000 },
+        { priceIdr: 2_400_000 },
       );
     });
 
@@ -3429,13 +3429,13 @@ describe('ConsignmentService', () => {
       // dilangkahi dengan mengubah pagarnya bukan pagar, cuma gesekan yang diajari untuk
       // diabaikan. Yang benar: tetap jalan, tapi tidak pernah diam-diam.
       prisma.consignment.findUnique.mockResolvedValue(
-        rowWith({ reservePriceIdr: 20_000_000, askPriceIdr: 24_000_000 }),
+        rowWith({ reservePriceIdr: 2_000_000, askPriceIdr: 2_400_000 }),
       );
 
       const out = await service.updatePrice(
         ID,
         {
-          askPriceIdr: 18_000_000,
+          askPriceIdr: 1_800_000,
           note: 'Pemilik minta turun lewat telepon, sudah disetujui.',
         },
         admin,
@@ -3444,10 +3444,10 @@ describe('ConsignmentService', () => {
       expect(out.belowReserveWarning).toMatch(/DI BAWAH HARGA TERENDAH/);
       expect(prisma.consignment.updateMany).toHaveBeenCalledWith(
         expect.objectContaining({
-          data: { askPriceIdr: 18_000_000 },
+          data: { askPriceIdr: 1_800_000 },
         }),
       );
-      expect(allEventNotes()[0]).toMatch(/reserve Rp 20000000/);
+      expect(allEventNotes()[0]).toMatch(/reserve Rp 2000000/);
     });
 
     /* ══════════════════════════════════════════════════════════════════════════════════════
@@ -3466,7 +3466,7 @@ describe('ConsignmentService', () => {
     it('menurunkan harga ikut menurunkan taksiran — tidak ada "-40% 30D" yang dikarang', async () => {
       prisma.consignment.findUnique.mockResolvedValue(
         rowWith({
-          askPriceIdr: 20_000_000,
+          askPriceIdr: 2_000_000,
           listing: { id: 'listing-1', status: 'ACTIVE' },
         }),
       );
@@ -3474,7 +3474,7 @@ describe('ConsignmentService', () => {
       await service.updatePrice(
         ID,
         {
-          askPriceIdr: 12_000_000,
+          askPriceIdr: 1_200_000,
           note: 'Pemilik minta turun; sudah disetujui lewat telepon.',
         },
         admin,
@@ -3483,8 +3483,8 @@ describe('ConsignmentService', () => {
       expect(prisma.listing.updateMany).toHaveBeenCalledWith(
         expect.objectContaining({
           data: {
-            priceIdrx: 12_000_000,
-            expectedValueIdrx: 12_000_000,
+            priceIdrx: 1_200_000,
+            expectedValueIdrx: 1_200_000,
           },
         }),
       );
@@ -3492,12 +3492,12 @@ describe('ConsignmentService', () => {
 
     it('di ATAS reserve: tidak ada peringatan sama sekali', async () => {
       prisma.consignment.findUnique.mockResolvedValue(
-        rowWith({ reservePriceIdr: 20_000_000 }),
+        rowWith({ reservePriceIdr: 2_000_000 }),
       );
       const out = await service.updatePrice(
         ID,
         {
-          askPriceIdr: 21_000_000,
+          askPriceIdr: 2_100_000,
           note: 'Harga pasar naik; disepakati pemilik.',
         },
         admin,
@@ -3507,15 +3507,15 @@ describe('ConsignmentService', () => {
 
     it('memajang di bawah reserve ikut diperingatkan dan tercatat di jejak audit', async () => {
       prisma.consignment.findUnique.mockResolvedValue(
-        rowWith({ reservePriceIdr: 20_000_000 }),
+        rowWith({ reservePriceIdr: 2_000_000 }),
       );
       const out = await service.createListingFor(
         ID,
-        { image: '/x.png', priceIdrx: 18_000_000 },
+        { image: '/x.png', priceIdrx: 1_800_000 },
         admin,
       );
       expect(out.belowReserveWarning).toMatch(/DI BAWAH HARGA TERENDAH/);
-      expect(allEventNotes().join(' ')).toMatch(/reserve Rp 20000000/);
+      expect(allEventNotes().join(' ')).toMatch(/reserve Rp 2000000/);
     });
 
     it('nilainya SAMPAI ke layar: angka reserve, harga berlaku, dan benderanya', async () => {
@@ -3523,16 +3523,16 @@ describe('ConsignmentService', () => {
         rowWith({
           id: 'x',
           status: ConsignmentStatus.LISTED,
-          reservePriceIdr: 20_000_000,
-          listing: { id: 'l1', status: 'ACTIVE', priceIdrx: 18_000_000 },
+          reservePriceIdr: 2_000_000,
+          listing: { id: 'l1', status: 'ACTIVE', priceIdrx: 1_800_000 },
         }),
       ]);
 
       const out = await service.adminList();
 
-      expect(out.rows[0].reservePriceIdr).toBe(20_000_000);
+      expect(out.rows[0].reservePriceIdr).toBe(2_000_000);
       expect(out.rows[0].belowReserve).toBe(true);
-      expect(out.rows[0].effectivePriceIdr).toBe(18_000_000);
+      expect(out.rows[0].effectivePriceIdr).toBe(1_800_000);
       expect(out.actionRequired[0].reasons.join(' ')).toMatch(
         /DI BAWAH harga terendah/,
       );

@@ -85,7 +85,15 @@ describe('batas harga yang bisa ditagihkan', () => {
       ['satu di atas batas atas', CHARGEABLE_PRICE_MAX_IDRX + 1, false],
       ['harga kartu graded murah yang tidak sah', 15_000, false],
       ['harga kartu kelas atas yang tidak sah', 1_200_000_000, false],
-      ['harga wajar di tengah', 24_250_000, true],
+      ['harga wajar di tengah', 2_500_000, true],
+      // Harga NYATA dari marketplace Hoshi (Charizard VMAX PSA 10). Dulu "wajar di tengah" — dan
+      // tagihannya memang terbit — padahal QRIS menolak di atas Rp 10 juta dan VA tidak bisa
+      // dipakai pembeli. Kartunya tayang, tombol Beli menyala, dan tidak ada yang bisa membayarnya.
+      [
+        'Rp 24.250.000: di atas batas QRIS, tidak bisa dibayar pembeli',
+        24_250_000,
+        false,
+      ],
       ['nol', 0, false],
       ['negatif', -1, false],
     ])('%s', (_nama, harga, harapan) => {
@@ -123,9 +131,9 @@ describe('batas harga yang bisa ditagihkan', () => {
      ⚠️ KALAU TEST INI MERAH karena `QRIS_FEE_BPS` atau batas mint berubah: jangan cuma
      memperbarui angka di bawah. PERBARUI JUGA BERKAS FRONTEND DI ATAS pada perubahan yang sama.
      ══════════════════════════════════════════════════════════════════════════════════════════ */
-  it('nilainya hari ini: Rp 19.860 – Rp 993.048.659', () => {
+  it('nilainya hari ini: Rp 19.860 – Rp 9.930.486 (batas atasnya batas QRIS Rp 10 juta)', () => {
     expect(CHARGEABLE_PRICE_MIN_IDRX).toBe(19_860);
-    expect(CHARGEABLE_PRICE_MAX_IDRX).toBe(993_048_659);
+    expect(CHARGEABLE_PRICE_MAX_IDRX).toBe(9_930_486);
   });
 
   /**
