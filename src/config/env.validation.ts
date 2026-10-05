@@ -253,7 +253,8 @@ class EnvironmentVariables {
   // Konsekuensinya, konfigurasi IDRX yang kurang baru ketahuan saat order pertama dibuat —
   // PaymentsService yang wajib memberi error jelas di titik itu, sama seperti TreasuryService.
 
-  // Opsional — base URL API IDRX. Default: https://idrx.co
+  // Opsional — base URL API IDRX. Default: https://api.idrx.co (host lama https://idrx.co/api
+  // dimatikan IDRX 30 Okt 2026). Isi https://idrx.co HANYA sebagai jalan pulang darurat.
   @IsOptional()
   @IsString()
   IDRX_API_BASE?: string;

@@ -9,6 +9,7 @@ import {
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { buildIdrxRequest } from '../idrx/idrx.signature';
+import { resolveIdrxEndpoint } from './idrx-endpoint';
 import { detectProductionSignal } from '../common/demo-mode';
 import { IdrxMockStore } from './idrx-mock.store';
 import type {
@@ -20,7 +21,8 @@ import type {
   IdrxTransactionRecord,
 } from './idrx.types';
 
-const IDRX_DEFAULT_BASE_URL = 'https://idrx.co';
+/** Host API IDRX sejak migrasi Oktober 2026 — lihat `idrx-endpoint.ts`. */
+const IDRX_DEFAULT_BASE_URL = 'https://api.idrx.co';
 
 /** Tanpa batas waktu, satu request IDRX yang menggantung bisa menyandera worker kita. */
 const IDRX_TIMEOUT_MS = 15_000;
@@ -65,7 +67,7 @@ export class IdrxClient {
     if (this.mockEnabled()) return this.mockMintRequest(input);
     return this.request<IdrxMintRequestResponse>(
       'POST',
-      '/api/transaction/mint-request',
+      '/transaction/mint-request',
       input,
     );
   }
@@ -89,7 +91,7 @@ export class IdrxClient {
     merchantOrderId: string,
   ): Promise<IdrxTransactionRecord | null> {
     if (this.mockEnabled()) return this.mockFindMint(merchantOrderId);
-    const path = this.withQuery('/api/transaction/user-transaction-history', {
+    const path = this.withQuery('/transaction/user-transaction-history', {
       transactionType: 'MINT',
       merchantOrderId,
       page: '1',
@@ -121,7 +123,7 @@ export class IdrxClient {
    */
   rates(usdtAmount: string, chainId?: string): Promise<IdrxRatesResponse> {
     if (this.mockEnabled()) return this.mockRates(usdtAmount);
-    const path = this.withQuery('/api/transaction/rates', {
+    const path = this.withQuery('/transaction/rates', {
       usdtAmount,
       ...(chainId ? { chainId } : {}),
     });
@@ -255,7 +257,7 @@ export class IdrxClient {
     if (!apiKey || !secretKeyBase64) {
       throw new ServiceUnavailableException(
         'Pembayaran IDRX belum dikonfigurasi. Set IDRX_API_KEY dan IDRX_API_SECRET ' +
-          '(serta IDRX_API_BASE bila bukan https://idrx.co) di environment.',
+          '(serta IDRX_API_BASE bila bukan https://api.idrx.co) di environment.',
       );
     }
     return { apiBase: apiBase.replace(/\/+$/, ''), apiKey, secretKeyBase64 };
@@ -277,9 +279,12 @@ export class IdrxClient {
   ): Promise<T> {
     const { apiBase, apiKey, secretKeyBase64 } = this.credentials();
 
+    // Path logis → path yang DIKIRIM sekaligus DITANDATANGANI. Lihat idrx-endpoint.ts: keduanya
+    // wajib identik, atau setiap request ditolak 401.
+    const endpoint = resolveIdrxEndpoint(apiBase, path);
     const signed = buildIdrxRequest({
-      apiBase,
-      path,
+      apiBase: endpoint.origin,
+      path: endpoint.path,
       method,
       apiKey,
       secretKeyBase64,
