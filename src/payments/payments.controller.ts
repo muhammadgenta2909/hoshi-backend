@@ -262,6 +262,32 @@ export class PaymentsController {
     return { received: true };
   }
 
+  @Post('duitku/callback')
+  // PUBLIK, TANPA GUARD — Duitku tidak bisa mengirim JWT kita. Duitku mengirimnya sebagai
+  // x-www-form-urlencoded; parser bawaan Nest sudah menangani bentuk itu. Aturan yang sama dengan
+  // callback IDRX: SELALU 2xx, lepas dari throttler, body cuma pemicu, bukti diambil ulang.
+  @HttpCode(200)
+  @SkipThrottle()
+  @ApiOperation({
+    summary:
+      'Webhook Duitku (publik, bertanda tangan md5) → selalu 2xx; tanda tangan tak sah diabaikan, ' +
+      'bukti pembayaran diambil ulang lewat transactionStatus',
+  })
+  async handleDuitkuCallback(
+    // Longgar dengan sengaja — alasan yang sama dengan callback IDRX di atas.
+    @Body() body: Record<string, unknown>,
+  ): Promise<{ received: true }> {
+    try {
+      await this.payments.handleDuitkuCallback(body);
+    } catch (err) {
+      this.logger.error(
+        `Callback Duitku gagal diproses (tetap 2xx, reconciler menyusul): ${
+          err instanceof Error ? err.message : 'unknown'
+        }`,
+      );
+    }
+    return { received: true };
+  }
   @Post('reconcile')
   @ApiBearerAuth()
   @UseGuards(AdminGuard)

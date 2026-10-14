@@ -22,7 +22,7 @@ import { CcShippingService } from '../collectorcrypt/cc-shipping.service';
 import { ConsignmentNotifyService } from '../consignment/consignment-notify.service';
 import type { CcMachineNormalized } from '../collectorcrypt/cc-gacha.types';
 import { PrismaService } from '../prisma/prisma.service';
-import { IdrxClient } from './idrx.client';
+import { PaymentGateway } from './payment-gateway';
 import { PaymentsService } from './payments.service';
 import type {
   IdrxMintRequestResponse,
@@ -73,6 +73,7 @@ describe('PaymentsService', () => {
     mintRequest: jest.Mock;
     rates: jest.Mock;
     findMintByMerchantOrderId: jest.Mock;
+    isDuitkuCallbackValid: jest.Mock;
   };
   let gacha: {
     machines: jest.Mock;
@@ -337,6 +338,8 @@ describe('PaymentsService', () => {
       rates: jest.fn().mockResolvedValue(ratesResponse(800_000)),
       // Default verifier: pembayaran TERBUKTI lunas & tercetak ke treasury.
       findMintByMerchantOrderId: jest.fn().mockResolvedValue(paidMintedRecord),
+      // Callback Duitku: bawaan TIDAK sah, supaya tidak ada test yang lolos karena kebetulan.
+      isDuitkuCallbackValid: jest.fn().mockReturnValue(false),
     };
     gacha = {
       machines: jest.fn().mockResolvedValue([machine]),
@@ -373,7 +376,7 @@ describe('PaymentsService', () => {
       providers: [
         PaymentsService,
         { provide: PrismaService, useValue: prisma },
-        { provide: IdrxClient, useValue: idrx },
+        { provide: PaymentGateway, useValue: idrx },
         { provide: GachaService, useValue: gacha },
         { provide: ConfigService, useValue: config },
         { provide: ResellerSettlementService, useValue: resellerSettlement },
@@ -3596,7 +3599,7 @@ describe('PaymentsService', () => {
           providers: [
             PaymentsService,
             { provide: PrismaService, useValue: prisma },
-            { provide: IdrxClient, useValue: idrx },
+            { provide: PaymentGateway, useValue: idrx },
             { provide: GachaService, useValue: gacha },
             { provide: ConfigService, useValue: config },
             {
@@ -3842,4 +3845,141 @@ describe('PaymentsService', () => {
     });
   });
 
+
+  /**
+   * ╔════════════════════════════════════════════════════════════════════════════════════════╗
+   * ║ REL DUITKU — PENGAMAN LAMA BERLAKU, PIN-NYA YANG BERBEDA.                              ║
+   * ╚════════════════════════════════════════════════════════════════════════════════════════╝
+   *
+   * Catatan Duitku masuk ke jalur verifikasi yang SAMA dengan IDRX (klaim atomik, utang refund,
+   * balapan callback). Yang berbeda hanya pin-nya: tidak ada wallet tujuan dan tidak ada
+   * requestType di pembayaran fiat. Kalau pin IDRX ikut dipakai, SETIAP pembayaran Duitku yang sah
+   * berhenti sebagai PIN_UNVERIFIABLE dan kartunya tidak pernah diserahkan.
+   */
+  describe('rel Duitku', () => {
+    const DK_ID = 'DK1791979642000a1b2c3d4';
+    const duitkuOrder: PaymentOrder = {
+      ...baseOrder,
+      merchantOrderId: DK_ID,
+      paymentMethod: 'HOSTED',
+      qrContent: null,
+    };
+    // Bentuk yang dihasilkan duitkuStatusToRecord untuk statusCode "00": tanpa wallet tujuan,
+    // tanpa requestType — persis yang akan menjatuhkan pin IDRX.
+    const duitkuPaid: IdrxTransactionRecord = {
+      id: 'DUITKU-REF-1',
+      merchantOrderId: DK_ID,
+      paymentStatus: 'PAID',
+      userMintStatus: 'MINTED',
+      toBeMinted: String(PRICE_IDR),
+      paymentAmount: String(PRICE_IDR),
+      rail: 'DUITKU',
+    };
+
+    it('pembayaran Duitku sah TANPA wallet tujuan → DITEBUS, bukan PIN_UNVERIFIABLE', async () => {
+      prisma.paymentOrder.findUnique.mockResolvedValue(duitkuOrder);
+      idrx.findMintByMerchantOrderId.mockResolvedValue(duitkuPaid);
+
+      const outcome = await service.verifyAndFulfil(DK_ID);
+
+      expect(outcome).toBe('FULFILLED');
+      expect(gacha.purchase).toHaveBeenCalledTimes(1);
+    });
+
+    it('nominal Duitku di bawah tagihan → UTANG, dan barangnya TIDAK berangkat', async () => {
+      prisma.paymentOrder.findUnique.mockResolvedValue(duitkuOrder);
+      idrx.findMintByMerchantOrderId.mockResolvedValue({
+        ...duitkuPaid,
+        toBeMinted: String(PRICE_IDR - 1),
+      });
+
+      const outcome = await service.verifyAndFulfil(DK_ID);
+
+      expect(outcome).toBe('REFUND_DUE');
+      expect(gacha.purchase).not.toHaveBeenCalled();
+    });
+
+    /**
+     * Pin rel. Lantai Duitku tagihan PENUH, lantai IDRX tagihan dikurangi biaya QRIS — kalau
+     * catatan dari rel yang salah bisa lolos, perbedaan itu jadi celah.
+     */
+    it('order IDRX yang "dibuktikan" catatan Duitku → UTANG, tidak ditebus', async () => {
+      prisma.paymentOrder.findUnique.mockResolvedValue(baseOrder);
+      idrx.findMintByMerchantOrderId.mockResolvedValue({
+        ...duitkuPaid,
+        merchantOrderId: MERCHANT_ORDER_ID,
+      });
+
+      const outcome = await service.verifyAndFulfil(MERCHANT_ORDER_ID);
+
+      expect(outcome).toBe('REFUND_DUE');
+      expect(gacha.purchase).not.toHaveBeenCalled();
+    });
+
+    it('order Duitku yang "dibuktikan" catatan IDRX → UTANG, tidak ditebus', async () => {
+      prisma.paymentOrder.findUnique.mockResolvedValue(duitkuOrder);
+      idrx.findMintByMerchantOrderId.mockResolvedValue({
+        ...paidMintedRecord,
+        merchantOrderId: DK_ID,
+      });
+
+      const outcome = await service.verifyAndFulfil(DK_ID);
+
+      expect(outcome).toBe('REFUND_DUE');
+      expect(gacha.purchase).not.toHaveBeenCalled();
+    });
+
+    describe('callback', () => {
+      it('tanda tangan TIDAK sah → diabaikan SEBELUM Duitku ditanya', async () => {
+        idrx.isDuitkuCallbackValid.mockReturnValue(false);
+
+        const outcome = await service.handleDuitkuCallback({
+          merchantOrderId: DK_ID,
+          resultCode: '00',
+        });
+
+        expect(outcome).toBe('UNKNOWN_ORDER');
+        expect(idrx.findMintByMerchantOrderId).not.toHaveBeenCalled();
+      });
+
+      it('tanda tangan sah tapi nomor order BUKAN milik Duitku → diabaikan', async () => {
+        idrx.isDuitkuCallbackValid.mockReturnValue(true);
+
+        const outcome = await service.handleDuitkuCallback({
+          merchantOrderId: MERCHANT_ORDER_ID,
+        });
+
+        expect(outcome).toBe('UNKNOWN_ORDER');
+        expect(idrx.findMintByMerchantOrderId).not.toHaveBeenCalled();
+      });
+
+      it('tanda tangan sah → bukti diambil ULANG server-ke-server, body tidak dipercaya', async () => {
+        idrx.isDuitkuCallbackValid.mockReturnValue(true);
+        prisma.paymentOrder.findUnique.mockResolvedValue(duitkuOrder);
+        idrx.findMintByMerchantOrderId.mockResolvedValue(duitkuPaid);
+
+        const outcome = await service.handleDuitkuCallback({
+          merchantOrderId: DK_ID,
+          // Body mengaku nominal kecil dan "gagal" — keduanya harus diabaikan.
+          amount: '1',
+          resultCode: '01',
+        });
+
+        expect(idrx.findMintByMerchantOrderId).toHaveBeenCalledWith(DK_ID);
+        expect(outcome).toBe('FULFILLED');
+      });
+    });
+
+    it('DTO order memberi tahu frontend rel pembayarannya', async () => {
+      prisma.paymentOrder.findFirst.mockResolvedValue(null);
+      idrx.mintRequest.mockResolvedValue(mintResponse(DK_ID));
+      prisma.paymentOrder.create.mockImplementation(
+        ({ data }: { data: Partial<PaymentOrder> }) => ({ ...duitkuOrder, ...data }),
+      );
+
+      const dto = await service.createPackOrder({ packType: 'pokemon_50' }, user);
+
+      expect(dto.provider).toBe('DUITKU');
+    });
+  });
 });

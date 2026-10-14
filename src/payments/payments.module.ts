@@ -3,9 +3,11 @@ import { CollectorCryptModule } from '../collectorcrypt/collectorcrypt.module';
 import { BalanceModule } from '../balance/balance.module';
 import { ConsignmentModule } from '../consignment/consignment.module';
 import { EscrowModule } from '../escrow/escrow.module';
+import { DuitkuClient } from './duitku.client';
 import { IdrxClient } from './idrx.client';
 import { IdrxMockController } from './idrx-mock.controller';
 import { IdrxMockStore } from './idrx-mock.store';
+import { PaymentGateway } from './payment-gateway';
 import { PaymentsController } from './payments.controller';
 import { PaymentsReconcileScheduler } from './payments-reconcile.scheduler';
 import { PaymentsService } from './payments.service';
@@ -49,6 +51,11 @@ import { PaymentsService } from './payments.service';
   controllers: [PaymentsController, IdrxMockController],
   providers: [
     PaymentsService,
+    // PaymentsService bergantung pada PaymentGateway (bukan IdrxClient langsung): satu pintu yang
+    // memilih IDRX atau Duitku. Lupa mendaftarkannya di sini = server GAGAL MENYALA, dan tsc
+    // tidak menangkapnya — ada test yang merakit modul ini untuk menjaganya.
+    PaymentGateway,
+    DuitkuClient,
     IdrxClient,
     IdrxMockStore,
     PaymentsReconcileScheduler,

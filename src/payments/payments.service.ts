@@ -75,7 +75,7 @@ import {
   QRIS_FEE_BPS,
 } from './idrx-mint-bounds';
 import { CreatePackOrderDto } from './dto/create-pack-order.dto';
-import { IdrxClient } from './idrx.client';
+import { isDuitkuOrderId, PaymentGateway } from './payment-gateway';
 
 /** Mesin default bila klien tidak menyebut packType — sama dengan jalur gacha. */
 const DEFAULT_PACK_TYPE = 'pokemon_50';
@@ -350,7 +350,7 @@ function orderSubject(order: PaymentOrder): string {
  * dikembalikan klien.
  */
 type IdrxMintRecord = NonNullable<
-  Awaited<ReturnType<IdrxClient['findMintByMerchantOrderId']>>
+  Awaited<ReturnType<PaymentGateway['findMintByMerchantOrderId']>>
 >;
 
 /** Hasil satu putaran verifikasi. Sengaja bukan exception: reconciler harus jalan terus. */
@@ -447,6 +447,11 @@ export interface PaymentOrderDto {
   /** USDC base unit (6 desimal) — satuan BERBEDA dari priceIdr, jangan dibandingkan. */
   priceUsdc: number;
   paymentMethod: string;
+  /**
+   * Rel pembayaran order ini, diturunkan dari nomor ordernya. Frontend memakainya untuk petunjuk
+   * cara bayar: kebiasaan aplikasi bank menolak QR IDRX tidak berlaku untuk halaman bayar Duitku.
+   */
+  provider: 'IDRX' | 'DUITKU';
   status: PaymentStatus;
   qrContent: string | null;
   virtualAccountNo: string | null;
@@ -511,7 +516,7 @@ export class PaymentsService {
 
   constructor(
     private readonly prisma: PrismaService,
-    private readonly idrx: IdrxClient,
+    private readonly idrx: PaymentGateway,
     private readonly gacha: GachaService,
     private readonly config: ConfigService,
     private readonly resellerSettlement: ResellerSettlementService,
@@ -1691,6 +1696,28 @@ export class PaymentsService {
     }
   }
 
+  /**
+   * Callback Duitku. Polanya SAMA dengan callback IDRX: body cuma PEMICU, buktinya diambil ulang
+   * server-ke-server lewat verifyAndFulfil (→ PaymentGateway → transactionStatus Duitku).
+   *
+   * Bedanya satu: callback Duitku bertanda tangan, jadi yang tanda tangannya tidak sah ditolak
+   * SEBELUM kita memanggil Duitku — supaya URL ini tidak bisa dipakai memaksa kita memverifikasi
+   * order karangan berulang-ulang. Tetap tidak pernah melempar; reconciler menyusul apa pun.
+   */
+  async handleDuitkuCallback(body: Record<string, unknown>): Promise<FulfilOutcome> {
+    if (!this.idrx.isDuitkuCallbackValid(body)) {
+      this.logger.warn('Callback Duitku dengan tanda tangan tidak sah — diabaikan.');
+      return 'UNKNOWN_ORDER';
+    }
+    const merchantOrderId = readMerchantOrderId(body);
+    if (!merchantOrderId || !isDuitkuOrderId(merchantOrderId)) {
+      this.logger.warn(
+        `Callback Duitku untuk nomor order yang bukan milik rel Duitku (${String(merchantOrderId)}) — diabaikan.`,
+      );
+      return 'UNKNOWN_ORDER';
+    }
+    return this.handleCallback({ merchantOrderId });
+  }
   /* ─────────────────────────── Verifikasi + fulfilment ─────────────────────────── */
 
   /**
@@ -3881,6 +3908,33 @@ export class PaymentsService {
     order: PaymentOrder,
     record: IdrxMintRecord,
   ): PinResult {
+    // ╔══ REL DUITKU: PIN FIAT, BUKAN PIN MINT ══╗
+    // Catatan Duitku tidak punya wallet tujuan, tidak punya requestType, dan tidak ada yang
+    // dicetak: rupiahnya mendarat di rekening PT. Memakai pin IDRX di sini akan menahan SETIAP
+    // pembayaran Duitku yang sah sebagai "tujuan mint tak bisa dipastikan". Yang dipin:
+    //  - rel catatan HARUS cocok dengan rel nomor order (order DK... wajib dibuktikan oleh Duitku,
+    //    dan sebaliknya) — gateway sudah memilih rel dari nomornya, ini sabuk keduanya;
+    //  - NOMINAL. Status Duitku melaporkan nominal TAGIHAN (biayanya terpisah, di `fee`), jadi
+    //    lantainya tagihan penuh — tidak ada potongan QRIS seperti di IDRX.
+    if (record.rail === 'DUITKU' || isDuitkuOrderId(order.merchantOrderId)) {
+      if (record.rail !== 'DUITKU' || !isDuitkuOrderId(order.merchantOrderId)) {
+        return {
+          refund: true,
+          reason:
+            `rel catatan (${record.rail ?? 'IDRX'}) tidak cocok dengan rel order ` +
+            `${order.merchantOrderId} — bukti datang dari jalur pembayaran yang salah`,
+        };
+      }
+      const paid = Number(record.toBeMinted);
+      if (!Number.isFinite(paid) || paid < order.priceIdr) {
+        return {
+          refund: true,
+          reason: `nominal Duitku (${String(record.toBeMinted)}) di bawah tagihan Rp ${order.priceIdr}`,
+        };
+      }
+      return null;
+    }
+
     const treasuryAddress = this.config.get<string>('HOSHI_TREASURY_ADDRESS');
     if (!treasuryAddress || treasuryAddress.trim().length === 0) {
       // Misconfigurasi KITA (env dicabut setelah order dibuat), bukan mint ke wallet asing.
@@ -4414,6 +4468,7 @@ function toPaymentOrderDto(order: PaymentOrder): PaymentOrderDto {
     priceIdr: order.priceIdr,
     priceUsdc: order.priceUsdc,
     paymentMethod: order.paymentMethod,
+    provider: isDuitkuOrderId(order.merchantOrderId) ? 'DUITKU' : 'IDRX',
     status: order.status,
     qrContent: order.qrContent,
     virtualAccountNo: order.virtualAccountNo,

@@ -1,5 +1,6 @@
 import { plainToInstance } from 'class-transformer';
 import {
+  IsEmail,
   IsIn,
   IsInt,
   IsOptional,
@@ -247,6 +248,56 @@ class EnvironmentVariables {
   @IsOptional()
   @IsInt()
   GACHA_TREASURY_DAILY_CAP_USDC?: number;
+
+  // ── DUITKU (payment gateway pembeli) ─────────────────────────────────────
+  // IDRX mewajibkan nama pembayar = nama pemilik akun IDRX (PT), jadi pembeli umum tidak bisa
+  // membayar lewat IDRX. Duitku menerima pembayaran dari siapa pun. Semua @IsOptional(): selama
+  // PAYMENT_PROVIDER belum "duitku", tidak ada satu pun yang dibaca. Lihat src/payments/duitku.client.ts.
+
+  // Opsional — rel tagihan BARU: "idrx" (bawaan) atau "duitku". Bukti pembayaran tidak ikut saklar
+  // ini: order lama tetap diverifikasi ke rel yang menerbitkannya (dibaca dari nomor ordernya).
+  @IsOptional()
+  @IsIn(['idrx', 'duitku'], {
+    message: 'PAYMENT_PROVIDER harus "idrx" atau "duitku"',
+  })
+  PAYMENT_PROVIDER?: string;
+
+  // Opsional — "sandbox" atau "production". Sandbox DITOLAK di deployment produksi (pembayaran
+  // sandbox gratis = kartu sungguhan diserahkan tanpa bayar).
+  @IsOptional()
+  @IsIn(['sandbox', 'production'], {
+    message: 'DUITKU_ENV harus "sandbox" atau "production"',
+  })
+  DUITKU_ENV?: string;
+
+  // Opsional (WAJIB kalau PAYMENT_PROVIDER=duitku) — kode merchant dari dashboard Duitku.
+  @IsOptional()
+  @IsString()
+  DUITKU_MERCHANT_CODE?: string;
+
+  // Opsional (WAJIB kalau PAYMENT_PROVIDER=duitku) — API key (merchant key) Duitku. RAHASIA:
+  // ia yang membuktikan tagihan, cek status, dan callback benar-benar milik kita. JANGAN pernah
+  // di-log, dikembalikan lewat API, atau ikut masuk ke pesan error.
+  @IsOptional()
+  @IsString()
+  DUITKU_API_KEY?: string;
+
+  // Opsional (WAJIB kalau PAYMENT_PROVIDER=duitku) — URL publik callback, mis.
+  // https://api.hoshimarket.xyz/api/payments/duitku/callback
+  @IsOptional()
+  @IsUrl({ require_tld: false, protocols: ['https', 'http'] })
+  DUITKU_CALLBACK_URL?: string;
+
+  // Opsional (WAJIB kalau PAYMENT_PROVIDER=duitku) — email operasional Hoshi yang dikirim ke
+  // Duitku sebagai "email pelanggan". Pembeli nyaris tidak pernah punya email di database.
+  @IsOptional()
+  @IsEmail()
+  DUITKU_CUSTOMER_EMAIL?: string;
+
+  // Opsional — nama di konfirmasi bank/VA pembeli. Bawaan: "Hoshimarket".
+  @IsOptional()
+  @IsString()
+  DUITKU_VA_NAME?: string;
 
   // ── IDRX (on-ramp rupiah) ────────────────────────────────────────────────
   // Semua @IsOptional(): deploy yang belum memakai pembayaran rupiah harus tetap bisa boot.
@@ -689,6 +740,7 @@ export function validateEnv(config: Record<string, unknown>) {
   warnIfPaymentReturnUrlMissing(config);
   warnIfResellCapUnset(config);
   warnIfBiteshipConfigIncomplete(config);
+  warnIfDuitkuConfigIncomplete(config);
   return validated;
 }
 
@@ -869,4 +921,34 @@ function assertSponsorCapsReadable(config: Record<string, unknown>): void {
         problems.map((p) => `  • ${p}`).join('\n'),
     );
   }
+}
+
+/**
+ * DUITKU DINYALAKAN TAPI TIDAK LENGKAP — berteriak, tidak mematikan start.
+ *
+ * Kalau `PAYMENT_PROVIDER=duitku` tapi kredensialnya kurang, SETIAP checkout akan gagal 503 —
+ * kegagalan yang baru terlihat saat pembeli pertama menekan Beli. Berteriak saat boot memberi
+ * operator kesempatan melihatnya lebih dulu. Tidak menolak start, alasan yang sama dengan
+ * tetangganya: mematikan seluruh backend (termasuk verifikasi order IDRX yang masih menggantung)
+ * demi satu var yang belum diisi menukar masalah sempit dengan situs yang mati.
+ */
+function warnIfDuitkuConfigIncomplete(config: Record<string, unknown>): void {
+  const str = (key: string): string => {
+    const v = config[key];
+    return typeof v === 'string' ? v.trim() : '';
+  };
+  if (str('PAYMENT_PROVIDER').toLowerCase() !== 'duitku') return;
+  const missing = [
+    'DUITKU_ENV',
+    'DUITKU_MERCHANT_CODE',
+    'DUITKU_API_KEY',
+    'DUITKU_CALLBACK_URL',
+    'DUITKU_CUSTOMER_EMAIL',
+  ].filter((k) => str(k) === '');
+  if (missing.length === 0) return;
+  // console, bukan Logger Nest: validateEnv berjalan SEBELUM aplikasi (dan logger-nya) berdiri.
+  console.error(
+    '[ENV] PAYMENT_PROVIDER=duitku TAPI pengaturannya belum lengkap — SETIAP checkout akan gagal ' +
+      `sampai ini diisi: ${missing.join(', ')}`,
+  );
 }

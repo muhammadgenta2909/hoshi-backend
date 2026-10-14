@@ -74,8 +74,12 @@ export interface IdrxMintRequestInput {
 }
 
 export interface IdrxMintRequestData {
-  /** Dokumentasi tidak memastikan tipenya. Jangan diasumsikan number. */
-  id: string | number;
+  /**
+   * Dokumentasi tidak memastikan tipenya. Jangan diasumsikan number. OPSIONAL karena tagihan
+   * Duitku (lihat payment-gateway.ts) tidak punya padanannya — dan menaruh `reference` di sini
+   * hanya supaya tipenya puas akan membuat kolom `idrxRequestId` berbohong.
+   */
+  id?: string | number;
   /**
    * DITERBITKAN OLEH IDRX, bukan oleh kita. Inilah join key satu-satunya untuk callback,
    * verifikasi history, dan rekonsiliasi. Wajib dipersist apa adanya.
@@ -143,6 +147,13 @@ export interface IdrxTransactionRecord {
   /** Bandingkan >= nominal rupiah yang kita snapshot di order. */
   toBeMinted?: string | number;
   paymentAmount?: string | number;
+  /**
+   * Rel pembayaran yang menghasilkan catatan ini. TIDAK ADA = IDRX (semua catatan lama).
+   * `DUITKU` = rupiah fiat ke rekening PT: tidak ada mint, tidak ada wallet tujuan, tidak ada
+   * requestType. Pin-nya berbeda, dan `assertRecordMatchesOrder` WAJIB membedakannya — memakai
+   * pin IDRX untuk catatan Duitku akan menahan setiap pembayaran yang sah sebagai "tak bisa dipin".
+   */
+  rail?: 'DUITKU';
 }
 
 export interface IdrxPaginationMetadata {
