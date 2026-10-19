@@ -452,6 +452,14 @@ export interface PaymentOrderDto {
    * cara bayar: kebiasaan aplikasi bank menolak QR IDRX tidak berlaku untuk halaman bayar Duitku.
    */
   provider: 'IDRX' | 'DUITKU';
+  /**
+   * Kartu / permintaan kirim yang ditagih order ini. Dipakai frontend untuk MELANJUTKAN pembayaran
+   * hanya dari nomor order di alamat kembalian gateway, saat data di browser hilang (pembeli bayar
+   * di aplikasi e-wallet lalu kembali lewat browser lain). Aman dikirim: getOrder hanya melayani
+   * PEMILIK order.
+   */
+  listingId: string | null;
+  redemptionId: string | null;
   status: PaymentStatus;
   qrContent: string | null;
   virtualAccountNo: string | null;
@@ -4477,6 +4485,8 @@ function toPaymentOrderDto(order: PaymentOrder): PaymentOrderDto {
     priceUsdc: order.priceUsdc,
     paymentMethod: order.paymentMethod,
     provider: isDuitkuOrderId(order.merchantOrderId) ? 'DUITKU' : 'IDRX',
+    listingId: order.listingId,
+    redemptionId: order.redemptionId,
     status: order.status,
     qrContent: order.qrContent,
     virtualAccountNo: order.virtualAccountNo,

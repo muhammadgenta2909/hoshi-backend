@@ -3970,6 +3970,25 @@ describe('PaymentsService', () => {
       });
     });
 
+    /**
+     * Pembeli yang membayar di aplikasi e-wallet sering kembali lewat browser LAIN, tanpa data
+     * pembayaran tersimpan. Yang tersisa cuma nomor order di alamat kembalian gateway — dan dari
+     * situ frontend harus bisa tahu kartu / permintaan kirim mana yang sedang dibayar. Dua field
+     * ini lahir dari serializer bertipe inferred: menghapusnya lolos tsc dan baru meledak di layar.
+     */
+    it('DTO order membawa listingId dan redemptionId untuk melanjutkan dari nomor order saja', async () => {
+      prisma.paymentOrder.findUnique.mockResolvedValue({
+        ...fulfilledOrder,
+        listingId: 'listing-9',
+        redemptionId: 'redemption-9',
+      });
+
+      const dto = await service.getOrder(MERCHANT_ORDER_ID, user);
+
+      expect(dto.listingId).toBe('listing-9');
+      expect(dto.redemptionId).toBe('redemption-9');
+    });
+
     it('DTO order memberi tahu frontend rel pembayarannya', async () => {
       prisma.paymentOrder.findFirst.mockResolvedValue(null);
       idrx.mintRequest.mockResolvedValue(mintResponse(DK_ID));
