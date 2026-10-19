@@ -189,6 +189,18 @@ export class PaymentsController {
     return this.payments.createDomesticShippingOrder(dto.redemptionId, user);
   }
 
+  @Get('config')
+  // PUBLIK — frontend membacanya SEBELUM pembeli login atau memilih kartu, untuk memutuskan apakah
+  // tombol bayar dibuka. Hanya dua field, nol rahasia. Inilah yang membuat menyalakan Duitku cukup
+  // dengan mengisi env di droplet: tidak ada deploy frontend di hari H.
+  @ApiOperation({
+    summary:
+      'Rel pembayaran aktif dan apakah pembeli bisa membayar sekarang ({ provider, buyerCheckoutOpen })',
+  })
+  paymentConfig() {
+    return this.payments.publicPaymentConfig();
+  }
+
   @Get('me/orders')
   @ApiBearerAuth()
   @UseGuards(JwtAuthGuard)

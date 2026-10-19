@@ -39,11 +39,54 @@ cek_env() { # nama, penjelasan, wajib(1)/opsional(0)
   else warn "$1 kosong — $2"; fi
 }
 
-head_ "1. JALUR UANG (tanpa ini tidak ada yang bisa dibeli)"
-cek_env IDRX_API_KEY              "kredensial penerbit tagihan" 1
-cek_env IDRX_NETWORK_CHAIN_ID     "jaringan mint IDRX" 1
+head_ "1. JALUR UANG PEMBELI (tanpa ini tidak ada yang bisa dibeli)"
+# IDRX mewajibkan nama pembayar = nama pemilik akun IDRX (PT), jadi PEMBELI tidak pernah bisa
+# melunasi tagihan IDRX. Pembeli membayar lewat Duitku. Lihat src/payments/payment-gateway.ts.
+PROVIDER="$(envval PAYMENT_PROVIDER | tr '[:upper:]' '[:lower:]')"
+if [ "$PROVIDER" = "duitku" ]; then
+  ok "PAYMENT_PROVIDER=duitku — tagihan baru terbit lewat Duitku"
+  DENV="$(envval DUITKU_ENV)"
+  case "$DENV" in
+    production) ok "DUITKU_ENV=production" ;;
+    sandbox)    bad "DUITKU_ENV=sandbox — DITOLAK di server produksi (pembayaran sandbox gratis = kartu gratis). Ganti ke production." ;;
+    *)          bad "DUITKU_ENV kosong/salah (\"$DENV\") — harus production" ;;
+  esac
+  cek_env DUITKU_MERCHANT_CODE "kode merchant dari dashboard Duitku" 1
+  cek_env DUITKU_API_KEY       "API key Duitku (RAHASIA — panjangnya saja yang ditampilkan)" 1
+  CB="$(envval DUITKU_CALLBACK_URL)"
+  if [ -n "$CB" ]; then
+    ok "DUITKU_CALLBACK_URL=$CB"
+    echo "     URL yang SAMA wajib didaftarkan di project Duitku (Callback URL)."
+  else
+    bad "DUITKU_CALLBACK_URL KOSONG — isi: $API_URL/api/payments/duitku/callback"
+  fi
+  EM="$(envval DUITKU_CUSTOMER_EMAIL)"
+  if [ -n "$EM" ]; then ok "DUITKU_CUSTOMER_EMAIL=$EM"; else bad "DUITKU_CUSTOMER_EMAIL KOSONG — isi email operasional Hoshi"; fi
+else
+  warn "PAYMENT_PROVIDER ${PROVIDER:-kosong} — tagihan masih lewat IDRX, yang TIDAK bisa dibayar pembeli."
+  echo "     Tombol bayar di website TERTUTUP otomatis sampai Duitku dinyalakan."
+  echo "     Setelah Duitku menyetujui merchant, tambahkan ke berkas env backend lalu restart:"
+  echo "       PAYMENT_PROVIDER=duitku"
+  echo "       DUITKU_ENV=production"
+  echo "       DUITKU_MERCHANT_CODE=<dari dashboard Duitku>"
+  echo "       DUITKU_API_KEY=<dari dashboard Duitku — jangan ditempel ke chat>"
+  echo "       DUITKU_CALLBACK_URL=$API_URL/api/payments/duitku/callback"
+  echo "       DUITKU_CUSTOMER_EMAIL=hoshimarketxyz@gmail.com"
+fi
 cek_env HOSHI_PAYMENT_RETURN_URL  "halaman tujuan setelah pembeli bayar" 1
-cek_env HOSHI_TREASURY_ADDRESS    "alamat treasury penerima" 1
+cek_env HOSHI_TREASURY_ADDRESS    "treasury USDC — dipakai membeli pack gacha" 0
+cek_env IDRX_API_KEY              "kurs USDC→Rupiah untuk harga pack + order IDRX lama" 0
+
+CFG="$(curl -s --max-time 15 "$API_URL/api/payments/config")"
+echo
+if echo "$CFG" | grep -q '"buyerCheckoutOpen":true'; then
+  ok "Server menjawab: PEMBELI BISA MEMBAYAR SEKARANG ($CFG)"
+elif echo "$CFG" | grep -q '"buyerCheckoutOpen":false'; then
+  warn "Server menjawab: pembayaran pembeli MASIH TERTUTUP ($CFG)"
+  [ "$PROVIDER" = "duitku" ] && echo "     Saklar sudah duitku tapi tertutup = ada pengaturan Duitku yang kurang/ditolak (lihat ✗ di atas)."
+else
+  bad "Rute $API_URL/api/payments/config tidak menjawab — build server belum memuat fitur Duitku? Jalankan deploy."
+fi
 
 head_ "2. FOTO (tanpa ini intake titipan macet di lapangan)"
 CLOUD="$(envval CLOUDINARY_URL)"
@@ -58,7 +101,10 @@ fi
 head_ "3. ONGKIR"
 BK="$(envval BITESHIP_API_KEY)"
 if [ -n "$BK" ]; then
-  ok "BITESHIP_API_KEY terisi (${#BK} karakter) — tarif kurir NYATA aktif"
+  warn "BITESHIP_API_KEY terisi (${#BK} karakter) — terisi BUKAN berarti jalan."
+  echo "     Saldo Biteship nol → setiap cek ongkir gagal lalu jatuh ke tabel tarif (pelan, log penuh error)."
+  echo "     Saldo terisi → tarif Biteship MENGALAHKAN tabel tarifmu, padahal paket dikirim manual di konter"
+  echo "     dengan harga konter. Selama kirim MANUAL: kosongkan BITESHIP_API_KEY."
   cek_env BITESHIP_ORIGIN_POSTAL_CODE "kode pos gudang (asal kiriman)" 1
   cek_env BITESHIP_COURIERS           "daftar kurir (kosong = jne,sicepat,jnt)" 0
 else
@@ -99,7 +145,7 @@ else
 fi
 
 head_ "7. YANG HIDUP DI LUAR"
-for p in api/health api/admin/consignments api/admin/shipping/domestic-rates; do
+for p in api/health api/payments/config api/admin/consignments api/admin/shipping/domestic-rates; do
   printf '     %-38s -> %s\n' "$p" "$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 "$API_URL/$p")"
 done
 for p in titipan titipan/klaim admin/ongkir; do

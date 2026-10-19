@@ -1697,6 +1697,14 @@ export class PaymentsService {
   }
 
   /**
+   * Untuk frontend: rel apa yang menerbitkan tagihan baru, dan apakah pembeli sungguhan bisa
+   * membayarnya. Publik, tanpa rahasia apa pun di dalamnya. Lihat PaymentGateway.buyerCheckoutStatus.
+   */
+  publicPaymentConfig(): { provider: 'IDRX' | 'DUITKU'; buyerCheckoutOpen: boolean } {
+    return this.idrx.buyerCheckoutStatus();
+  }
+
+  /**
    * Callback Duitku. Polanya SAMA dengan callback IDRX: body cuma PEMICU, buktinya diambil ulang
    * server-ke-server lewat verifyAndFulfil (→ PaymentGateway → transactionStatus Duitku).
    *

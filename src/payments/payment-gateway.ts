@@ -141,6 +141,37 @@ export class PaymentGateway {
     return status ? duitkuStatusToRecord(status) : null;
   }
 
+  /**
+   * ╔════════════════════════════════════════════════════════════════════════════════════════╗
+   * ║ BISAKAH PEMBELI SUNGGUHAN MEMBAYAR SEKARANG?                                           ║
+   * ╚════════════════════════════════════════════════════════════════════════════════════════╝
+   *
+   * Dijawab di SERVER supaya frontend tidak perlu dideploy ulang di hari Duitku dinyalakan:
+   * mengisi env di droplet lalu restart sudah cukup untuk membuka tombol bayar di seluruh situs.
+   *
+   *   - IDRX (bawaan) → TERTUTUP. IDRX mewajibkan nama pembayar = nama pemilik akun IDRX (PT), jadi
+   *     tidak satu pun pembeli bisa melunasi QR-nya. Menerbitkan QR yang pasti gagal dibayar lebih
+   *     buruk daripada berkata jujur bahwa pembayaran online belum dibuka.
+   *     Pengecualian satu-satunya: IDRX MOCK di mesin non-produksi, supaya alur demo tetap jalan.
+   *   - Duitku → TERBUKA hanya kalau konfigurasinya lengkap DAN sah untuk mesin ini (readConfig
+   *     yang sama yang dipakai saat menagih — termasuk penolakan sandbox di produksi). Saklar yang
+   *     menyala dengan kredensial kurang tidak boleh membuka tombol yang lalu gagal 503.
+   */
+  buyerCheckoutStatus(): {
+    provider: 'IDRX' | 'DUITKU';
+    buyerCheckoutOpen: boolean;
+  } {
+    if (this.provider() === 'duitku') {
+      try {
+        this.duitku.readConfig();
+        return { provider: 'DUITKU', buyerCheckoutOpen: true };
+      } catch {
+        return { provider: 'DUITKU', buyerCheckoutOpen: false };
+      }
+    }
+    return { provider: 'IDRX', buyerCheckoutOpen: this.idrx.mockEnabled() };
+  }
+
   /** Callback Duitku bertanda tangan sah? Lihat DuitkuClient.isCallbackSignatureValid. */
   isDuitkuCallbackValid(body: Record<string, unknown>): boolean {
     return this.duitku.isCallbackSignatureValid(body);

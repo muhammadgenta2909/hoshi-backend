@@ -21,6 +21,7 @@ describe('PaymentGateway', () => {
     mintRequest: jest.Mock;
     findMintByMerchantOrderId: jest.Mock;
     rates: jest.Mock;
+    mockEnabled: jest.Mock;
   };
   let duitku: {
     createInvoice: jest.Mock;
@@ -55,6 +56,7 @@ describe('PaymentGateway', () => {
       }),
       findMintByMerchantOrderId: jest.fn().mockResolvedValue(null),
       rates: jest.fn(),
+      mockEnabled: jest.fn().mockReturnValue(false),
     };
     duitku = {
       createInvoice: jest
@@ -163,6 +165,44 @@ describe('PaymentGateway', () => {
     expect(id.length).toBeLessThanOrEqual(50);
     expect(isDuitkuOrderId('20261009021827')).toBe(false);
     expect(isDuitkuOrderId('MOCK-1790558116318-19380')).toBe(false);
+  });
+
+  /**
+   * Jawaban ini yang membuka atau menutup tombol bayar di SELURUH situs. Salah ke arah "terbuka"
+   * berarti pembeli diberi QR yang pasti gagal dibayar (IDRX) atau tombol yang 503 (Duitku belum
+   * lengkap). Salah ke arah "tertutup" di hari H berarti toko buka tapi tidak bisa menerima uang.
+   */
+  describe('apakah pembeli bisa membayar sekarang', () => {
+    it('IDRX (bawaan) → TERTUTUP: name matching membuat tidak ada pembeli yang bisa melunasi QR-nya', () => {
+      expect(gateway(undefined).buyerCheckoutStatus()).toEqual({
+        provider: 'IDRX',
+        buyerCheckoutOpen: false,
+      });
+    });
+
+    it('IDRX MOCK di mesin non-produksi → terbuka, supaya alur demo tetap jalan', () => {
+      idrx.mockEnabled.mockReturnValue(true);
+      expect(gateway('idrx').buyerCheckoutStatus().buyerCheckoutOpen).toBe(
+        true,
+      );
+    });
+
+    it('Duitku dengan konfigurasi lengkap → TERBUKA', () => {
+      expect(gateway('duitku').buyerCheckoutStatus()).toEqual({
+        provider: 'DUITKU',
+        buyerCheckoutOpen: true,
+      });
+    });
+
+    it('Duitku dinyalakan tapi konfigurasinya kurang/ditolak → TERTUTUP, bukan tombol yang 503', () => {
+      duitku.readConfig.mockImplementation(() => {
+        throw new Error('Duitku belum dikonfigurasi: DUITKU_API_KEY kosong.');
+      });
+      expect(gateway('duitku').buyerCheckoutStatus()).toEqual({
+        provider: 'DUITKU',
+        buyerCheckoutOpen: false,
+      });
+    });
   });
 
   /**

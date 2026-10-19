@@ -137,7 +137,7 @@ export class IdrxClient {
    * (detectProductionSignal() === null). Jadi walau flag kepencet di mainnet, jalur
    * asli yang dipakai — mock tak akan pernah menyentuh uang/rupiah nyata.
    */
-  private mockEnabled(): boolean {
+  mockEnabled(): boolean {
     return (
       this.config.get<string>('IDRX_MOCK') === '1' &&
       detectProductionSignal() === null
