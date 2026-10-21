@@ -1,6 +1,7 @@
 import { createHash } from 'crypto';
 import { ConfigService } from '@nestjs/config';
 import {
+  DUITKU_TX_NOT_FOUND,
   DuitkuClient,
   duitkuCallbackSignature,
   duitkuInvoiceSignature,
@@ -115,7 +116,7 @@ describe('DuitkuClient', () => {
       await client({ DUITKU_ENV: 'production' }).transactionStatus('DK1');
 
       expect(sent().url).toBe(
-        'https://api-prod.duitku.com/api/merchant/transactionStatus',
+        'https://passport.duitku.com/webapi/api/merchant/transactionStatus',
       );
     });
   });
@@ -216,6 +217,49 @@ describe('DuitkuClient', () => {
         signature: duitkuStatusSignature('DS12345', 'DK1', 'kunci-uji-coba'),
       });
       expect(status).toMatchObject({ statusCode: '00', amount: '20000' });
+    });
+
+    // Host POP TIDAK punya endpoint ini (404 generik di sandbox) — salah host = tidak satu pun
+    // pembayaran bisa diverifikasi.
+    it('cek status dikirim ke host WEBAPI, bukan host POP', async () => {
+      respond({ merchantOrderId: 'DK1', amount: '20000', statusCode: '01' });
+      await client().transactionStatus('DK1');
+      expect(sent().url).toBe(
+        'https://sandbox.duitku.com/webapi/api/merchant/transactionStatus',
+      );
+    });
+
+    // Jawaban persis yang diamati di sandbox (host webapi) untuk tagihan yang belum dibuka.
+    it('HTTP 404 {"Message":"Transaction not found"} → NOT_FOUND (belum dibuka), bukan error', async () => {
+      respond({ Message: 'Transaction not found' }, 404);
+
+      await expect(client().transactionStatus('DK1')).resolves.toBe(
+        DUITKU_TX_NOT_FOUND,
+      );
+    });
+
+    it('HTTP 400 "Transaction not found" → juga NOT_FOUND', async () => {
+      respond('Transaction not found', 400);
+
+      await expect(client().transactionStatus('DK1')).resolves.toBe(
+        DUITKU_TX_NOT_FOUND,
+      );
+    });
+
+    it('HTTP 400 dengan pesan LAIN (mis. tanda tangan salah) → tetap error, bukan "belum dibuka"', async () => {
+      respond({ Message: 'Wrong signature' }, 400);
+
+      await expect(client().transactionStatus('DK1')).rejects.toThrow(
+        /HTTP 400/,
+      );
+    });
+
+    it('HTTP 500 → tetap error (Duitku ngadat ≠ belum bayar)', async () => {
+      respond('Transaction not found', 500);
+
+      await expect(client().transactionStatus('DK1')).rejects.toThrow(
+        /HTTP 500/,
+      );
     });
   });
 

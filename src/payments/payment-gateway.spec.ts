@@ -1,8 +1,10 @@
 import { ConfigService } from '@nestjs/config';
 import 'reflect-metadata';
-import { DuitkuClient } from './duitku.client';
+import { DUITKU_TX_NOT_FOUND, DuitkuClient } from './duitku.client';
 import { IdrxClient } from './idrx.client';
 import {
+  DUITKU_NOT_OPENED_GRACE_MS,
+  duitkuNotOpenedRecord,
   duitkuStatusToRecord,
   isDuitkuOrderId,
   newDuitkuOrderId,
@@ -120,6 +122,66 @@ describe('PaymentGateway', () => {
         'DK1791979642000a1b2c3d4',
       );
       expect(idrx.findMintByMerchantOrderId).not.toHaveBeenCalled();
+    });
+  });
+
+  /**
+   * Tagihan Duitku yang tidak pernah dibuka pembeli tidak punya transaksi sama sekali. Kalau ini
+   * tidak pernah jadi EXPIRED, order-nya dipoll 7 hari dan redemption ongkirnya terkunci.
+   */
+  describe('tagihan Duitku yang belum pernah dibuka', () => {
+    const ID = 'DK1791979642000a1b2c3d4';
+    const minutesAgo = (m: number) => new Date(Date.now() - m * 60_000);
+
+    beforeEach(() => {
+      duitku.transactionStatus.mockResolvedValue(DUITKU_TX_NOT_FOUND);
+    });
+
+    it('tenggat belum lewat → MENUNGGU', async () => {
+      const rec = await gateway('duitku').findMintByMerchantOrderId(
+        ID,
+        new Date(Date.now() + 10 * 60_000),
+      );
+      expect(rec).toMatchObject({
+        paymentStatus: 'WAITING_FOR_PAYMENT',
+        userMintStatus: 'NOT_AVAILABLE',
+        rail: 'DUITKU',
+      });
+    });
+
+    it('tenggat lewat tapi masih dalam kelonggaran → tetap MENUNGGU (selisih jam server)', async () => {
+      const rec = await gateway('duitku').findMintByMerchantOrderId(
+        ID,
+        minutesAgo(DUITKU_NOT_OPENED_GRACE_MS / 60_000 - 1),
+      );
+      expect(rec?.paymentStatus).toBe('WAITING_FOR_PAYMENT');
+    });
+
+    it('tenggat + kelonggaran lewat → KEDALUWARSA, tidak pernah LUNAS', async () => {
+      const rec = await gateway('duitku').findMintByMerchantOrderId(
+        ID,
+        minutesAgo(DUITKU_NOT_OPENED_GRACE_MS / 60_000 + 1),
+      );
+      expect(rec).toMatchObject({
+        paymentStatus: 'EXPIRED',
+        userMintStatus: 'NOT_AVAILABLE',
+        rail: 'DUITKU',
+      });
+    });
+
+    it('tanpa tenggat (sapuan EXPIRED) → MENUNGGU, tidak pernah dikedaluwarsakan dari sini', async () => {
+      const rec = await gateway('duitku').findMintByMerchantOrderId(ID);
+      expect(rec?.paymentStatus).toBe('WAITING_FOR_PAYMENT');
+      expect(
+        duitkuNotOpenedRecord(ID, null, Date.now() + 1e12).paymentStatus,
+      ).toBe('WAITING_FOR_PAYMENT');
+    });
+
+    it('jawaban tak cocok (null) TETAP null — tidak ikut dikedaluwarsakan', async () => {
+      duitku.transactionStatus.mockResolvedValue(null);
+      await expect(
+        gateway('duitku').findMintByMerchantOrderId(ID, minutesAgo(600)),
+      ).resolves.toBeNull();
     });
   });
 

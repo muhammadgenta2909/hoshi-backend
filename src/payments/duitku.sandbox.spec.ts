@@ -1,7 +1,7 @@
 import { existsSync, readFileSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { ConfigService } from '@nestjs/config';
-import { DuitkuClient } from './duitku.client';
+import { DUITKU_TX_NOT_FOUND, DuitkuClient } from './duitku.client';
 import { newDuitkuOrderId } from './payment-gateway';
 
 /**
@@ -98,8 +98,10 @@ const enabled = !!creds?.DUITKU_MERCHANT_CODE && !!creds?.DUITKU_API_KEY;
         const status = await client().transactionStatus(id);
 
         expect(status).not.toBeNull();
-        expect(status?.statusCode).toBe('00');
-        expect(status?.amount).toMatch(/^20000(\.0+)?$/);
+        expect(status).not.toBe(DUITKU_TX_NOT_FOUND);
+        if (!status || status === DUITKU_TX_NOT_FOUND) return;
+        expect(status.statusCode).toBe('00');
+        expect(status.amount).toMatch(/^20000(\.0+)?$/);
       });
       return;
     }
@@ -117,11 +119,16 @@ const enabled = !!creds?.DUITKU_MERCHANT_CODE && !!creds?.DUITKU_API_KEY;
       expect(invoice.paymentUrl).toMatch(/^https:\/\//);
       expect(invoice.reference).toBeTruthy();
 
+      writeFileSync(LAST_ORDER_FILE, id);
+
+      // Tagihan yang BELUM DIBUKA pembeli belum punya transaksi di Duitku: jawabannya HTTP 400
+      // "Transaction not found" (diamati di sandbox), yang klien terjemahkan jadi NOT_FOUND.
+      // Kalau sudah dibuka, jawabannya "01" (menunggu).
       const status = await client().transactionStatus(id);
       expect(status).not.toBeNull();
-      expect(status?.statusCode).toBe('01'); // belum dibayar
-
-      writeFileSync(LAST_ORDER_FILE, id);
+      if (status !== DUITKU_TX_NOT_FOUND) {
+        expect(status?.statusCode).toBe('01');
+      }
       console.log(
         `\n  Tagihan sandbox terbit: ${id}\n  Buka link ini untuk simulasi bayar:\n  ${invoice.paymentUrl}\n`,
       );

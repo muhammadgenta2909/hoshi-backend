@@ -1780,7 +1780,12 @@ export class PaymentsService {
     //    bukan kolom idrx* yang tersimpan (itu cuma jejak audit).
     let record: IdrxMintRecord | null;
     try {
-      record = await this.idrx.findMintByMerchantOrderId(merchantOrderId);
+      record = await this.idrx.findMintByMerchantOrderId(
+        merchantOrderId,
+        // Hanya rel Duitku yang memakainya: tagihan yang tak pernah dibuka pembeli dikedaluwarsakan
+        // sesudah tenggat ini. Sapuan EXPIRED (settleExpiredButPaid) SENGAJA tidak mengirimnya.
+        order.expiresAt,
+      );
     } catch (err) {
       // GAGAL TERTUTUP, TAPI TIDAK MEMBUANG PEMICUNYA. IDRX down bukan alasan membayar pack,
       // dan juga bukan alasan melupakan order ini: status tidak disentuh → reconciler mengulang.

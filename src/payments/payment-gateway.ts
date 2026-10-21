@@ -1,7 +1,11 @@
 import { randomBytes } from 'crypto';
 import { BadRequestException, Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { DuitkuClient, type DuitkuTransactionStatus } from './duitku.client';
+import {
+  DUITKU_TX_NOT_FOUND,
+  DuitkuClient,
+  type DuitkuTransactionStatus,
+} from './duitku.client';
 import { IdrxClient } from './idrx.client';
 import type {
   IdrxMintRequestInput,
@@ -52,6 +56,43 @@ export function duitkuStatusToRecord(
     userMintStatus: paid ? 'MINTED' : 'NOT_AVAILABLE',
     toBeMinted: status.amount,
     paymentAmount: status.amount,
+    rail: 'DUITKU',
+  };
+}
+
+/**
+ * Kelonggaran sesudah `expiresAt` order sebelum tagihan Duitku yang TIDAK PERNAH DIBUKA dianggap
+ * kedaluwarsa. Kita mengirim expiryPeriod yang sama ke Duitku, jadi sesudah itu halaman bayarnya
+ * sudah mati; kelonggaran ini cuma menyerap selisih jam antara server kita dan Duitku.
+ */
+export const DUITKU_NOT_OPENED_GRACE_MS = 15 * 60 * 1000;
+
+/**
+ * Tagihan yang belum pernah dibuka pembeli → catatan verifikasi.
+ *
+ * Belum ada transaksi = belum ada satu rupiah pun yang bisa masuk. Selama tenggat order belum
+ * lewat (+ kelonggaran) ia MENUNGGU; sesudahnya KEDALUWARSA, supaya order-nya berhenti dipoll dan
+ * redemption ongkir yang dikuncinya dilepas. Order TANPA tenggat tidak pernah dikedaluwarsakan dari
+ * sini — itu keputusan yang tidak boleh diambil tanpa angka.
+ *
+ * Kalau ternyata ada pembayaran sesudahnya (seharusnya mustahil), sapuan EXPIRED tetap bertanya
+ * ulang ke Duitku dan settleExpiredButPaid MENCATAT UTANGNYA — tidak ada uang yang hilang diam-diam.
+ */
+export function duitkuNotOpenedRecord(
+  merchantOrderId: string,
+  expiresAt: Date | null | undefined,
+  now: number = Date.now(),
+): IdrxTransactionRecord {
+  const expired =
+    expiresAt instanceof Date &&
+    now > expiresAt.getTime() + DUITKU_NOT_OPENED_GRACE_MS;
+  return {
+    id: merchantOrderId,
+    merchantOrderId,
+    paymentStatus: expired ? 'EXPIRED' : 'WAITING_FOR_PAYMENT',
+    userMintStatus: 'NOT_AVAILABLE',
+    toBeMinted: '0',
+    paymentAmount: '0',
     rail: 'DUITKU',
   };
 }
@@ -131,13 +172,21 @@ export class PaymentGateway {
     };
   }
 
+  /**
+   * `expiresAt` hanya dipakai rel Duitku, untuk tagihan yang belum pernah dibuka (lihat
+   * duitkuNotOpenedRecord). Tidak diisi → tagihan itu selalu MENUNGGU, tidak pernah dikedaluwarsakan.
+   */
   async findMintByMerchantOrderId(
     merchantOrderId: string,
+    expiresAt?: Date | null,
   ): Promise<IdrxTransactionRecord | null> {
     if (!isDuitkuOrderId(merchantOrderId)) {
       return this.idrx.findMintByMerchantOrderId(merchantOrderId);
     }
     const status = await this.duitku.transactionStatus(merchantOrderId);
+    if (status === DUITKU_TX_NOT_FOUND) {
+      return duitkuNotOpenedRecord(merchantOrderId, expiresAt);
+    }
     return status ? duitkuStatusToRecord(status) : null;
   }
 

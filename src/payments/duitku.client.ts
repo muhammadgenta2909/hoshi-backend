@@ -25,7 +25,7 @@ import { detectProductionSignal } from '../common/demo-mode';
  *
  *   createInvoice     POST {POP}/api/merchant/createInvoice
  *                     header x-duitku-signature = sha256(merchantCode + timestamp + apiKey)
- *   transactionStatus POST {POP}/api/merchant/transactionStatus
+ *   transactionStatus POST {WEBAPI}/api/merchant/transactionStatus  (BUKAN host POP — lihat DUITKU_WEBAPI_BASE)
  *                     body.signature = md5(merchantCode + merchantOrderId + apiKey)
  *   callback          POST x-www-form-urlencoded ke callbackUrl
  *                     signature = md5(merchantCode + amount + merchantOrderId + apiKey)
@@ -36,6 +36,17 @@ import { detectProductionSignal } from '../common/demo-mode';
 const DUITKU_POP_BASE = {
   sandbox: 'https://api-sandbox.duitku.com',
   production: 'https://api-prod.duitku.com',
+} as const;
+
+/**
+ * Cek status TIDAK tinggal di host POP. Diamati di sandbox (21 Okt 2026): POST
+ * api-sandbox.duitku.com/api/merchant/transactionStatus → 404 generik (endpoint tidak ada), jadi
+ * TIDAK SATU PUN pembayaran bisa diverifikasi. Host webapi menjawab dengan benar: tanda tangan sah
+ * → 404 {"Message":"Transaction not found"}, tanda tangan salah → 401 {"Message":"Wrong signature"}.
+ */
+const DUITKU_WEBAPI_BASE = {
+  sandbox: 'https://sandbox.duitku.com/webapi',
+  production: 'https://passport.duitku.com/webapi',
 } as const;
 
 export type DuitkuEnv = keyof typeof DUITKU_POP_BASE;
@@ -86,6 +97,34 @@ export interface DuitkuTransactionStatus {
   statusCode: string;
   statusMessage?: string;
 }
+
+/**
+ * Jawaban Duitku untuk tagihan yang BELUM PERNAH DIBUKA pembeli.
+ *
+ * Diamati langsung di sandbox: tepat sesudah createInvoice sukses, transactionStatus menjawab
+ * HTTP 400 "Transaction not found". Transaksi POP baru LAHIR saat pembeli membuka halaman bayar dan
+ * memilih metode. Jadi ini BUKAN gangguan — ini fakta "belum ada pembayaran apa pun". Kalau
+ * dilempar sebagai error, tagihan yang tak pernah dibuka akan dicek ulang tiap tick selama 7 hari
+ * dan tidak pernah ditandai kedaluwarsa (redemption ongkirnya ikut terkunci).
+ */
+export const DUITKU_TX_NOT_FOUND = 'NOT_FOUND' as const;
+
+/** HTTP non-2xx dari Duitku, membawa status + potongan body supaya pemanggil bisa membedakannya. */
+export class DuitkuHttpError extends ServiceUnavailableException {
+  constructor(
+    path: string,
+    readonly httpStatus: number,
+    readonly bodySnippet: string,
+  ) {
+    super(`Duitku ${path} menjawab HTTP ${httpStatus}.`);
+  }
+}
+
+/** HTTP 400/404 dengan pesan "transaction not found" — dan HANYA itu. 400 lain tetap error. */
+export const isDuitkuNotFound = (err: unknown): boolean =>
+  err instanceof DuitkuHttpError &&
+  (err.httpStatus === 400 || err.httpStatus === 404) &&
+  /transaction not found/i.test(err.bodySnippet);
 
 /* ─────────────── Tanda tangan — fungsi murni, diekspor supaya bisa diuji tanpa jaringan ─────────────── */
 
@@ -224,26 +263,36 @@ export class DuitkuClient {
   /**
    * Bukti pembayaran SERVER-KE-SERVER. Satu-satunya sumber kebenaran — body callback hanya pemicu.
    *
-   * Mengembalikan null kalau Duitku tidak mengenal order ini (atau menjawab order LAIN): sama
-   * dengan IdrxClient, "tidak ditemukan" dan "tidak cocok" sama-sama berarti JANGAN menebus.
+   * - DUITKU_TX_NOT_FOUND: tagihan belum pernah dibuka pembeli (lihat konstantanya) — belum bayar.
+   * - null: respons tidak cocok dengan order ini / tidak lengkap — JANGAN menebus, sama seperti
+   *   IdrxClient. Sengaja dibedakan dari NOT_FOUND: "jawaban aneh" tidak boleh ikut dianggap
+   *   "pasti belum bayar" lalu dikedaluwarsakan.
    */
   async transactionStatus(
     merchantOrderId: string,
-  ): Promise<DuitkuTransactionStatus | null> {
+  ): Promise<DuitkuTransactionStatus | typeof DUITKU_TX_NOT_FOUND | null> {
     const cfg = this.readConfig();
-    const res = await this.post<Partial<DuitkuTransactionStatus>>(
-      cfg,
-      '/api/merchant/transactionStatus',
-      {
-        merchantCode: cfg.merchantCode,
-        merchantOrderId,
-        signature: duitkuStatusSignature(
-          cfg.merchantCode,
+    let res: Partial<DuitkuTransactionStatus>;
+    try {
+      res = await this.post<Partial<DuitkuTransactionStatus>>(
+        cfg,
+        '/api/merchant/transactionStatus',
+        {
+          merchantCode: cfg.merchantCode,
           merchantOrderId,
-          cfg.apiKey,
-        ),
-      },
-    );
+          signature: duitkuStatusSignature(
+            cfg.merchantCode,
+            merchantOrderId,
+            cfg.apiKey,
+          ),
+        },
+        {},
+        'webapi',
+      );
+    } catch (err) {
+      if (isDuitkuNotFound(err)) return DUITKU_TX_NOT_FOUND;
+      throw err;
+    }
     if (
       typeof res.merchantOrderId !== 'string' ||
       res.merchantOrderId !== merchantOrderId ||
@@ -302,8 +351,12 @@ export class DuitkuClient {
     path: string,
     body: unknown,
     headers: Record<string, string> = {},
+    base: 'pop' | 'webapi' = 'pop',
   ): Promise<T> {
-    const url = `${DUITKU_POP_BASE[cfg.env]}${path}`;
+    const host = (base === 'webapi' ? DUITKU_WEBAPI_BASE : DUITKU_POP_BASE)[
+      cfg.env
+    ];
+    const url = `${host}${path}`;
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), DUITKU_TIMEOUT_MS);
     let res: Awaited<ReturnType<typeof fetch>>;
@@ -335,10 +388,19 @@ export class DuitkuClient {
     const text = await res.text();
     if (!res.ok) {
       const snippet = text.slice(0, ERROR_BODY_MAX);
-      this.logger.error(`Duitku POST ${path} → HTTP ${res.status}: ${snippet}`);
-      throw new ServiceUnavailableException(
-        `Duitku ${path} menjawab HTTP ${res.status}.`,
-      );
+      const err = new DuitkuHttpError(path, res.status, snippet);
+      // "Belum dibuka" itu keadaan normal tiap tagihan baru — bukan ERROR yang menenggelamkan
+      // gangguan sungguhan di log.
+      if (isDuitkuNotFound(err)) {
+        this.logger.debug(
+          `Duitku POST ${path} → belum ada transaksi (${snippet})`,
+        );
+      } else {
+        this.logger.error(
+          `Duitku POST ${path} → HTTP ${res.status}: ${snippet}`,
+        );
+      }
+      throw err;
     }
     try {
       return JSON.parse(text) as T;

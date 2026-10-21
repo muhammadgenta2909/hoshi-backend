@@ -2030,6 +2030,7 @@ describe('PaymentsService', () => {
       // Bukti diambil dari server-to-server, bukan dari body.
       expect(idrx.findMintByMerchantOrderId).toHaveBeenCalledWith(
         MERCHANT_ORDER_ID,
+        expect.anything(),
       );
       expect(gacha.purchase).not.toHaveBeenCalled();
       expect(outcome).toBe('AWAITING_PAYMENT');
@@ -3886,6 +3887,35 @@ describe('PaymentsService', () => {
       expect(gacha.purchase).toHaveBeenCalledTimes(1);
     });
 
+    /**
+     * Tagihan yang tidak pernah dibuka pembeli: gerbang butuh TENGGAT order untuk bisa
+     * menyatakannya kedaluwarsa (lihat duitkuNotOpenedRecord). Tanpa argumen ini order tsb
+     * dipoll 7 hari dan redemption ongkirnya terkunci AWAITING_PAYMENT.
+     */
+    it('verifikasi mengirim TENGGAT order ke gerbang, dan vonis EXPIRED-nya menutup order', async () => {
+      prisma.paymentOrder.findUnique.mockResolvedValue(duitkuOrder);
+      idrx.findMintByMerchantOrderId.mockResolvedValue({
+        ...duitkuPaid,
+        paymentStatus: 'EXPIRED',
+        userMintStatus: 'NOT_AVAILABLE',
+        toBeMinted: '0',
+        paymentAmount: '0',
+      });
+
+      await service.verifyAndFulfil(DK_ID);
+
+      expect(idrx.findMintByMerchantOrderId).toHaveBeenCalledWith(
+        DK_ID,
+        duitkuOrder.expiresAt,
+      );
+      expect(prisma.paymentOrder.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ status: PaymentStatus.EXPIRED }),
+        }),
+      );
+      expect(gacha.purchase).not.toHaveBeenCalled();
+    });
+
     it('nominal Duitku di bawah tagihan → UTANG, dan barangnya TIDAK berangkat', async () => {
       prisma.paymentOrder.findUnique.mockResolvedValue(duitkuOrder);
       idrx.findMintByMerchantOrderId.mockResolvedValue({
@@ -3965,7 +3995,10 @@ describe('PaymentsService', () => {
           resultCode: '01',
         });
 
-        expect(idrx.findMintByMerchantOrderId).toHaveBeenCalledWith(DK_ID);
+        expect(idrx.findMintByMerchantOrderId).toHaveBeenCalledWith(
+          DK_ID,
+          duitkuOrder.expiresAt,
+        );
         expect(outcome).toBe('FULFILLED');
       });
     });
