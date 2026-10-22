@@ -1,13 +1,33 @@
 import { plainToInstance } from 'class-transformer';
 import {
+  IsEmail,
   IsIn,
   IsInt,
   IsOptional,
   IsString,
+  IsUrl,
   Matches,
+  ValidateIf,
   MinLength,
   validateSync,
 } from 'class-validator';
+// Konstanta-saja, TANPA import lain (lihat cc-shipping-mock.mount.ts): validasi env jalan paling
+// awal saat boot dan tidak boleh menarik Nest/@solana/web3.js hanya untuk sebuah string.
+import { CC_SHIPPING_MOCK_MOUNT } from '../collectorcrypt/cc-shipping-mock.mount';
+// Idem — file tanpa import sama sekali, SENGAJA, supaya aturan baca plafon sponsor gas yang
+// dipakai saat boot adalah aturan yang SAMA dengan yang dipakai saat memutuskan sponsor.
+import { sponsorCapEnvProblems } from '../escrow/sponsor-cap-env';
+// Idem — src/payments/idrx-mint-bounds.ts TIDAK mengimpor apa pun, dengan sengaja. Batas yang
+// dipakai saat boot untuk menolak ongkir domestik yang mustahil ditagih WAJIB batas yang SAMA
+// dengan yang dipakai saat menerbitkan mint-request IDRX.
+import {
+  IDRX_MAX_MINT_IDR,
+  IDRX_MIN_MINT_IDR,
+} from '../payments/idrx-mint-bounds';
+// Idem — src/payments/biteship-rate-env.ts TIDAK mengimpor apa pun, dengan sengaja. Aturan baca
+// konfigurasi tarif kurir yang dipakai saat BOOT wajib aturan yang SAMA dengan yang dipakai saat
+// benar-benar memanggil API-nya, bukan dua salinan yang bisa menyimpang diam-diam.
+import { biteshipConfigProblems } from '../payments/biteship-rate-env';
 
 /**
  * Skema validasi environment. Dipanggil ConfigModule saat boot — kalau ada yang
@@ -39,6 +59,46 @@ class EnvironmentVariables {
   @IsOptional()
   @IsString()
   FRONTEND_ORIGIN?: string;
+
+  /* ══════════════════════════════════════════════════════════════════════════════════════════
+     ALAMAT KEMBALI SETELAH BAYAR — didaftarkan supaya salah ketiknya ketahuan saat BOOT.
+
+     Dibaca `requiredConfig` di TIGA jalur penerbitan tagihan, termasuk satu-satunya rail yang
+     menerbitkan tagihan untuk kartu TITIPAN. `requiredConfig` melempar saat DIPANGGIL, bukan
+     saat start — jadi sebelum ini: var-nya salah ketik atau terhapus saat menyunting
+     backend.env di droplet → boot BERHASIL, log bersih, dashboard hijau, dan kegagalannya baru
+     muncul di depan PEMBELI PERTAMA yang menekan tombol Beli.
+
+     DUA PERLAKUAN, DAN PERBEDAANNYA DISENGAJA:
+
+       nilai ADA tapi CACAT  → DITOLAK KERAS di sini. Konfigurasi cacat tidak pernah bisa jalan,
+                               jadi tidak ada yang dipertukarkan dengan menolaknya, dan boot
+                               adalah titik termurah untuk memperbaikinya.
+
+       nilai HILANG/KOSONG   → PERINGATAN saja (`warnIfPaymentReturnUrlMissing` di bawah), backend
+                               TETAP menyala. Alasannya ditulis lengkap di fungsi itu; singkatnya,
+                               menolak start akan menukar checkout yang rusak dengan SELURUH situs
+                               yang mati.
+
+     `@ValidateIf` di bawah itulah yang memisahkan keduanya. Ia perlu karena `@IsOptional()` saja
+     tidak cukup: `HOSHI_PAYMENT_RETURN_URL=` (baris ada, nilainya kosong) adalah cara paling wajar
+     orang "menghapus" sebuah var di backend.env, dan bagi @IsOptional itu nilai yang ADA — lalu
+     @IsUrl menolaknya sebagai cacat, dan boot mati justru di kasus yang paling sering terjadi.
+     ══════════════════════════════════════════════════════════════════════════════════════════ */
+  @ValidateIf(
+    (o: EnvironmentVariables) =>
+      typeof o.HOSHI_PAYMENT_RETURN_URL === 'string' &&
+      o.HOSHI_PAYMENT_RETURN_URL.trim().length > 0,
+  )
+  @IsUrl(
+    { require_tld: false, require_protocol: true },
+    {
+      message:
+        'HOSHI_PAYMENT_RETURN_URL harus URL lengkap berikut protokolnya, mis. ' +
+        'https://hoshimarket.xyz/open-packs — ini alamat yang dibuka pembeli setelah membayar.',
+    },
+  )
+  HOSHI_PAYMENT_RETURN_URL?: string;
 
   @IsOptional()
   @IsString()
@@ -94,6 +154,37 @@ class EnvironmentVariables {
   @IsOptional()
   @IsString()
   HOSHI_CC_BUY_ENABLED?: string;
+
+  /* ══════════════════════════════════════════════════════════════════════════════════════════
+     RESELLER CC — SATU-SATUNYA JALUR DI REPO INI YANG MEMBELANJAKAN USDC TREASURY SENDIRI.
+
+     Keduanya dipakai di `PaymentsService.fulfilListing` tapi tidak pernah terdaftar di sini,
+     jadi tidak ada satu pun tempat yang menuliskan artinya — padahal yang kedua adalah BATAS
+     BELANJA.
+
+     `HOSHI_CC_RESELL_ENABLED` dibaca sebagai `.trim().toLowerCase() === 'true'`, jadi "1",
+     "yes", "TRUE " tidak menyalakannya. Itu memang disengaja untuk saklar belanja: satu-satunya
+     cara menyalakannya adalah mengetik persis kata itu, dan tidak ada nilai yang "kira-kira
+     menyala".
+
+     `HOSHI_CC_MAX_CARD_PRICE_USDC` dalam BASE UNIT USDC (6 desimal) — $100 = 100000000.
+     Dibaca `intConfig`, yang MELEMPAR untuk nilai cacat (bagus, fail-closed) dan hanya memakai
+     bawaan kalau var-nya TIDAK ADA. Jadi bahayanya bukan salah ketik; bahayanya BAWAANNYA
+     SENDIRI: 5_000_000_000 = $5.000 PER KARTU. Itu bukan plafon yang pernah diputuskan siapa
+     pun, dan ia berkali-kali lipat di atas float treasury yang wajar untuk fase ini.
+
+     Tidak diubah di sini, karena mengubah batas belanja diam-diam sama salahnya dengan
+     mewarisinya diam-diam. Yang ditambahkan: ia sekarang PUNYA NAMA di berkas ini, dan boot
+     BERTERIAK kalau jalur belanjanya diarmed sementara plafonnya tidak pernah diisi — lihat
+     `warnIfResellCapUnset`.
+     ══════════════════════════════════════════════════════════════════════════════════════════ */
+  @IsOptional()
+  @IsString()
+  HOSHI_CC_RESELL_ENABLED?: string;
+
+  @IsOptional()
+  @IsString()
+  HOSHI_CC_MAX_CARD_PRICE_USDC?: string;
 
   // Opsional — kurs USD→IDR untuk mengubah harga katalog CC menjadi harga display
   // IDRX saat listing PERTAMA dibuat (re-sync tidak menyentuh harga). String
@@ -158,12 +249,63 @@ class EnvironmentVariables {
   @IsInt()
   GACHA_TREASURY_DAILY_CAP_USDC?: number;
 
+  // ── DUITKU (payment gateway pembeli) ─────────────────────────────────────
+  // IDRX mewajibkan nama pembayar = nama pemilik akun IDRX (PT), jadi pembeli umum tidak bisa
+  // membayar lewat IDRX. Duitku menerima pembayaran dari siapa pun. Semua @IsOptional(): selama
+  // PAYMENT_PROVIDER belum "duitku", tidak ada satu pun yang dibaca. Lihat src/payments/duitku.client.ts.
+
+  // Opsional — rel tagihan BARU: "idrx" (bawaan) atau "duitku". Bukti pembayaran tidak ikut saklar
+  // ini: order lama tetap diverifikasi ke rel yang menerbitkannya (dibaca dari nomor ordernya).
+  @IsOptional()
+  @IsIn(['idrx', 'duitku'], {
+    message: 'PAYMENT_PROVIDER harus "idrx" atau "duitku"',
+  })
+  PAYMENT_PROVIDER?: string;
+
+  // Opsional — "sandbox" atau "production". Sandbox DITOLAK di deployment produksi (pembayaran
+  // sandbox gratis = kartu sungguhan diserahkan tanpa bayar).
+  @IsOptional()
+  @IsIn(['sandbox', 'production'], {
+    message: 'DUITKU_ENV harus "sandbox" atau "production"',
+  })
+  DUITKU_ENV?: string;
+
+  // Opsional (WAJIB kalau PAYMENT_PROVIDER=duitku) — kode merchant dari dashboard Duitku.
+  @IsOptional()
+  @IsString()
+  DUITKU_MERCHANT_CODE?: string;
+
+  // Opsional (WAJIB kalau PAYMENT_PROVIDER=duitku) — API key (merchant key) Duitku. RAHASIA:
+  // ia yang membuktikan tagihan, cek status, dan callback benar-benar milik kita. JANGAN pernah
+  // di-log, dikembalikan lewat API, atau ikut masuk ke pesan error.
+  @IsOptional()
+  @IsString()
+  DUITKU_API_KEY?: string;
+
+  // Opsional (WAJIB kalau PAYMENT_PROVIDER=duitku) — URL publik callback, mis.
+  // https://api.hoshimarket.xyz/api/payments/duitku/callback
+  @IsOptional()
+  @IsUrl({ require_tld: false, protocols: ['https', 'http'] })
+  DUITKU_CALLBACK_URL?: string;
+
+  // Opsional (WAJIB kalau PAYMENT_PROVIDER=duitku) — email operasional Hoshi yang dikirim ke
+  // Duitku sebagai "email pelanggan". Pembeli nyaris tidak pernah punya email di database.
+  @IsOptional()
+  @IsEmail()
+  DUITKU_CUSTOMER_EMAIL?: string;
+
+  // Opsional — nama di konfirmasi bank/VA pembeli. Bawaan: "Hoshimarket".
+  @IsOptional()
+  @IsString()
+  DUITKU_VA_NAME?: string;
+
   // ── IDRX (on-ramp rupiah) ────────────────────────────────────────────────
   // Semua @IsOptional(): deploy yang belum memakai pembayaran rupiah harus tetap bisa boot.
   // Konsekuensinya, konfigurasi IDRX yang kurang baru ketahuan saat order pertama dibuat —
   // PaymentsService yang wajib memberi error jelas di titik itu, sama seperti TreasuryService.
 
-  // Opsional — base URL API IDRX. Default: https://idrx.co
+  // Opsional — base URL API IDRX. Default: https://api.idrx.co (host lama https://idrx.co/api
+  // dimatikan IDRX 30 Okt 2026). Isi https://idrx.co HANYA sebagai jalan pulang darurat.
   @IsOptional()
   @IsString()
   IDRX_API_BASE?: string;
@@ -210,6 +352,16 @@ class EnvironmentVariables {
   @IsString()
   IDRX_MOCK_PUBLIC_URL?: string;
 
+  // Interval penyapu order tersangkut, dalam milidetik. Default 120000; lantai 30000; PLAFON
+  // 600000 (dijepit + ERROR kalau dilewati, lihat payments-reconcile.scheduler.ts).
+  // KENAPA TERDAFTAR DI SINI: ini BUKAN tuning. Nilainya adalah batas atas seberapa lama sebuah
+  // pembayaran yang callback-nya hilang bisa tidak terdeteksi. Dulu variabel ini tidak ada di
+  // skema mana pun, jadi salah ketik NAMANYA gagal diam-diam (jatuh ke default, masih aman) tapi
+  // salah isi NILAINYA menurunkan jaminan deteksi uang tanpa gejala. Sekarang terlihat saat boot.
+  @IsOptional()
+  @IsString()
+  PAYMENTS_RECONCILE_INTERVAL_MS?: string;
+
   // CC MOCK (staging/devnet). "1" mengaktifkan mock CollectorCrypt gacha: katalog mesin +
   // buka pack dijawab lokal dengan kartu palsu — tanpa API key CC, tanpa treasury ber-USDC,
   // tanpa transaksi on-chain. HANYA berlaku bila deployment tidak terlihat produksi
@@ -245,12 +397,152 @@ class EnvironmentVariables {
   @IsString()
   HOSHI_P2P_ENABLED?: string;
 
+  // ── C: SPONSOR GAS PENITIPAN ESCROW ──────────────────────────────────────
+  // Opsional — "false" MEMATIKAN sponsor gas, sehingga PENJUAL kembali membayar fee transaksi
+  // penitipan kartu ke escrow. Default NYALA, dan itu disengaja: dengan sponsor mati, penjual
+  // yang masuk lewat Google (wallet Privy embedded, saldo SOL NOL) SAMA SEKALI tidak bisa
+  // menitipkan kartu — jadi tidak bisa menjual. Sponsor memisahkan FEE PAYER (escrow) dari
+  // AUTHORITY (penjual): kartu tetap tidak bisa berpindah tanpa tanda tangan penjual.
+  // Ini TIDAK menyalakan apa pun sendiri — seluruh jalur escrow tetap mati sampai
+  // HOSHI_P2P_ENABLED=true. Plafonnya: empat env di bawah (lihat src/escrow/escrow-fee-sponsor.ts).
+  //
+  // CATATAN: mematikannya BUKAN satu-satunya cara penjual membayar gasnya sendiri. Kalau
+  // sponsor menyala tapi tidak bisa berjalan (kuota penuh / saldo escrow tipis / fee tak
+  // terbaca), penjual yang saldonya cukup otomatis dapat transaksi penjual-bayar. Flag ini
+  // untuk mematikan sponsor SECARA SADAR & menyeluruh, bukan sebagai penanganan kegagalan.
+  @IsOptional()
+  @IsString()
+  HOSHI_ESCROW_SPONSOR_FEE?: string;
+
+  // ATURAN BACA KEEMPAT PLAFON DI BAWAH (src/escrow/sponsor-cap-env.ts, dipakai saat boot DAN
+  // saat memutuskan sponsor — satu aturan, bukan dua salinan):
+  //   • tidak di-set / kosong → default bawaan;
+  //   • "0" → NOL, dan itu disengaja: inilah rem tangan operator di tengah insiden (plafon nol =
+  //     tidak ada transaksi yang disponsori) tanpa perlu deploy. Dulu "0" diam-diam jadi default,
+  //     jadi operator yang meminta NOL justru mendapat 0,02 SOL/hari;
+  //   • apa pun yang lain ("off", "-1", "1e5", "5.5") → BACKEND MENOLAK START. Batas belanja yang
+  //     salah ketik tidak boleh diam-diam kembali ke default.
+  // (Mematikan sponsor SELURUHNYA tetap lewat HOSHI_ESCROW_SPONSOR_FEE=false di atas.)
+
+  // Opsional — plafon fee untuk SATU transaksi penitipan (lamports). Default 50.000 (≈10× fee
+  // transfer Core normal). Fee sesungguhnya dibaca dari getFeeForMessage, bukan ditebak; env ini
+  // hanya batas atas yang membuat satu transaksi tak wajar ditolak SEBELUM ditandatangani.
+  @IsOptional()
+  @IsString()
+  HOSHI_ESCROW_SPONSOR_MAX_FEE_LAMPORTS?: string;
+
+  // Opsional — plafon GLOBAL 24 jam untuk sponsor gas (lamports). Default 20.000.000 (0,02 SOL
+  // ≈ 4.000 penitipan/hari). Dihitung dari tabel escrow_fee_sponsorships (yang DITERBITKAN),
+  // bukan dari penghitung di memori — supaya selamat dari restart & multi-instance.
+  @IsOptional()
+  @IsString()
+  HOSHI_ESCROW_SPONSOR_DAILY_CAP_LAMPORTS?: string;
+
+  // Opsional — plafon 24 jam PER PENJUAL (jumlah transaksi). Default 20. Ini rem anti-Sybil yang
+  // sesungguhnya: plafon global saja bisa dihabiskan satu akun, dan throttle per-IP tak menolong
+  // karena identitas di sistem ini gratis.
+  @IsOptional()
+  @IsString()
+  HOSHI_ESCROW_SPONSOR_MAX_PER_SELLER_24H?: string;
+
+  // Opsional — SOL yang WAJIB TERSISA di wallet escrow sesudah menanggung satu fee (lamports).
+  // Default 10.000.000 (0,01 SOL). Bukan cadangan sopan-santun: escrow yang kehabisan SOL tidak
+  // bisa lagi MENYERAHKAN kartu ke pembeli atau MENGEMBALIKANNYA ke penjual.
+  @IsOptional()
+  @IsString()
+  HOSHI_ESCROW_SPONSOR_RESERVE_LAMPORTS?: string;
+
   // Opsional — komisi Hoshi untuk penjualan P2P dalam basis point ("500" = 5%), diambil dari sisi
   // PENJUAL (pembeli tetap bayar harga + fee QRIS). Default 500. PaymentsService meng-clamp 0..100%.
   // String (bukan @IsInt), sama seperti HOSHI_PACK_MARGIN_BPS, agar salah ketik tak jadi angka diam2.
   @IsOptional()
   @IsString()
   HOSHI_MARKETPLACE_FEE_BPS?: string;
+
+  // ── KIRIM DOMESTIK (stok fisik Hoshi, kurir lokal Indonesia) ──────────────
+  // Opsional — ongkir FLAT NASIONAL dalam Rupiah UTUH, mis. "30000".
+  //
+  // INI LAPIS KELIMA, BUKAN SUMBER UTAMA. Sumber utamanya baris `domestic_shipping_rates` yang
+  // diubah admin TANPA deploy (PUT /api/admin/shipping/domestic-rates) — di situlah TIER
+  // PER-WILAYAH (Jawa / luar Jawa / lebih halus) ditetapkan. Env ini FLAT NASIONAL: ia tidak
+  // mengenal wilayah, jadi ia hanya dipakai kalau TIDAK ADA satu pun baris tarif aktif. Kalau env
+  // ini pun kosong, jalur bayar memakai TIER PENAMPUNG di
+  // src/payments/domestic-shipping-rate.ts (DOMESTIC_DEFAULT_TIERS).
+  //
+  // Nilainya WAJIB di dalam batas mint IDRX (Rp 20.000–Rp 1.000.000.000) — di bawah minimum IDRX,
+  // invoice ongkirnya tidak akan pernah bisa terbit. String (bukan @IsInt), mengikuti pola
+  // HOSHI_PACK_MARGIN_BPS: salah ketik tidak boleh diam-diam jadi angka. Batasnya ditegakkan SAAT
+  // BOOT (assertDomesticShippingRateSane di bawah) supaya salah ketik gagal di depan orang yang
+  // mengetiknya, BUKAN di depan pembeli pertama yang menekan "Bayar ongkir".
+  //
+  // TIDAK ADA hubungannya dengan treasury: jalur domestik tidak pernah mendanai USDC.
+  @IsOptional()
+  @IsString()
+  HOSHI_DOMESTIC_SHIPPING_FLAT_IDR?: string;
+
+  /* ══════════════════════════════════════════════════════════════════════════════════════════
+     TARIF ONGKIR NYATA DARI KURIR (BITESHIP) — LAPIS 0, DI ATAS KELIMA LAPIS DI ATAS.
+
+     Kelimanya di bawah ini OPSIONAL, dan SATU-SATUNYA saklarnya BITESHIP_API_KEY. Kosong = lapis
+     tarif kurir DIAM SEPENUHNYA dan ongkir diresolusi persis seperti sebelum lapis ini ada
+     (baris DB → env flat → tier penampung). Itu keadaan produksi HARI INI: tidak boleh ada satu
+     pun var di blok ini yang, dengan dibiarkan kosong, mengubah perilaku apa pun.
+
+     ┌──── KENAPA BLOK INI MEMPERINGATKAN DAN TIDAK PERNAH MENOLAK START ──────────────────────┐
+     │ `assertDomesticShippingRateSane` di bawah MENOLAK START untuk ongkir env yang cacat, dan │
+     │ itu benar: nilainya adalah NOMINAL YANG DITAGIHKAN, jadi yang salah di sana berarti      │
+     │ menagih pembeli angka yang tidak pernah diputuskan siapa pun.                            │
+     │                                                                                          │
+     │ Var di blok ini tidak begitu. Tidak satu pun dari mereka ADALAH sebuah harga: mereka     │
+     │ menentukan apakah kita BERTANYA ke kurir. Kalau salah satunya cacat, yang terjadi adalah │
+     │ lapis 0 diam dan ongkir kembali ke tarif tier — yaitu PERSIS keadaan produksi hari ini,  │
+     │ yang jelas tidak rusak. Menolak start karenanya berarti menukar "fitur tambahan mati"    │
+     │ dengan api.hoshimarket.xyz MATI SELURUHNYA (di droplet, migrasi dan server dirantai `&&` │
+     │ dalam satu CMD). Itu bukan perbaikan — alasannya sama persis dengan                      │
+     │ `warnIfPaymentReturnUrlMissing`.                                                          │
+     │                                                                                          │
+     │ Gantinya: `warnIfBiteshipConfigIncomplete` MENCETAK KERAS setiap masalahnya saat boot,   │
+     │ dan klien tarifnya melog ulang saat jalan. Diam adalah satu-satunya arah gagal yang      │
+     │ benar-benar berbahaya di sini — seseorang memasang kunci API, mengira tarif nyata sudah  │
+     │ menyala, dan tidak pernah tahu bahwa yang ditagihkan masih angka penampung.              │
+     └──────────────────────────────────────────────────────────────────────────────────────────┘
+
+     Aturan pembacaan semua var ini hidup di src/payments/biteship-rate-env.ts — file TANPA
+     import sama sekali, SENGAJA, supaya aturan yang dipakai saat BOOT adalah aturan yang SAMA
+     dengan yang dipakai saat benar-benar memanggil API-nya.
+     ══════════════════════════════════════════════════════════════════════════════════════════ */
+
+  // Kunci API Biteship ("biteship_live.…" / "biteship_test.…"). RAHASIA: tidak pernah dikirim ke
+  // browser, dan setiap teks yang dilog jalur tarif disaring lebih dulu (redactApiKey).
+  // KOSONG = lapis tarif kurir MATI TOTAL, tanpa satu baris log pun.
+  @IsOptional()
+  @IsString()
+  BITESHIP_API_KEY?: string;
+
+  // Kode pos GUDANG HOSHI (asal kiriman), TEPAT 5 digit, mis. "12440". Wajib diisi kalau
+  // BITESHIP_API_KEY diisi — tanpa asal, tarif tidak bisa dihitung sama sekali.
+  @IsOptional()
+  @IsString()
+  BITESHIP_ORIGIN_POSTAL_CODE?: string;
+
+  // Kode kurir yang benar-benar kita pakai, dipisah koma, mis. "jne,sicepat,jnt". Kosong = bawaan
+  // di kode. SATU kode kurir yang tidak dikenal membuat Biteship menolak SELURUH request.
+  @IsOptional()
+  @IsString()
+  BITESHIP_COURIERS?: string;
+
+  // Berat satu kiriman dalam GRAM, mis. "250" (satu slab + kemasan). Kosong/cacat = bawaan di
+  // kode. String (bukan @IsInt) mengikuti pola HOSHI_PACK_MARGIN_BPS: salah ketik tidak boleh
+  // diam-diam jadi angka — di sini ia dilaporkan lalu bawaan yang dipakai.
+  @IsOptional()
+  @IsString()
+  BITESHIP_WEIGHT_GRAMS?: string;
+
+  // Base URL API Biteship. Kosong = https://api.biteship.com. Ada supaya staging bisa diarahkan
+  // ke mock tanpa kunci sungguhan — sama seperti COLLECTORCRYPT_SHIPPING_BASE_URL.
+  @IsOptional()
+  @IsString()
+  BITESHIP_BASE_URL?: string;
 
   // ── CC Vault Shipping: kirim kartu fisik keluar dari vault CC ─────────────
   // Opsional — "true" MENGAKTIFKAN jalur REAL kirim kartu fisik: user bayar ongkir Rupiah, treasury
@@ -266,6 +558,18 @@ class EnvironmentVariables {
   @IsOptional()
   @IsString()
   COLLECTORCRYPT_SHIPPING_BASE_URL?: string;
+
+  // CC SHIPPING MOCK (staging/devnet). "1" MENYALAKAN mock CC Vault Shipping di dalam backend ini
+  // sendiri, di /api/cc-shipping-mock — supaya alur kirim kartu fisik bisa ditelusuri lewat browser
+  // TANPA kredensial CC dan tanpa uang asli (Render tidak bisa menjangkau localhost:4010, jadi mock
+  // proses-terpisah tidak menolong di staging). Arahkan COLLECTORCRYPT_SHIPPING_BASE_URL ke
+  // <URL backend publik>/api/cc-shipping-mock untuk memakainya.
+  // HANYA berlaku bila deployment tidak terlihat produksi (detectProductionSignal) — sama seperti
+  // IDRX_MOCK/CC_MOCK. BEDANYA: flag ini juga masuk interlock cutover mainnet di bawah, jadi
+  // SOLANA_CLUSTER=mainnet-beta + flag ini menyala = backend MENOLAK START. Biarkan kosong di produksi.
+  @IsOptional()
+  @IsString()
+  CC_SHIPPING_MOCK?: string;
 
   // Opsional — User-Agent yang dikirim ke CC Shipping (CC menolak sebagian request tanpa UA).
   // Client punya fallback non-kosong bila ini tidak di-set.
@@ -285,7 +589,8 @@ class EnvironmentVariables {
   // Kalau kosong, endpoint /redemptions/siws/nonce menolak dengan 503 "SIWS not configured"
   // (CcShippingService.siwsConfig) — TIDAK memanggil CC dengan partnerAppId/domain/uri undefined.
 
-  // Slug partner CC kita (atau Privy App ID) — dikirim sebagai partnerAppId ke /auth/wallet/nonce.
+  // partnerAppId yang DITERBITKAN CC (email support@collectorcrypt.com) — dikirim ke
+  // /auth/wallet/nonce. Nilai yang tidak dikenal CC dijawab 400 "Unknown partner".
   @IsOptional()
   @IsString()
   COLLECTORCRYPT_PARTNER_APP_ID?: string;
@@ -384,6 +689,30 @@ function assertMainnetConsistency(config: Record<string, unknown>): void {
     );
   }
 
+  // MOCK CC SHIPPING DI MAINNET — dua kesalahan yang berbeda, dua-duanya ditolak.
+  //
+  // Kenapa flag ini masuk interlock padahal IDRX_MOCK/CC_MOCK tidak: dua mock itu cuma MENGGANTI
+  // jawaban di dalam proses, jadi kalau kepencet di mainnet double-gate-nya diam-diam
+  // mengabaikannya dan jalur asli tetap jalan. Yang ini dituju lewat sebuah BASE URL. Kalau
+  // flag-nya menyala di mainnet, double-gate membuat /cc-shipping-mock menjawab 404 — dan yang
+  // kelihatan oleh operator bukan "mock mati", melainkan setiap panggilan shipping gagal 404
+  // sesudah treasury mendanai USDC ASLI. Gagal saat BOOT jauh lebih murah daripada gagal di
+  // tengah jalur uang, jadi ketidakcocokan ini dibuat mustahil, bukan sekadar tidak berbahaya.
+  if (str('CC_SHIPPING_MOCK') === '1') {
+    problems.push(
+      'CC_SHIPPING_MOCK=1 (mock CC Vault Shipping) menyala di mainnet — kosongkan variabelnya. ' +
+        'Mock ini hanya untuk staging/devnet dan TIDAK PERNAH boleh melayani jalur uang asli.',
+    );
+  }
+  // Belah yang kedua: flag sudah dimatikan tapi base URL-nya masih menunjuk mock. Tanpa cek ini
+  // backend start dengan senang hati lalu menembak endpoint yang dijamin 404 — kegagalan yang
+  // muncul PERSIS setelah dana keluar.
+  if (shipBase.includes(`/${CC_SHIPPING_MOCK_MOUNT}`)) {
+    problems.push(
+      `COLLECTORCRYPT_SHIPPING_BASE_URL masih menunjuk mock internal (${str('COLLECTORCRYPT_SHIPPING_BASE_URL')}) di mainnet — pakai https://api.collectorcrypt.com.`,
+    );
+  }
+
   if (problems.length > 0) {
     throw new Error(
       'Cutover mainnet TIDAK konsisten — backend menolak start supaya uang asli tidak jalan di config setengah jadi:\n' +
@@ -405,6 +734,221 @@ export function validateEnv(config: Record<string, unknown>) {
           .join('\n'),
     );
   }
+  assertSponsorCapsReadable(config);
+  assertDomesticShippingRateSane(config);
   assertMainnetConsistency(config);
+  warnIfPaymentReturnUrlMissing(config);
+  warnIfResellCapUnset(config);
+  warnIfBiteshipConfigIncomplete(config);
+  warnIfDuitkuConfigIncomplete(config);
   return validated;
+}
+
+/**
+ * PLAFON BELANJA RESELLER — berteriak HANYA ketika ia benar-benar berbahaya.
+ *
+ * `HOSHI_CC_MAX_CARD_PRICE_USDC` punya bawaan $5.000 PER KARTU. Selama jalur reseller MATI
+ * (keadaan default), angka itu tidak membelanjakan apa pun dan tidak perlu diributkan — memaksa
+ * orang mengisinya untuk fitur yang tidak mereka pakai adalah cara melatih peringatan diabaikan.
+ *
+ * Tapi begitu `HOSHI_CC_RESELL_ENABLED=true`, jalur itu membeli kartu dengan USDC treasury
+ * SUNGGUHAN, dan plafon yang tidak pernah diisi berarti setiap pembelian diadili oleh angka yang
+ * tidak pernah diputuskan siapa pun. Di situlah — dan hanya di situlah — ini layak berteriak.
+ *
+ * Tidak menolak start, alasan yang sama dengan tetangganya: plafon bawaan tetap sebuah plafon,
+ * dan mematikan seluruh backend karena satu var yang belum diisi menukar risiko sempit dengan
+ * situs yang mati. Yang menahan belanja sungguhan tetap saldo treasury dan gerbang di kodenya.
+ */
+function warnIfResellCapUnset(config: Record<string, unknown>): void {
+  // `typeof === 'string'` dulu, bukan `String(...)`: nilai non-string tidak pernah bisa menjadi
+  // 'true' lewat jalur aslinya (ConfigService membaca env sebagai string), dan memaksanya jadi
+  // string di sini hanya menciptakan cara kedua sebuah saklar belanja bisa terbaca menyala.
+  const flag = config.HOSHI_CC_RESELL_ENABLED;
+  const armed =
+    typeof flag === 'string' && flag.trim().toLowerCase() === 'true';
+  if (!armed) return;
+
+  const cap = config.HOSHI_CC_MAX_CARD_PRICE_USDC;
+  const terisi = typeof cap === 'string' ? cap.trim() !== '' : cap != null;
+  if (terisi) return;
+
+  // console, bukan Logger Nest: validateEnv berjalan SEBELUM aplikasi (dan logger-nya) berdiri.
+  console.error(
+    '[ENV] HOSHI_CC_RESELL_ENABLED=true TAPI HOSHI_CC_MAX_CARD_PRICE_USDC TIDAK DIISI. ' +
+      'Jalur reseller akan membeli kartu dengan USDC treasury SUNGGUHAN, dan plafon per-kartunya ' +
+      'jatuh ke bawaan 5000000000 base unit = $5.000 PER KARTU — angka yang tidak pernah ' +
+      'diputuskan siapa pun. Isi HOSHI_CC_MAX_CARD_PRICE_USDC di backend.env dengan plafon yang ' +
+      'memang kamu maksud (base unit USDC, 6 desimal: $100 = 100000000), atau matikan lagi ' +
+      'HOSHI_CC_RESELL_ENABLED sampai plafonnya diputuskan.',
+  );
+}
+
+/**
+ * TARIF KURIR NYATA (Biteship) — MEMPERINGATKAN saat boot, tidak pernah menolak start.
+ *
+ * Alasan lengkap kenapa blok ini memperingatkan alih-alih menolak ada di atas, di deklarasi
+ * var-nya. Singkatnya: tidak satu pun var di sini ADALAH sebuah harga — mereka menentukan apakah
+ * kita BERTANYA ke kurir — jadi yang cacat cuma mengembalikan ongkir ke tarif tier, yaitu keadaan
+ * produksi hari ini. Menolak start karenanya akan mematikan seluruh api.hoshimarket.xyz demi
+ * sebuah lapis tambahan.
+ *
+ * Yang DITUTUP fungsi ini adalah arah gagal yang sesungguhnya berbahaya: DIAM. Seseorang memasang
+ * BITESHIP_API_KEY di droplet, mengira tarif nyata sudah menyala, dan tidak pernah tahu bahwa
+ * kode pos gudangnya salah ketik sehingga setiap pembeli masih ditagih angka PENAMPUNG.
+ */
+function warnIfBiteshipConfigIncomplete(config: Record<string, unknown>): void {
+  const problems = biteshipConfigProblems((key) => {
+    const raw = config[key];
+    return typeof raw === 'string' ? raw : undefined;
+  });
+  if (problems.length === 0) return;
+  // console, bukan Logger Nest: validateEnv berjalan SEBELUM aplikasi (dan logger-nya) berdiri.
+  console.error(
+    '[ENV] TARIF KURIR NYATA (Biteship) TIDAK AKAN DIPAKAI sepenuhnya — backend tetap menyala ' +
+      'dan ongkir domestik jatuh ke tarif tier/penampung (Rp 25.000 / Rp 50.000), yang BUKAN ' +
+      'tarif kurir sungguhan:\n' +
+      problems.map((p) => `  • ${p}`).join('\n'),
+  );
+}
+
+/**
+ * ALAMAT KEMBALI SETELAH BAYAR — MEMPERINGATKAN saat boot, tidak menolak start.
+ *
+ * `HOSHI_PAYMENT_RETURN_URL` dibaca `requiredConfig` di TIGA jalur penerbitan tagihan, termasuk
+ * satu-satunya rail yang menerbitkan tagihan untuk kartu TITIPAN. `requiredConfig` melempar saat
+ * DIPANGGIL, bukan saat start — jadi var yang terhapus saat menyunting backend.env menghasilkan
+ * boot yang berhasil, log bersih, dan kegagalan yang baru muncul di depan pembeli pertama.
+ *
+ * ┌──── KENAPA INI MEMPERINGATKAN, PADAHAL TETANGGANYA DI ATAS MENOLAK START ─────────────────┐
+ * │ `assertDomesticShippingRateSane` dan interlock mainnet menolak start karena yang mereka   │
+ * │ jaga adalah BATAS BELANJA dan KONSISTENSI JARINGAN: menyala dengan nilai yang salah di    │
+ * │ sana berarti membelanjakan uang dengan batas yang tidak pernah diminta siapa pun.         │
+ * │                                                                                            │
+ * │ Var ini tidak begitu. Kalau ia hilang, yang rusak HANYA penerbitan tagihan. Menolak start │
+ * │ justru menukar kerusakan sempit itu dengan kerusakan total: di droplet, migrasi dan server │
+ * │ dirantai `&&` dalam satu CMD, jadi boot yang gagal berarti api.hoshimarket.xyz MATI —     │
+ * │ marketplace, vault, riwayat, semuanya — bukan cuma checkout-nya.                          │
+ * │                                                                                            │
+ * │ Menukar checkout yang rusak dengan situs yang mati bukan perbaikan.                        │
+ * └────────────────────────────────────────────────────────────────────────────────────────────┘
+ *
+ * Bentuk nilainya tetap DIVALIDASI KERAS di atas (`@IsUrl`): nilai yang ADA tapi cacat ditolak,
+ * karena di situ tidak ada pertukaran apa pun — konfigurasi yang cacat tidak pernah bisa jalan.
+ */
+function warnIfPaymentReturnUrlMissing(config: Record<string, unknown>): void {
+  const raw = config.HOSHI_PAYMENT_RETURN_URL;
+  const ada = typeof raw === 'string' && raw.trim().length > 0;
+  if (ada) return;
+  // console, bukan Logger Nest: validateEnv berjalan SEBELUM aplikasi (dan logger-nya) berdiri.
+  console.error(
+    '[ENV] HOSHI_PAYMENT_RETURN_URL TIDAK TERISI. Backend tetap menyala, tetapi SETIAP ' +
+      'penerbitan tagihan akan gagal — pack, stok Hoshi, dan kartu TITIPAN. Pembeli akan ' +
+      'melihat kegagalan di tombol Beli, bukan di sini. Isi var ini di backend.env, mis. ' +
+      'HOSHI_PAYMENT_RETURN_URL=https://hoshimarket.xyz/open-packs',
+  );
+}
+
+/**
+ * PLAFON SPONSOR GAS YANG TIDAK BISA DIBACA = BACKEND MENOLAK START.
+ *
+ * Keempat env ini adalah BATAS BELANJA, dan sebelum ini nilai yang tidak terbaca — termasuk "0",
+ * "-1", dan "off" — diam-diam berubah menjadi default bawaan. Untuk sebuah batas belanja itu arah
+ * yang salah: operator yang mengetik `HOSHI_ESCROW_SPONSOR_DAILY_CAP_LAMPORTS=0` untuk menghentikan
+ * sponsor di tengah insiden justru mendapat 0,02 SOL/hari. Sekarang "0" berarti NOL (lihat
+ * src/escrow/sponsor-cap-env.ts) dan yang benar-benar tidak terbaca ditolak DI SINI.
+ *
+ * KENAPA MENOLAK START, bukan melempar saat dipakai seperti plafon treasury: plafon ini dibaca di
+ * jalur yang punya JALAN MUNDUR ("penjual bayar gas"), jadi melempar saat dipakai akan ikut
+ * mematikan jalan mundur itu untuk penjual yang tidak ada urusannya dengan salah ketik kita —
+ * sementara diam-diam memakai default berarti membelanjakan SOL dengan batas yang tidak pernah
+ * diminta siapa pun. Gagal saat boot tidak punya dua kerugian itu, dan alasannya sama dengan
+ * interlock cutover mainnet di bawah: gagal saat BOOT jauh lebih murah daripada gagal — atau
+ * membelanjakan — di tengah jalur uang.
+ */
+/**
+ * ONGKIR DOMESTIK dari env — DITOLAK SAAT BOOT kalau nominalnya mustahil ditagih.
+ *
+ * ┌──── KENAPA SAAT BOOT DAN BUKAN SAAT DIPAKAI ────────────────────────────────────────────────┐
+ * │ Batas bawahnya BUKAN angka karangan: ia MINIMUM MINT IDRX (Rp 20.000). Sebuah nilai di      │
+ * │ bawahnya menghasilkan konfigurasi yang kelihatan benar di mana-mana — env terisi, dashboard │
+ * │ tenang, log bersih — lalu GAGAL pertama kali seorang pembeli menekan "Bayar ongkir",        │
+ * │ karena gateway menolak mint-request-nya. Itu kegagalan yang muncul di depan USER, berjam-   │
+ * │ jam atau berhari-hari sesudah salah ketiknya, dan yang menanggungnya orang yang sudah       │
+ * │ membeli kartu.                                                                              │
+ * │                                                                                             │
+ * │ Menolaknya saat BOOT memindahkan kegagalan itu ke depan orang yang MENGETIKNYA, detik itu   │
+ * │ juga, dengan pesan yang menyebut batasnya. Var ini OPSIONAL — tidak diisi = tidak ada yang  │
+ * │ dicek — jadi aturan ini tidak bisa menjatuhkan deploy yang tidak memakainya.                 │
+ * └─────────────────────────────────────────────────────────────────────────────────────────────┘
+ *
+ * Yang di DB (tabel `domestic_shipping_rates`) divalidasi di dua titik lain dengan batas yang
+ * SAMA: saat admin menulis (assertSaneRate di AdminService) dan saat jalur bayar membaca
+ * (fail-closed di resolveDomesticShippingIdr). Boot tidak bisa mengeceknya — DATABASE_URL belum
+ * tentu terjangkau saat validasi env, dan satu blip DB tidak boleh menggagalkan start.
+ */
+function assertDomesticShippingRateSane(config: Record<string, unknown>): void {
+  // `typeof === 'string'` dulu, bukan `String(...)`: alasan sama dengan warnIfResellCapUnset —
+  // nilai non-string tidak pernah datang dari env, dan memaksanya jadi string di sini hanya
+  // menciptakan cara kedua sebuah TARIF bisa terbaca "terisi". (Juga membersihkan
+  // @typescript-eslint/no-base-to-string di baris ini.)
+  const v = config.HOSHI_DOMESTIC_SHIPPING_FLAT_IDR;
+  const raw =
+    typeof v === 'string' ? v.trim() : typeof v === 'number' ? String(v) : '';
+  if (!raw) return; // tidak diisi = pakai tarif dashboard / tier penampung. Sah.
+  const parsed = Number(raw);
+  if (
+    !Number.isInteger(parsed) ||
+    parsed < IDRX_MIN_MINT_IDR ||
+    parsed > IDRX_MAX_MINT_IDR
+  ) {
+    throw new Error(
+      `HOSHI_DOMESTIC_SHIPPING_FLAT_IDR="${raw}" bukan ongkir yang bisa ditagihkan. Nilainya ` +
+        `harus bilangan bulat Rupiah UTUH antara ${IDRX_MIN_MINT_IDR} dan ${IDRX_MAX_MINT_IDR} ` +
+        '(batas mint IDRX). Di bawah minimum itu, invoice ongkirnya DITOLAK gateway dan jalur ' +
+        'kirim domestik mati di pembelian pertama — jadi backend menolak start alih-alih ' +
+        'membiarkan kegagalannya muncul di depan pembeli. Kosongkan var ini untuk memakai tarif ' +
+        'dari dashboard admin (PUT /api/admin/shipping/domestic-rates).',
+    );
+  }
+}
+
+function assertSponsorCapsReadable(config: Record<string, unknown>): void {
+  const problems = sponsorCapEnvProblems(config);
+  if (problems.length > 0) {
+    throw new Error(
+      'Plafon sponsor gas escrow tidak bisa dibaca — backend menolak start supaya batas belanja ' +
+        'tidak diam-diam kembali ke default:\n' +
+        problems.map((p) => `  • ${p}`).join('\n'),
+    );
+  }
+}
+
+/**
+ * DUITKU DINYALAKAN TAPI TIDAK LENGKAP — berteriak, tidak mematikan start.
+ *
+ * Kalau `PAYMENT_PROVIDER=duitku` tapi kredensialnya kurang, SETIAP checkout akan gagal 503 —
+ * kegagalan yang baru terlihat saat pembeli pertama menekan Beli. Berteriak saat boot memberi
+ * operator kesempatan melihatnya lebih dulu. Tidak menolak start, alasan yang sama dengan
+ * tetangganya: mematikan seluruh backend (termasuk verifikasi order IDRX yang masih menggantung)
+ * demi satu var yang belum diisi menukar masalah sempit dengan situs yang mati.
+ */
+function warnIfDuitkuConfigIncomplete(config: Record<string, unknown>): void {
+  const str = (key: string): string => {
+    const v = config[key];
+    return typeof v === 'string' ? v.trim() : '';
+  };
+  if (str('PAYMENT_PROVIDER').toLowerCase() !== 'duitku') return;
+  const missing = [
+    'DUITKU_ENV',
+    'DUITKU_MERCHANT_CODE',
+    'DUITKU_API_KEY',
+    'DUITKU_CALLBACK_URL',
+    'DUITKU_CUSTOMER_EMAIL',
+  ].filter((k) => str(k) === '');
+  if (missing.length === 0) return;
+  // console, bukan Logger Nest: validateEnv berjalan SEBELUM aplikasi (dan logger-nya) berdiri.
+  console.error(
+    '[ENV] PAYMENT_PROVIDER=duitku TAPI pengaturannya belum lengkap — SETIAP checkout akan gagal ' +
+      `sampai ini diisi: ${missing.join(', ')}`,
+  );
 }

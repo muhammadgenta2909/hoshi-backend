@@ -19,7 +19,7 @@ import { AdminGuard } from '../auth/admin.guard';
 import { CurrentUser } from '../auth/current-user.decorator';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import type { AuthUser } from '../auth/jwt.strategy';
-import { PrivyToken } from '../auth/privy-token.decorator';
+import { CcAccessToken } from '../auth/cc-access-token.decorator';
 import { CreateListingOrderDto } from './dto/create-listing-order.dto';
 import { CreateOfferOrderDto } from './dto/create-offer-order.dto';
 import { CreatePackOrderDto } from './dto/create-pack-order.dto';
@@ -137,23 +137,80 @@ export class PaymentsController {
     summary:
       'Terbitkan tagihan rupiah untuk ONGKIR kirim kartu fisik (CC Vault Shipping) → QR/VA/paymentUrl IDRX',
     description:
-      'Ongkir (USD) di-taksir SERVER dari CollectorCrypt (butuh header x-privy-identity-token), ' +
+      'Ongkir (USD) di-taksir SERVER dari CollectorCrypt (butuh header x-cc-access-token: access token ' +
+      'sesi wallet sign-in CC, prefix cca_, dari /redemptions/siws/verify), ' +
       'lalu di-Rupiah-kan lewat kurs IDRX. TIDAK ADA USDC yang bergerak di request ini — pendanaan ' +
       'USDC ke wallet user + burn kartu dilakukan setelah Rupiah lunas, di sesi tanda-tangan user.',
   })
   createShippingOrder(
     @Body() dto: CreateShippingOrderDto,
     @CurrentUser() user: AuthUser,
-    @PrivyToken() privyToken: string,
+    @CcAccessToken() ccAccessToken: string,
   ) {
-    return this.payments.createShippingOrder(dto.redemptionId, user, privyToken);
+    return this.payments.createShippingOrder(
+      dto.redemptionId,
+      user,
+      ccAccessToken,
+    );
+  }
+
+  /**
+   * ONGKIR KIRIM DOMESTIK (stok fisik Hoshi, kurir lokal Indonesia).
+   *
+   * RUTE TERPISAH dari /payments/shipping DENGAN SENGAJA, walau rail pembayarannya sama
+   * (packType='SHIPPING' + IDRX + reconciler + sapuan kedaluwarsa yang sama):
+   *   • TIDAK butuh header x-cc-access-token — tidak ada sesi CollectorCrypt yang relevan, dan
+   *     @CcAccessToken() akan 400 kalau headernya kosong. Sebuah pengiriman domestik TIDAK
+   *     BOLEH butuh kredensial CC yang masih kita tunggu.
+   *   • TIDAK digerbang HOSHI_CC_SHIPPING_ENABLED — jalur ini tidak menyentuh CC sama sekali.
+   *   • Harganya dari TARIF ADMIN, bukan dari estimate CC.
+   * Dua gerbang rail (assertCcRail / assertDomesticRail) memastikan tidak ada baris yang bisa
+   * masuk rute yang salah.
+   */
+  @Post('shipping/domestic')
+  @ApiBearerAuth()
+  @UseGuards(JwtAuthGuard)
+  @Throttle({ default: { ttl: 60000, limit: 10 } })
+  @ApiOperation({
+    summary:
+      'Terbitkan tagihan rupiah ONGKIR kirim DOMESTIK (stok Hoshi, kurir lokal) → QR/VA/' +
+      'paymentUrl IDRX',
+    description:
+      'Untuk kartu STOK HOSHI yang fisiknya disimpan Hoshi di Indonesia. NOL NFT, NOL burn, ' +
+      'NOL USDC treasury, NOL panggilan CollectorCrypt, NOL tanda tangan wallet — satu-satunya ' +
+      'uang yang bergerak adalah ongkir Rupiah dari user ke treasury, dan ongkir itu SELALU ' +
+      'aman di-refund. Ongkirnya dari tarif admin (PUT /admin/shipping/domestic-rates), BUKAN ' +
+      'dari estimate CollectorCrypt. TIDAK butuh header x-cc-access-token.',
+  })
+  createDomesticShippingOrder(
+    @Body() dto: CreateShippingOrderDto,
+    @CurrentUser() user: AuthUser,
+  ) {
+    return this.payments.createDomesticShippingOrder(dto.redemptionId, user);
+  }
+
+  @Get('config')
+  // PUBLIK — frontend membacanya SEBELUM pembeli login atau memilih kartu, untuk memutuskan apakah
+  // tombol bayar dibuka. Hanya dua field, nol rahasia. Inilah yang membuat menyalakan Duitku cukup
+  // dengan mengisi env di droplet: tidak ada deploy frontend di hari H.
+  @ApiOperation({
+    summary:
+      'Rel pembayaran aktif dan apakah pembeli bisa membayar sekarang ({ provider, buyerCheckoutOpen })',
+  })
+  paymentConfig() {
+    return this.payments.publicPaymentConfig();
   }
 
   @Get('me/orders')
   @ApiBearerAuth()
   @UseGuards(JwtAuthGuard)
   @ApiOperation({
-    summary: 'Riwayat order pembayaran milik user login (terbaru dulu)',
+    summary:
+      'Riwayat order pembayaran milik user login (terbaru dulu). B3: setiap baris membawa ' +
+      '`refundState` (NONE | IN_PROGRESS | UNDER_REVIEW) + `refundNotice` (kalimat siap-tampil). ' +
+      'HANYA IN_PROGRESS yang boleh dirender sebagai "dana sedang dikembalikan"; UNDER_REVIEW ' +
+      'berarti operator justru DILARANG mengirim uangnya sampai diverifikasi. Kolom operasional ' +
+      '`refundSafe` TIDAK diekspos.',
   })
   myOrders(@CurrentUser() user: AuthUser) {
     return this.payments.myOrders(user.id);
@@ -217,6 +274,32 @@ export class PaymentsController {
     return { received: true };
   }
 
+  @Post('duitku/callback')
+  // PUBLIK, TANPA GUARD — Duitku tidak bisa mengirim JWT kita. Duitku mengirimnya sebagai
+  // x-www-form-urlencoded; parser bawaan Nest sudah menangani bentuk itu. Aturan yang sama dengan
+  // callback IDRX: SELALU 2xx, lepas dari throttler, body cuma pemicu, bukti diambil ulang.
+  @HttpCode(200)
+  @SkipThrottle()
+  @ApiOperation({
+    summary:
+      'Webhook Duitku (publik, bertanda tangan md5) → selalu 2xx; tanda tangan tak sah diabaikan, ' +
+      'bukti pembayaran diambil ulang lewat transactionStatus',
+  })
+  async handleDuitkuCallback(
+    // Longgar dengan sengaja — alasan yang sama dengan callback IDRX di atas.
+    @Body() body: Record<string, unknown>,
+  ): Promise<{ received: true }> {
+    try {
+      await this.payments.handleDuitkuCallback(body);
+    } catch (err) {
+      this.logger.error(
+        `Callback Duitku gagal diproses (tetap 2xx, reconciler menyusul): ${
+          err instanceof Error ? err.message : 'unknown'
+        }`,
+      );
+    }
+    return { received: true };
+  }
   @Post('reconcile')
   @ApiBearerAuth()
   @UseGuards(AdminGuard)

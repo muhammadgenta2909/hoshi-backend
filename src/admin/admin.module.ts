@@ -6,6 +6,7 @@ import { AdminJwtStrategy } from '../auth/admin-jwt.strategy';
 import { CollectorCryptModule } from '../collectorcrypt/collectorcrypt.module';
 import { MarketplaceModule } from '../marketplace/marketplace.module';
 import { BalanceModule } from '../balance/balance.module';
+import { EscrowModule } from '../escrow/escrow.module';
 import { AdminController } from './admin.controller';
 import { AdminService } from './admin.service';
 
@@ -18,6 +19,9 @@ import { AdminService } from './admin.service';
     CollectorCryptModule,
     // Proses penarikan saldo penjual (approve/reject) lewat WithdrawalService.
     BalanceModule,
+    // D (4.6) — dashboard escrow + pemulihan manual. Kunci escrow tetap terkurung di
+    // EscrowService; admin hanya boleh memicunya lewat aksi beralasan yang berpagar status.
+    EscrowModule,
     PassportModule,
     JwtModule.registerAsync({
       inject: [ConfigService],

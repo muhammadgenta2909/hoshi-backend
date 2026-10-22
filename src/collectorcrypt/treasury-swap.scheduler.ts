@@ -35,6 +35,8 @@ export class TreasurySwapScheduler implements OnModuleInit, OnModuleDestroy {
   private running = false;
   /** Kapan tiap jenis alarm terakhir diteriakkan — supaya log tidak jadi bising. */
   private readonly lastAlarm = new Map<string, number>();
+  /** Hanya SWAP yang dijaga flag; alarm saldo selalu jalan. Lihat blok di atas onModuleInit. */
+  private swapEnabled = false;
 
   constructor(
     private readonly swap: TreasurySwapService,
@@ -42,20 +44,32 @@ export class TreasurySwapScheduler implements OnModuleInit, OnModuleDestroy {
     private readonly config: ConfigService,
   ) {}
 
+  /* ══════════════════════════════════════════════════════════════════════════════════════════
+     ALARM SALDO TIDAK LAGI IKUT MATI BERSAMA SWAP.
+
+     Dulu `onModuleInit` langsung `return` kalau TREASURY_SWAP_SCHEDULER_ENABLED bukan '1', dan
+     log-nya sendiri mengakui akibatnya: "tidak ada alarm saldo dari scheduler".
+
+     Dua hal itu digabung karena kebetulan berbagi satu timer, bukan karena saling bergantung —
+     dan menggabungkannya membuat kill-switch swap diam-diam jadi kill-switch MONITORING. Persis
+     di keadaan yang paling membutuhkannya: float yang dikelola MANUAL adalah float yang bisa
+     habis tanpa ada satu pun proses yang memperhatikan. Yang memberi tahu treasury kering
+     kembali menjadi USER, lewat pesan gagal saat ia mencoba membayar — itu bukan monitoring,
+     itu kehilangan penjualan.
+
+     Sekarang timernya SELALU jalan; yang dijaga flag hanya SWAP-nya. Alarm tidak punya
+     kill-switch sendiri, dan itu disengaja: alarm yang bisa lupa dinyalakan bukan alarm.
+
+     Bacaan saldo bersifat read-only dan punya peredam sendiri (`this.alarm`), jadi menjalankannya
+     saat swap dorman tidak menyentuh apa pun selain satu panggilan RPC tiap putaran.
+     ══════════════════════════════════════════════════════════════════════════════════════════ */
   onModuleInit(): void {
-    // DEFAULT MATI (dorman). Penyapu auto-swap HANYA jalan kalau di-set eksplisit
-    // TREASURY_SWAP_SCHEDULER_ENABLED=1. Alasan: selama fase awal, float treasury dikelola
+    // DEFAULT MATI (dorman) UNTUK SWAP-NYA SAJA. Selama fase awal, float treasury dikelola
     // MANUAL (isi USDC/SOL sendiri, cairkan IDRX sendiri) — meng-auto-swap tanpa diminta bisa
     // menukar IDRX yang justru mau dikirim balik ke user/partner. Nyalakan hanya saat volume
     // sudah rutin dan angka FX-nya sudah terbukti.
-    if (this.config.get<string>('TREASURY_SWAP_SCHEDULER_ENABLED') !== '1') {
-      this.logger.warn(
-        'Penyapu treasury DORMAN (set TREASURY_SWAP_SCHEDULER_ENABLED=1 untuk mengaktifkan). ' +
-          'IDRX hasil pembayaran user TIDAK ditukar otomatis, dan tidak ada alarm saldo dari scheduler. ' +
-          'Kelola float secara manual sampai auto-swap sengaja dinyalakan.',
-      );
-      return;
-    }
+    this.swapEnabled =
+      this.config.get<string>('TREASURY_SWAP_SCHEDULER_ENABLED') === '1';
 
     const raw = Number(this.config.get<string>('TREASURY_SWAP_INTERVAL_MS'));
     const ms =
@@ -65,9 +79,19 @@ export class TreasurySwapScheduler implements OnModuleInit, OnModuleDestroy {
 
     this.timer = setInterval(() => void this.sweep(), ms);
     this.timer.unref?.();
-    this.logger.log(
-      `Penyapu treasury aktif — swap IDRX→USDC + alarm saldo tiap ${Math.round(ms / 1000)} detik.`,
-    );
+
+    const tiap = `tiap ${Math.round(ms / 1000)} detik`;
+    if (this.swapEnabled) {
+      this.logger.log(
+        `Penyapu treasury aktif — swap IDRX→USDC + alarm saldo ${tiap}.`,
+      );
+    } else {
+      this.logger.warn(
+        `Auto-swap treasury DORMAN (set TREASURY_SWAP_SCHEDULER_ENABLED=1 untuk mengaktifkan). ` +
+          `IDRX hasil pembayaran user TIDAK ditukar otomatis — kelola float secara manual. ` +
+          `ALARM SALDO TETAP JALAN ${tiap}.`,
+      );
+    }
   }
 
   onModuleDestroy(): void {
@@ -79,6 +103,16 @@ export class TreasurySwapScheduler implements OnModuleInit, OnModuleDestroy {
     if (this.running) return;
     this.running = true;
     try {
+      /* Swap dorman → JANGAN memanggil `swap.sweep()` sama sekali. Melewatinya bukan optimasi:
+         sweep menulis kunci, plafon harian, dan bisa mengirim transaksi. Yang diteruskan ke
+         alarm hanyalah 'DISABLED' — dan itu memang benar. Kebetulan yang berguna: 'DISABLED'
+         termasuk keadaan "macet" di `checkBalances`, jadi IDRX yang menumpuk selama auto-swap
+         dimatikan justru DILAPORKAN, bukan didiamkan. */
+      if (!this.swapEnabled) {
+        await this.checkBalances('DISABLED');
+        return;
+      }
+
       const result = await this.swap.sweep();
 
       // Hasil yang PERLU diketahui manusia dilaporkan; sisanya (NOTHING_TO_DO, LOCKED,

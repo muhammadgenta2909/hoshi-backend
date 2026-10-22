@@ -35,14 +35,23 @@ import { AdminLoginDto } from './dto/admin-login.dto';
 import { AdminUpdateListingDto } from './dto/admin-update-listing.dto';
 import { SetListingStatusDto } from './dto/set-listing-status.dto';
 import { UpdateRedemptionStatusDto } from './dto/update-redemption-status.dto';
+import { CancelAwaitingPaymentDto } from './dto/cancel-awaiting-payment.dto';
+import { RecoverEscrowDto } from './dto/recover-escrow.dto';
+import { RecoverBurnSubmittedDto } from './dto/recover-burn-submitted.dto';
+import { SettleRefundDueDto } from './dto/settle-refund-due.dto';
+import { CurrentUser } from '../auth/current-user.decorator';
+import type { AuthUser } from '../auth/jwt.strategy';
 import {
   CreateContactMessageDto,
   MarkMessageReadDto,
   QueryAdminMessagesDto,
 } from './dto/contact-message.dto';
 import { ImportListingsDto } from './dto/import-listings.dto';
+import { SetListingsSellableDto } from './dto/set-listings-sellable.dto';
+import { SetDomesticShippingRateDto } from './dto/set-domestic-shipping-rate.dto';
 import { UpdateVaultItemDto } from './dto/update-vault-item.dto';
 import {
+  QueryAdminEscrowDto,
   QueryAdminActivityDto,
   QueryAdminCardsDto,
   QueryAdminListingsDto,
@@ -127,7 +136,12 @@ export class AdminController {
   @ApiBearerAuth()
   @UseGuards(AdminGuard)
   @ApiOperation({
-    summary: 'Ledger transaksi (PACK / RESELLER / P2P) dari PaymentOrder',
+    summary:
+      'Ledger transaksi (PACK / RESELLER / CONSIGNMENT / P2P) dari PaymentOrder. ' +
+      '`status=REFUND_DUE` memberi ANTREAN UTANG REFUND: setiap barisnya membawa `refundSafe` ' +
+      '(GERBANG UANG — false berarti JANGAN transfer sebelum diverifikasi di luar sistem) dan ' +
+      'teks `error` apa adanya. Tidak ada rute apa pun yang mengirim uangnya; refund dikerjakan ' +
+      'manusia di luar sistem.',
   })
   transactions(
     @Query('page') page?: string,
@@ -221,25 +235,303 @@ export class AdminController {
     return this.withdrawal.adminReject(id, dto.note);
   }
 
+  /**
+   * A — BACA DULU SEBELUM MENANDAI. Stok Hoshi yang TIDAK bisa dibeli (`sellable=false`).
+   * Inilah permukaan yang dulu tidak ada: kartu terpajang, nol Rupiah bisa masuk, dan tidak
+   * ada apa pun di dashboard yang menjelaskan kenapa.
+   */
+  @Get('listings/unsellable')
+  @ApiBearerAuth()
+  @UseGuards(AdminGuard)
+  @ApiOperation({
+    summary:
+      'READ-ONLY: listing stok Hoshi yang TIDAK BISA DIBELI karena sellable=false (ACTIVE, ' +
+      'bukan katalog CC, tanpa penjual user). Daftar ini MENCAMPUR stok sungguhan dengan ' +
+      'baris seed/placeholder — bentuknya identik dan tidak bisa dibedakan otomatis. Baca ' +
+      'ini dulu, lalu tandai HANYA baris yang kartunya benar-benar ada di rak. Respons membawa ' +
+      '`total`/`returned`/`limit`/`offset`/`hasMore` untuk paging, `actionRequired` (kosong = ' +
+      'tidak ada stok yang tertahan), dan `placeholderDetection: "MANUAL_ONLY"` — tidak ada ' +
+      'predikat otomatis yang bisa memisahkan baris seed dari stok nyata.',
+  })
+  unsellableListings(
+    @Query('limit') limit?: string,
+    @Query('offset') offset?: string,
+  ) {
+    return this.admin.listUnsellableStock(
+      Number(limit) || 200,
+      Number(offset) || 0,
+    );
+  }
+
+  /**
+   * A — PERBAIKAN DATA untuk baris yang diimpor SEBELUM `importListings` menulis
+   * `sellable: true`. Tanpa rute ini satu-satunya jalan keluar adalah mengedit Postgres.
+   *
+   * SENGAJA per-id (maks 500), BUKAN sapuan massal: default `sellable=false` ada untuk menahan
+   * baris seed/placeholder, dan bentuk baris seed IDENTIK dengan bentuk stok sungguhan. Hanya
+   * manusia yang tahu mana yang nyata.
+   */
+  @Post('listings/sellable')
+  @ApiBearerAuth()
+  @UseGuards(AdminGuard)
+  @ApiOperation({
+    summary:
+      'Tandai baris listing tertentu BISA / TIDAK BISA dibeli (flag sellable), per daftar id ' +
+      'eksplisit (maks 500). Menaikkan flag = baris itu SEKARANG bisa dibeli pembeli — pakai ' +
+      'HANYA untuk kartu yang fisiknya benar-benar ada di rak Hoshi. Reversibel ' +
+      '(sellable=false). Setiap perubahan di-log dengan id admin-nya. IDEMPOTEN: memanggilnya ' +
+      'dua kali dengan body yang sama menghasilkan `changed: 0` dan id-nya muncul di ' +
+      '`alreadyCorrect` — bukan error, bukan perubahan kedua. `skipped` = id yang ditolak pagar ' +
+      'bentuk (tidak ada / katalog CC / listing user / bukan ACTIVE).',
+  })
+  setListingsSellable(
+    @Body() dto: SetListingsSellableDto,
+    @CurrentUser() user: AuthUser,
+  ) {
+    return this.admin.setListingsSellable(dto.ids, dto.sellable, user);
+  }
+
+  /* ─────── TARIF ONGKIR KIRIM DOMESTIK (stok Hoshi, kurir lokal Indonesia) ─────── */
+
+  @Get('shipping/domestic-rates')
+  @ApiBearerAuth()
+  @UseGuards(AdminGuard)
+  @ApiOperation({
+    summary:
+      'Tarif ongkir kirim DOMESTIK: tier yang SEDANG berlaku, urutan resolusinya, contoh ' +
+      'siap-tempel, dan `actionRequired` — daftar hal yang masih harus diputuskan pemilik ' +
+      'produk (mis. tier yang angkanya masih PENAMPUNG dan SEDANG ditagihkan ke pembeli). ' +
+      'Tabel KOSONG bukan berarti "tidak ada yang perlu dilakukan": artinya jalur bayar sedang ' +
+      'memakai tier penampung di kode — dan itulah yang dikatakan `usingDefaults: true` + ' +
+      '`placeholderCount`. Respons juga membawa `limits` (batas nominal yang ditegakkan ' +
+      'assertSaneRate — pakai untuk memvalidasi form SEBELUM submit) dan `placeholderPricesIdr` ' +
+      '(angka penampung yang SEDANG ditagihkan). READ-ONLY.',
+  })
+  domesticShippingRates() {
+    return this.admin.listDomesticShippingRates();
+  }
+
+  @Put('shipping/domestic-rates')
+  @ApiBearerAuth()
+  @UseGuards(AdminGuard)
+  @ApiOperation({
+    summary:
+      'Set SATU TIER ongkir kirim DOMESTIK tanpa deploy (upsert per scope). INI TEMPAT PEMILIK ' +
+      'PRODUK MENETAPKAN ONGKIRNYA, dan tempat TIER BARU LAHIR: satu baris = satu tier yang ' +
+      'membawa harganya SEKALIGUS daftar provinsinya (`provinces`), jadi menambah/memperhalus ' +
+      'tier tidak pernah butuh perubahan kode. scope "TIER:<NAMA>" = tier wilayah, ' +
+      '"STATE:<provinsi>" = harga khusus satu provinsi, "*" = flat nasional (bentuk lama). ' +
+      'fallback=true menandai tier PENAMPUNG untuk provinsi tak dikenal — otomatis dimatikan di ' +
+      'tier lain. NOL dana treasury: ini hanya nominal Rupiah yang ditagihkan ke pembeli. ' +
+      'Berlaku untuk tagihan BERIKUTNYA; tagihan yang sudah terbit memakai nominal yang ' +
+      'di-snapshot di PaymentOrder-nya. IDEMPOTEN (upsert per `scope`): body yang sama dikirim ' +
+      'dua kali menghasilkan baris yang sama, aman di-retry. Field yang TIDAK disebut tidak ' +
+      'diubah. Responsnya membawa `effective`/`actionRequired`/`usingDefaults` yang SUDAH ' +
+      'diperbarui — bentuknya identik dengan GET, jadi dashboard bisa merender ulang tanpa ' +
+      'memanggil GET lagi.',
+  })
+  setDomesticShippingRate(
+    @Body() dto: SetDomesticShippingRateDto,
+    @CurrentUser() user: AuthUser,
+  ) {
+    return this.admin.setDomesticShippingRate(dto, user);
+  }
+
   @Get('redemptions')
   @ApiBearerAuth()
   @UseGuards(AdminGuard)
-  @ApiOperation({ summary: 'Daftar permintaan kirim kartu fisik (redemption)' })
+  @ApiOperation({
+    summary:
+      'Daftar permintaan kirim kartu fisik (redemption). Field `rail` membedakan ' +
+      'HOSHI_DOMESTIC (kemas & kirim sendiri lewat kurir lokal; isi resinya di sini) dari ' +
+      'CC_VAULT (burn + shipment CollectorCrypt; resi datang dari poll CC). Setiap baris juga ' +
+      'membawa `ongkir` (required/paid/inFlight/refundDue/refundSafe/paidIdr/orders — keadaan ' +
+      'tagihan ongkir Rupiah-nya), `allowedNextStatuses` + `blockedNextStatuses` (tombol yang ' +
+      'boleh dirender, SUDAH dikurangi pagar ongkir), dan `actionRequired` (daftar kalimat; ' +
+      'kosong = tidak ada yang tertunggak).',
+  })
   redemptions() {
     return this.admin.listRedemptions();
+  }
+
+  /**
+   * Angka RINGAN untuk lencana sidebar admin — dipanggil ulang tiap 15 detik dari SETIAP halaman
+   * /admin/*, jadi ia sengaja cuma satu `count` dan bukan `GET admin/stats` (8 count + aggregate).
+   * Presedennya `GET admin/support/unread-count`, yang sudah di-poll dari layout yang sama.
+   */
+  @Get('redemptions/pending-count')
+  @ApiBearerAuth()
+  @UseGuards(AdminGuard)
+  @ApiOperation({
+    summary:
+      'Berapa paket yang ongkirnya sudah beres dan belum dikemas (status PACKING). HANYA rail ' +
+      'DOMESTIK: pagarnya `listingId` non-null, karena baris CollectorCrypt juga BOLEH duduk di ' +
+      'PACKING namun nol Rupiah pernah masuk ke sana. TIDAK menyaring keadaan bayar — jalur ' +
+      '"ongkir ditanggung Hoshi" (absorbShippingFee) menaruh baris domestik di PACKING tanpa ' +
+      'order ongkir sama sekali, dan justru paket itu yang paling wajib berangkat.',
+  })
+  redemptionsPendingCount() {
+    return this.admin.pendingPackCount();
   }
 
   @Patch('redemptions/:id/status')
   @ApiBearerAuth()
   @UseGuards(AdminGuard)
   @ApiOperation({
-    summary: 'Majukan status kirim: REQUESTED→PACKING→SHIPPED, atau CANCELED',
+    summary:
+      'Majukan/tutup status kirim. Record-only: REQUESTED→PACKING→SHIPPED→DELIVERED, atau ' +
+      'CANCELED. Jalur real (resolusi manual): FUNDING/FUNDED→RECLAIM_DUE, RECLAIM_DUE→CANCELED ' +
+      '(sesudah USDC direklaim; refundSafe TETAP false — BUKAN izin refund Rupiah), ' +
+      'SHIP_FAILED_POST_BURN→DELIVERED, IN_TRANSIT→DELIVERED (penutupan manual bila CC memarkir ' +
+      'kiriman di Shipped dan poll status tak pernah menjawab Delivered). ' +
+      'READY_TO_FUND dan BURN_SUBMITTED punya rute sendiri. ' +
+      'RAIL HOSHI_DOMESTIC (stok Hoshi, kurir lokal): AWAITING_PAYMENT → PACKING dilakukan ' +
+      'OTOMATIS begitu ongkir Rupiah lunas; dari sini admin mengisi resi (trackingIds/' +
+      'trackingUrls, HANYA rail ini) lalu PACKING → SHIPPED → DELIVERED. Membatalkan baris ' +
+      'DOMESTIK yang ongkirnya sudah lunas otomatis mencatat utang refundnya dan ' +
+      'melaporkannya di `shippingDebts` pada respons. ' +
+      'B2: REQUESTED → PACKING/SHIPPED pada rail HOSHI_DOMESTIC DITOLAK (400) selama ongkirnya ' +
+      'belum lunas — kirim `absorbShippingFee: true` + `note` (≥10 karakter) kalau Hoshi memang ' +
+      'sengaja menanggung ongkirnya; pernyataan itu disimpan permanen di kolom `note`. Respons ' +
+      'membawa `rail`, `ongkir`, `allowedNextStatuses`, dan `actionRequired` yang sudah diperbarui.',
   })
   updateRedemption(
     @Param('id') id: string,
     @Body() dto: UpdateRedemptionStatusDto,
   ) {
-    return this.admin.updateRedemptionStatus(id, dto.status);
+    return this.admin.updateRedemptionStatus(
+      id,
+      dto.status,
+      {
+        trackingIds: dto.trackingIds,
+        trackingUrls: dto.trackingUrls,
+      },
+      { absorbShippingFee: dto.absorbShippingFee, note: dto.note },
+    );
+  }
+
+  /**
+   * SATU-SATUNYA jalan keluar tanpa mengedit Postgres untuk baris yang nyangkut di BURN_SUBMITTED.
+   * Bukan endpoint "set status apa saja": HANYA BURN_SUBMITTED -> FUNDED, tidak ada parameter
+   * status, wajib beralasan, dan refundSafe tetap false.
+   */
+  @Post('redemptions/:id/recover-burn-submitted')
+  @ApiBearerAuth()
+  @UseGuards(AdminGuard)
+  @ApiOperation({
+    summary:
+      'PEMULIHAN MANUAL: BURN_SUBMITTED -> FUNDED (admin). PERINGATAN: dengan menjalankan ini ' +
+      'operator MENYATAKAN sudah memverifikasi ke CollectorCrypt bahwa kartunya BELUM dibakar. ' +
+      'Wajib menyertakan alasan (disimpan di baris). refundSafe TETAP false — aksi ini tidak ' +
+      'pernah membuat uang bisa di-refund.',
+  })
+  recoverRedemptionBurnSubmitted(
+    @Param('id') id: string,
+    @Body() dto: RecoverBurnSubmittedDto,
+    @CurrentUser() user: AuthUser,
+  ) {
+    return this.admin.recoverBurnSubmittedToFunded(id, dto.note, user);
+  }
+
+  /**
+   * B1 — SATU-SATUNYA jalan keluar untuk baris READY_TO_FUND (ongkir Rupiah LUNAS, USDC BELUM
+   * dikirim) yang tidak akan pernah bisa dipenuhi. Bentuknya sama dengan pemulihan BURN_SUBMITTED:
+   * satu transisi saja, tanpa parameter status, wajib beralasan, tulisan berpagar predikat.
+   * Bedanya: di sini refundSafe TIDAK ditulis — ia sudah true dan DIVERIFIKASI true (bersama
+   * fundingSignature null) sebagai SYARAT, karena itulah yang membuat Rupiah-nya benar-benar
+   * aman di-refund.
+   */
+  @Post('redemptions/:id/settle-refund-due')
+  @ApiBearerAuth()
+  @UseGuards(AdminGuard)
+  @ApiOperation({
+    summary:
+      'PENYELESAIAN MANUAL: READY_TO_FUND -> REFUND_DUE (admin). Ongkir Rupiah sudah LUNAS tapi ' +
+      'pendanaan USDC tidak pernah bisa dijalankan. Di status ini NOL USDC treasury bergerak ' +
+      '(diverifikasi: fundingSignature null + refundSafe true), jadi ongkir Rupiah BENAR-BENAR ' +
+      'aman di-refund — dan operator WAJIB melakukan refund itu DI LUAR SISTEM. Wajib menyertakan ' +
+      'alasan (DITAMBAHKAN ke catatan baris). Mint-nya jadi bebas: user boleh minta kirim lagi.',
+  })
+  settleRedemptionRefundDue(
+    @Param('id') id: string,
+    @Body() dto: SettleRefundDueDto,
+    @CurrentUser() user: AuthUser,
+  ) {
+    return this.admin.settleReadyToFundAsRefundDue(id, dto.note, user);
+  }
+
+  /**
+   * B1 — JALAN KELUAR TERAKHIR untuk baris AWAITING_PAYMENT (tagihan ongkir terbit, baris
+   * redemption NOL uang). Tombol batal user menutup kasus umumnya; rute ini untuk saat usernya
+   * sudah tidak ada, atau saat order ongkirnya duduk di status yang tombol user tolak
+   * (PAID/FULFILLED). Bentuknya sama dengan dua rute pemulihan lain: satu transisi saja, tanpa
+   * parameter status, wajib beralasan, tulisan berpagar predikat, dan refundSafe TIDAK ditulis.
+   */
+  @Post('redemptions/:id/cancel-awaiting-payment')
+  @ApiBearerAuth()
+  @UseGuards(AdminGuard)
+  @ApiOperation({
+    summary:
+      'PEMBATALAN MANUAL: AWAITING_PAYMENT -> CANCELED (admin). Untuk baris yang tagihan ongkirnya ' +
+      'terbit tapi tidak akan pernah bergerak lagi (user hilang, atau order ongkirnya macet di ' +
+      'FULFILLING sesudah proses mati). Baris redemption NOL uang di status ini — utang ongkirnya ' +
+      'tetap tercatat di PaymentOrder-nya sendiri dan DILAPORKAN di `shippingDebts` pada respons. ' +
+      'Wajib menyertakan alasan (DITAMBAHKAN ke catatan baris). Mint-nya jadi bebas diminta lagi.',
+  })
+  cancelRedemptionAwaitingPayment(
+    @Param('id') id: string,
+    @Body() dto: CancelAwaitingPaymentDto,
+    @CurrentUser() user: AuthUser,
+  ) {
+    return this.admin.cancelAwaitingPayment(id, dto.note, user);
+  }
+
+  /* ───────────────── D (checklist 4.6) — ESCROW: LIHAT & PULIHKAN ───────────────── */
+
+  @Get('escrow')
+  @ApiBearerAuth()
+  @UseGuards(AdminGuard)
+  @ApiOperation({
+    summary:
+      'Kartu yang SEDANG dipegang wallet escrow + kartu yang tertinggal di dalamnya + listing ' +
+      'yang akan jadi tak-bisa-dibeli saat HOSHI_P2P_ENABLED dinyalakan. READ-ONLY.',
+    description:
+      'Sebelum ini tidak ada permukaan apa pun yang menunjukkan isi escrow: kegagalan ' +
+      'mengembalikan kartu ke penjual hanya menulis "cek on-chain dan kembalikan manual" ke ' +
+      'log, dan log dirotasi. "verify=true" MEMVERIFIKASI kepemilikan on-chain untuk baris yang ' +
+      'mengaku ber-escrow (N panggilan RPC — jangan dipakai untuk polling dashboard). Tanpa ' +
+      'verify, kolom escrowOwnsOnChain bernilai null yang berarti TIDAK DIPERIKSA, bukan ' +
+      '"tidak dipegang".',
+  })
+  escrow(@Query() query: QueryAdminEscrowDto) {
+    return this.admin.escrowOverview({
+      verify: query.verify === 'true',
+      limit: query.limit,
+    });
+  }
+
+  @Post('escrow/:listingId/return')
+  @ApiBearerAuth()
+  @UseGuards(AdminGuard)
+  @ApiOperation({
+    summary:
+      'PEMULIHAN MANUAL: kembalikan kartu dari wallet escrow ke PENJUALNYA (admin). Hanya ' +
+      'listing CANCELLED atau PENDING_ESCROW, hanya bila escrow TERBUKTI memegangnya on-chain.',
+    description:
+      'TIDAK ADA parameter tujuan: wallet penerima SELALU diturunkan dari baris penjual listing ' +
+      '— kalau alamat boleh datang dari body, ini bukan pemulihan melainkan pintu belakang ' +
+      'pengiriman aset. Listing ACTIVE ditolak (batalkan dulu; cancel menutup jendela beli ' +
+      'secara atomik sebelum menyentuh escrow). Listing SOLD ditolak KERAS: kartunya sudah/ ' +
+      'mungkin sah milik pembeli. Wajib menyertakan alasan, disimpan permanen di ' +
+      'escrow_recoveries bersama identitas admin dan hasilnya (termasuk hasil yang TIDAK ' +
+      'DIKETAHUI, yang TIDAK membersihkan penanda escrow).',
+  })
+  returnEscrowToSeller(
+    @Param('listingId') listingId: string,
+    @Body() dto: RecoverEscrowDto,
+    @CurrentUser() user: AuthUser,
+  ) {
+    return this.admin.recoverEscrowToSeller(listingId, dto.reason, user);
   }
 
   @Get('listings')

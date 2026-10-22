@@ -23,6 +23,7 @@ import { BalanceModule } from './balance/balance.module';
 import { RedemptionModule } from './redemption/redemption.module';
 import { SwapModule } from './swap/swap.module';
 import { GeoModule } from './geo/geo.module';
+import { ConsignmentModule } from './consignment/consignment.module';
 
 @Module({
   imports: [
@@ -47,6 +48,7 @@ import { GeoModule } from './geo/geo.module';
     RedemptionModule,
     SwapModule,
     GeoModule,
+    ConsignmentModule,
   ],
   controllers: [AppController],
   providers: [

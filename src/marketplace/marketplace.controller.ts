@@ -9,6 +9,7 @@ import {
   UseGuards,
 } from '@nestjs/common';
 import { ApiBearerAuth, ApiOperation, ApiTags } from '@nestjs/swagger';
+import { Throttle } from '@nestjs/throttler';
 import { CurrentUser } from '../auth/current-user.decorator';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import type { AuthUser } from '../auth/jwt.strategy';
@@ -195,12 +196,20 @@ export class MarketplaceController {
     return this.marketplace.relist(id, dto, user);
   }
 
+  // Rem ledakan untuk jalur yang MENERBITKAN KEWAJIBAN GAS: tiap panggilan sukses menghasilkan
+  // satu transaksi bertanda-tangan-escrow yang fee-nya kami tanggung dan yang penjual bisa
+  // siarkan sendiri. Rate limit BUKAN gerbangnya — identitas di sistem ini gratis, jadi batas
+  // per-IP mudah di-Sybil; plafon yang sesungguhnya ada di ledger (per-penjual & global 24 jam,
+  // src/escrow/escrow-fee-sponsor.ts). Ini lapis pertama, bukan satu-satunya.
+  @Throttle({ default: { ttl: 60000, limit: 10 } })
   @Post(':id/escrow/prepare')
   @ApiBearerAuth()
   @UseGuards(JwtAuthGuard)
   @ApiOperation({
     summary:
-      'Escrow langkah 1: bangun tx transfer kartu penjual → escrow (real P2P, PENDING_ESCROW)',
+      'Escrow langkah 1: bangun tx transfer kartu penjual → escrow (real P2P, PENDING_ESCROW). ' +
+      'Fee jaringan ditanggung wallet escrow (fee payer ≠ authority); penjual tetap tanda tangan ' +
+      'sebagai pemilik kartu.',
   })
   prepareEscrow(@Param('id') id: string, @CurrentUser() user: AuthUser) {
     return this.marketplace.prepareEscrow(id, user);

@@ -52,10 +52,21 @@ export class PaymentsReconcileScheduler
     const raw = Number(
       this.config.get<string>('PAYMENTS_RECONCILE_INTERVAL_MS'),
     );
-    const ms =
+    const requested =
       Number.isFinite(raw) && raw >= MIN_INTERVAL_MS
         ? raw
         : DEFAULT_INTERVAL_MS;
+    // Jepit ke plafon, dan BERISIK kalau dijepit — kalau tidak, satu env yang salah menurunkan
+    // jaminan deteksi uang tanpa gejala apa pun (lihat MAX_INTERVAL_MS).
+    const ms = Math.min(requested, MAX_INTERVAL_MS);
+    if (requested > MAX_INTERVAL_MS) {
+      this.logger.error(
+        `PAYMENTS_RECONCILE_INTERVAL_MS=${requested} melewati plafon ${MAX_INTERVAL_MS} dan ` +
+          `DIJEPIT ke ${MAX_INTERVAL_MS}. Interval di atas plafon membuat baris EXPIRED keluar ` +
+          'dari jendela sapuan 1 jam sebelum pernah ditanyakan — pembayaran yang callback-nya ' +
+          'hilang bisa tidak terdeteksi sama sekali.',
+      );
+    }
 
     this.timer = setInterval(() => void this.sweep(), ms);
     // unref: timer tidak boleh menahan proses tetap hidup saat shutdown.
@@ -90,3 +101,12 @@ export class PaymentsReconcileScheduler
 const DEFAULT_INTERVAL_MS = 120_000;
 /** Lantai keras — interval terlalu rapat hanya membanjiri IDRX dan DB tanpa manfaat. */
 const MIN_INTERVAL_MS = 30_000;
+/**
+ * PLAFON keras. Interval ini BUKAN sekadar tuning: ia adalah batas atas seberapa lama sebuah
+ * pembayaran yang callback-nya hilang bisa tidak terdeteksi, dan sapuan EXPIRED punya jendela
+ * 1 jam — interval yang lebih besar dari jendela itu berarti ada baris yang keluar jendela
+ * sebelum pernah ditanyakan sekali pun, alias uang hilang tanpa jejak. Dulu tidak ada plafonnya
+ * dan variabelnya tidak terdaftar di skema env, jadi mengisinya 30 menit menurunkan jaminan
+ * deteksi uang jadi 30 menit TANPA gejala apa pun. Sekarang dijepit dan diteriakkan.
+ */
+const MAX_INTERVAL_MS = 600_000;

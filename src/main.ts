@@ -40,7 +40,16 @@ async function bootstrap() {
     .split(',')
     .map((o) => o.trim())
     .filter(Boolean);
-  app.enableCors({ origin: origins, credentials: true });
+  // `Retry-After` DIBUKA ke browser dengan sengaja. ThrottlerGuard sudah mengirimkannya pada
+  // setiap 429, tapi tanpa `exposedHeaders` header itu tidak pernah terbaca dari origin lain —
+  // jadi frontend hanya bisa MENEBAK lama tunggunya. Satu-satunya hal yang dibocorkan adalah
+  // "berapa detik lagi boleh mencoba", yang justru itulah yang perlu diketahui orang yang salah
+  // ketik kode klaim kartunya sendiri. Tidak ada perilaku throttle yang berubah di sini.
+  app.enableCors({
+    origin: origins,
+    credentials: true,
+    exposedHeaders: ['Retry-After'],
+  });
 
   // Validasi + sanitasi semua DTO secara global.
   app.useGlobalPipes(
