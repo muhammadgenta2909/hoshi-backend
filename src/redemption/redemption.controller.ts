@@ -102,6 +102,20 @@ export class RedemptionController {
     return this.redemption.cancel(id, user, dto?.reason);
   }
 
+  /** "Pesanan Diterima": pembeli menyatakan paket DOMESTIK-nya sudah sampai (SHIPPED → DELIVERED). */
+  @Post(':id/confirm-received')
+  @ApiBearerAuth()
+  @UseGuards(JwtAuthGuard)
+  @Throttle({ default: { ttl: 60000, limit: 10 } })
+  @ApiOperation({
+    summary:
+      'Konfirmasi paket kurir domestik sudah diterima. Hanya pemilik baris, hanya dari SHIPPED. ' +
+      'Idempoten (baris yang sudah DELIVERED dikembalikan apa adanya). Nol uang.',
+  })
+  confirmReceived(@Param('id') id: string, @CurrentUser() user: AuthUser) {
+    return this.redemption.confirmReceived(id, user);
+  }
+
   /* ─────────── KIRIM DOMESTIK (stok Hoshi, kurir lokal) — TANPA CC, TANPA gerbang CC ───────────
      Jalur ini TIDAK menyentuh CollectorCrypt: tidak ada NFT untuk dibakar, tidak ada USDC yang
      didanai, tidak ada tanda tangan wallet, dan tidak ada header x-cc-access-token. Ia karena

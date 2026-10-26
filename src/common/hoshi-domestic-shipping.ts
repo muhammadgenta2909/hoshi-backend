@@ -232,6 +232,8 @@ export const DOMESTIC_ERROR_CODE = {
   ADDRESS_UNSUPPORTED: 'HOSHI_DOMESTIC_ADDRESS_UNSUPPORTED',
   /** Tagihan ongkir untuk baris ini sudah/sedang diproses — jangan terbitkan yang kedua. */
   ORDER_IN_PROGRESS: 'HOSHI_DOMESTIC_ORDER_IN_PROGRESS',
+  /** "Pesanan Diterima" ditekan untuk paket yang belum dikirim (bukan SHIPPED). */
+  NOT_CONFIRMABLE: 'HOSHI_DOMESTIC_NOT_CONFIRMABLE',
 } as const;
 
 export type DomesticErrorCode =

@@ -7,6 +7,7 @@ import { CollectorCryptModule } from '../collectorcrypt/collectorcrypt.module';
 import { MarketplaceModule } from '../marketplace/marketplace.module';
 import { BalanceModule } from '../balance/balance.module';
 import { EscrowModule } from '../escrow/escrow.module';
+import { MailModule } from '../mail/mail.module';
 import { AdminController } from './admin.controller';
 import { AdminService } from './admin.service';
 
@@ -22,6 +23,8 @@ import { AdminService } from './admin.service';
     // D (4.6) — dashboard escrow + pemulihan manual. Kunci escrow tetap terkurung di
     // EscrowService; admin hanya boleh memicunya lewat aksi beralasan yang berpagar status.
     EscrowModule,
+    // Email pengiriman domestik (ShipmentNotifyService) saat resi diisi / paket diterima.
+    MailModule,
     PassportModule,
     JwtModule.registerAsync({
       inject: [ConfigService],
