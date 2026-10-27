@@ -326,6 +326,15 @@ model CardRedemption {
   updatedAt   DateTime         @updatedAt
   processedAt DateTime?
 
+  // --- Penerimaan paket DOMESTIK. Nullable → baris lama tetap valid.
+  /// Kapan admin menandai SHIPPED (resi diisi). Dasar hitung konfirmasi otomatis 7 hari.
+  shippedAt   DateTime?
+  /// Kapan paketnya dinyatakan DITERIMA (status DELIVERED).
+  deliveredAt DateTime?
+  /// Siapa yang menyatakannya: 'BUYER' (tombol "Pesanan Diterima"), 'AUTO' (7 hari tanpa
+  /// konfirmasi), 'ADMIN' (PATCH status). String bebas, bukan enum, supaya tidak butuh migrasi enum.
+  deliveredBy String?
+
   // --- Jalur REAL (CC Vault Shipping API). Semua nullable → baris record-only lama tetap valid.
   ccShippingAddressId String? // id ShippingAddress yang dibuat di CC (POST /shipping-address/create)
   outboundShipmentId  String? @unique // id shipment CC (POST /redeem/prepare) — @unique = anti dobel-burn

@@ -5,8 +5,10 @@ import {
   Injectable,
   Logger,
   NotFoundException,
+  Optional,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { ShipmentNotifyService } from '../mail/shipment-notify.service';
 // CATATAN: cloudinary SENGAJA TIDAK di-import di sini (top-level). SDK-nya memvalidasi CLOUDINARY_URL
 // saat MODULE DI-LOAD dan melempar Error kalau formatnya salah (harus diawali 'cloudinary://'). Import
 // top-level = satu env rusak meng-crash SELURUH backend saat boot (crash-loop, deploy gagal). Kita
@@ -272,6 +274,9 @@ export class AdminService {
     // D (checklist 4.6) — dashboard escrow + pemulihan manual. EscrowService satu-satunya yang
     // boleh menyuruh wallet escrow menandatangani; admin hanya memicunya lewat pintu ini.
     private readonly escrow: EscrowService,
+    // Email pengiriman domestik (dikirim / diterima). @Optional: best-effort, dan spec lama yang
+    // membangun service ini dengan tangan tetap jalan tanpa menyuntiknya.
+    @Optional() private readonly shipmentNotify?: ShipmentNotifyService,
   ) {}
 
   async login(email: string, password: string) {
@@ -1091,10 +1096,39 @@ export class AdminService {
     const noteData = absorbNote
       ? { note: appendBoundedNote(row.note, absorbNote, NOTE_MAX) }
       : {};
+    // Cap waktu penerimaan paket DOMESTIK. `shippedAt` = dasar konfirmasi otomatis 7 hari
+    // (RedemptionDeliveryScheduler); `deliveredBy: 'ADMIN'` membedakan penutupan manual dari
+    // tombol pembeli dan dari konfirmasi otomatis.
+    const deliveryStamp: {
+      shippedAt?: Date;
+      deliveredAt?: Date;
+      deliveredBy?: string;
+    } = {};
+    if (domestic && status === RedemptionStatus.SHIPPED) {
+      deliveryStamp.shippedAt = new Date();
+    }
+    if (status === RedemptionStatus.DELIVERED) {
+      deliveryStamp.deliveredAt = new Date();
+      deliveryStamp.deliveredBy = 'ADMIN';
+    }
     const updated = await this.prisma.cardRedemption.update({
       where: { id },
-      data: { status, ...extra, ...trackingData, ...noteData },
+      data: {
+        status,
+        ...extra,
+        ...trackingData,
+        ...noteData,
+        ...deliveryStamp,
+      },
     });
+
+    // Email ke pembeli / pemilik titipan / admin — SESUDAH commit, tidak pernah melempar.
+    if (domestic && status === RedemptionStatus.SHIPPED) {
+      this.shipmentNotify?.shipped(id);
+    }
+    if (domestic && status === RedemptionStatus.DELIVERED) {
+      this.shipmentNotify?.delivered(id, 'ADMIN');
+    }
 
     // ╔════════════════════════════════════════════════════════════════════════════════════╗
     // ║ KARTU TITIPAN YANG DISERAHKAN KE KURIR = CUSTODY SELESAI. CATAT SEKARANG.          ║

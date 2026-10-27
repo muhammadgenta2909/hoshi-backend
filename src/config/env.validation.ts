@@ -619,6 +619,17 @@ class EnvironmentVariables {
   @IsString()
   MAIL_FROM?: string;
 
+  // Email admin (boleh CSV) yang diberi tahu saat paket domestik DITERIMA. Opsional: tanpa ini
+  // statusnya tetap terlihat di dashboard admin.
+  @IsOptional()
+  @IsString()
+  ADMIN_NOTIFY_EMAIL?: string;
+
+  // '0' = matikan konfirmasi otomatis 7 hari untuk paket domestik (debug saja).
+  @IsOptional()
+  @IsString()
+  DELIVERY_AUTO_CONFIRM_ENABLED?: string;
+
   // ── GEO proxy (countrystatecity.in) ──────────────────────────────────────
   // Opsional — API key untuk https://api.countrystatecity.in (header X-CSCAPI-KEY).
   // GELAP sampai diisi: tanpa key, GET /api/geo/* menjawab 503 "Geo lookup not

@@ -1,4 +1,4 @@
-import { HttpStatus, Injectable, Logger } from '@nestjs/common';
+import { HttpStatus, Injectable, Logger, Optional } from '@nestjs/common';
 import {
   ActivityType,
   CcPackStatus,
@@ -40,6 +40,10 @@ import {
 } from '../common/hoshi-domestic-shipping';
 import { isPhysicallyHeldByHoshi } from '../common/consignment.gate';
 import { RequestRedemptionDto } from './dto/request-redemption.dto';
+import {
+  AUTO_CONFIRM_DAYS,
+  ShipmentNotifyService,
+} from '../mail/shipment-notify.service';
 
 export type CardRedemptionDto = {
   id: string;
@@ -80,6 +84,17 @@ export type CardRedemptionDto = {
   /** Link lacak, sejajar indeksnya dengan `trackingIds`. Kosong = kurirnya tak punya link. */
   trackingUrls: string[];
   createdAt: Date;
+  /** Kapan resi diisi (SHIPPED). Null = belum dikirim / baris jalur CC. */
+  shippedAt: Date | null;
+  /** Kapan paket dinyatakan diterima (DELIVERED). */
+  deliveredAt: Date | null;
+  /** 'BUYER' | 'AUTO' | 'ADMIN' — siapa yang menyatakan diterima. */
+  deliveredBy: string | null;
+  /**
+   * Kapan baris DOMESTIK yang masih SHIPPED akan dianggap diterima otomatis. Dihitung server
+   * (shippedAt + AUTO_CONFIRM_DAYS) supaya frontend tidak menyalin angka 7 hari sendiri.
+   */
+  autoConfirmAt: Date | null;
 };
 
 /**
@@ -232,8 +247,21 @@ function toDto(r: CardRedemption): CardRedemptionDto {
     trackingIds: r.trackingIds ?? [],
     trackingUrls: r.trackingUrls ?? [],
     createdAt: r.createdAt,
+    shippedAt: r.shippedAt ?? null,
+    deliveredAt: r.deliveredAt ?? null,
+    deliveredBy: r.deliveredBy ?? null,
+    autoConfirmAt:
+      r.status === RedemptionStatus.SHIPPED &&
+      r.listingId != null &&
+      r.shippedAt
+        ? new Date(r.shippedAt.getTime() + AUTO_CONFIRM_MS)
+        : null,
   };
 }
+
+const AUTO_CONFIRM_MS = AUTO_CONFIRM_DAYS * 24 * 60 * 60 * 1000;
+/** Batas baris per sapuan konfirmasi otomatis — sisanya diambil sapuan berikutnya. */
+const AUTO_CONFIRM_BATCH = 50;
 
 /**
  * Redeem kartu vault → kirim fisik ke rumah.
@@ -251,7 +279,144 @@ export class RedemptionService {
     private readonly prisma: PrismaService,
     private readonly ccShipping: CcShippingService,
     private readonly payments: PaymentsService,
+    // Email "paket diterima" — best-effort; @Optional supaya spec lama tetap bisa membangunnya.
+    @Optional() private readonly shipmentNotify?: ShipmentNotifyService,
   ) {}
+
+  /**
+   * ╔════════════════════════════════════════════════════════════════════════════════════════╗
+   * ║ "PESANAN DITERIMA" — pembeli menyatakan paket DOMESTIK-nya sudah sampai.               ║
+   * ╚════════════════════════════════════════════════════════════════════════════════════════╝
+   *
+   * NOL UANG: hasil penjualan titipan sudah dibayar ke pemiliknya saat kartu terjual, dan ongkir
+   * sudah lunas sebelum paket berangkat. Tombol ini hanya mencatat fakta + memberi tahu pemilik
+   * kartu dan admin. Karena itu idempoten: menekan dua kali = jawaban yang sama, bukan error.
+   *
+   * Hanya SHIPPED → DELIVERED, hanya rail domestik, hanya pemilik baris. Tulisan berpagar status,
+   * jadi tidak bisa balapan dengan konfirmasi otomatis maupun PATCH admin.
+   */
+  async confirmReceived(
+    id: string,
+    user: AuthUser,
+  ): Promise<CardRedemptionDto> {
+    const row = await this.prisma.cardRedemption.findUnique({ where: { id } });
+    if (!row) {
+      throw noEffectError(
+        HttpStatus.NOT_FOUND,
+        SHIPPING_ERROR_CODE.REDEMPTION_NOT_FOUND,
+        'Pengiriman tidak ditemukan.',
+      );
+    }
+    if (row.userId !== user.id) {
+      throw noEffectError(
+        HttpStatus.FORBIDDEN,
+        SHIPPING_ERROR_CODE.REDEMPTION_NOT_YOURS,
+        'Pengiriman ini bukan milik Anda.',
+      );
+    }
+    if (!isDomesticRedemption(row)) {
+      throw domesticError({
+        status: HttpStatus.BAD_REQUEST,
+        code: DOMESTIC_ERROR_CODE.WRONG_RAIL,
+        message:
+          'Konfirmasi penerimaan hanya untuk kiriman kurir domestik. Status kiriman ' +
+          'CollectorCrypt diperbarui otomatis dari pelacakannya.',
+        redemptionId: id,
+      });
+    }
+    if (row.status === RedemptionStatus.DELIVERED) return toDto(row);
+    if (row.status !== RedemptionStatus.SHIPPED) {
+      throw domesticError({
+        status: HttpStatus.BAD_REQUEST,
+        code: DOMESTIC_ERROR_CODE.NOT_CONFIRMABLE,
+        message:
+          'Paket ini belum dikirim, jadi belum bisa dikonfirmasi diterima.',
+        redemptionId: id,
+      });
+    }
+
+    const now = new Date();
+    const moved = await this.prisma.cardRedemption.updateMany({
+      where: { id, userId: user.id, status: RedemptionStatus.SHIPPED },
+      data: {
+        status: RedemptionStatus.DELIVERED,
+        deliveredAt: now,
+        deliveredBy: 'BUYER',
+        note: appendBoundedNote(
+          row.note,
+          `[DITERIMA PEMBELI ${now.toISOString()}] dikonfirmasi lewat tombol "Pesanan Diterima".`,
+          NOTE_MAX,
+        ),
+      },
+    });
+    const after = await this.prisma.cardRedemption.findUnique({
+      where: { id },
+    });
+    if (!after) {
+      throw noEffectError(
+        HttpStatus.NOT_FOUND,
+        SHIPPING_ERROR_CODE.REDEMPTION_NOT_FOUND,
+        'Pengiriman tidak ditemukan.',
+      );
+    }
+    if (moved.count === 1) {
+      this.logger.log(
+        `Redemption ${id}: SHIPPED → DELIVERED (dikonfirmasi pembeli ${user.id}).`,
+      );
+      this.shipmentNotify?.delivered(id, 'BUYER');
+    }
+    // count 0 → kalah balapan dengan konfirmasi otomatis/admin. Baris yang SUDAH DELIVERED =
+    // sukses yang sama; status lain (mis. admin membatalkan) dikembalikan apa adanya.
+    return toDto(after);
+  }
+
+  /**
+   * Paket DOMESTIK yang SHIPPED lebih dari AUTO_CONFIRM_DAYS tanpa konfirmasi → DELIVERED ('AUTO').
+   * Dipanggil RedemptionDeliveryScheduler. Baris tanpa `shippedAt` (lahir sebelum kolomnya ada
+   * dan lolos backfill migrasi) memakai `updatedAt` sebagai cadangan.
+   */
+  async autoConfirmDelivered(now: Date = new Date()): Promise<number> {
+    const cutoff = new Date(now.getTime() - AUTO_CONFIRM_MS);
+    const due = await this.prisma.cardRedemption.findMany({
+      where: {
+        status: RedemptionStatus.SHIPPED,
+        listingId: { not: null },
+        OR: [
+          { shippedAt: { lte: cutoff } },
+          { shippedAt: null, updatedAt: { lte: cutoff } },
+        ],
+      },
+      select: { id: true, note: true },
+      orderBy: { createdAt: 'asc' },
+      take: AUTO_CONFIRM_BATCH,
+    });
+    let done = 0;
+    for (const r of due) {
+      const moved = await this.prisma.cardRedemption.updateMany({
+        where: { id: r.id, status: RedemptionStatus.SHIPPED },
+        data: {
+          status: RedemptionStatus.DELIVERED,
+          deliveredAt: now,
+          deliveredBy: 'AUTO',
+          note: appendBoundedNote(
+            r.note,
+            `[DITERIMA OTOMATIS ${now.toISOString()}] ${AUTO_CONFIRM_DAYS} hari sesudah dikirim tanpa konfirmasi pembeli.`,
+            NOTE_MAX,
+          ),
+        },
+      });
+      if (moved.count === 1) {
+        done++;
+        this.shipmentNotify?.delivered(r.id, 'AUTO');
+      }
+    }
+    if (done) {
+      this.logger.log(
+        `Konfirmasi otomatis: ${done} paket domestik → DELIVERED.`,
+      );
+    }
+    return done;
+  }
 
   async request(
     dto: RequestRedemptionDto,
